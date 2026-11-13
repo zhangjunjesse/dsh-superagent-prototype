@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>贾维斯</title>
+  <link rel="stylesheet" href="/ui.css">
+  <link rel="stylesheet" href="/capabilities.css">
+</head>
+<body>
+  <div class="shell" id="conversation-page">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark" data-assistant-initial aria-hidden="true">贾</div><div class="brand-name"><span data-assistant-name>贾维斯</span><span class="brand-sub">你的工作伙伴</span></div></div>
+      <div class="top-status">
+        <button class="overview-trigger" id="context-toggle" type="button" aria-label="经营概览" aria-expanded="false" aria-controls="context-sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="2"/><rect x="14" y="4" width="6" height="7" rx="2"/><rect x="4" y="14" width="7" height="6" rx="2"/><rect x="14" y="14" width="6" height="6" rx="2"/></svg><span>经营概览</span></button>
+        <span class="toolbar-divider" aria-hidden="true"></span>
+        <button class="icon-button" id="settings-open" type="button" aria-label="设置" title="设置" aria-controls="settings-page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h4m4 0h8M4 17h9m4 0h3"/><circle cx="10" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></svg></button>
+        <details class="chat-menu" id="conversation-menu"><summary class="icon-button" aria-label="更多选项" title="更多选项"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></summary><div class="menu-surface"><button id="reset" type="button">清空对话</button></div></details>
+      </div>
+    </header>
+    <main class="workspace">
+      <div class="cockpit-grid">
+        <section class="conversation" aria-labelledby="conversation-title">
+          <div class="conversation-head sr-only"><span class="conversation-title" id="conversation-title">与 <span data-assistant-name>贾维斯</span> 对话</span></div>
+          <div class="thread" id="thread" aria-label="对话记录"></div>
+          <div class="chat-feedback" id="chat-feedback" role="status"></div>
+          <div class="chat-confirm" id="chat-confirm" hidden><span>清空后无法恢复此对话。</span><button class="action secondary" id="clear-cancel" type="button">取消</button><button class="action" id="clear-confirm" type="button">清空对话</button></div>
+          <form class="composer" id="composer">
+            <label class="sr-only" for="input" id="composer-label">给贾维斯发消息</label>
+            <div class="composer-box">
+              <textarea id="input" rows="1" placeholder="给贾维斯发消息"></textarea>
+              <section class="model-picker" id="model-picker" role="dialog" aria-labelledby="model-picker-title" hidden>
+                <header><h2 id="model-picker-title">模型与思考</h2><button type="button" class="icon-button" id="model-picker-close" aria-label="关闭模型选择">×</button></header>
+                <label class="quick-model-field" for="quick-model">模型<select id="quick-model"></select></label>
+                <div class="quick-effort-heading" id="quick-effort-title">思考级别</div>
+                <div class="quick-efforts" id="quick-efforts" role="group" aria-labelledby="quick-effort-title"></div>
+                <p class="quick-efforts-empty" id="quick-efforts-empty" hidden>此模型未提供可选级别</p>
+                <p class="model-picker-status" id="model-picker-status" role="status"></p>
+                <footer><button type="button" id="model-picker-settings">完整模型设置 <span aria-hidden="true">↗</span></button><button type="button" id="model-picker-refresh">刷新可选项</button></footer>
+              </section>
+              <div class="composer-actions">
+                <button class="model-indicator" id="composer-model" type="button" title="切换模型与思考级别" aria-haspopup="dialog" aria-expanded="false" aria-controls="model-picker"><span class="model-dot" aria-hidden="true"></span><span id="composer-model-label">选择模型</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>
+                <span class="composer-hint" aria-hidden="true">Shift + Enter 换行</span>
+                <button class="composer-button" id="stop-generation" type="button" aria-label="停止生成" title="停止生成" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg></button>
+                <button class="composer-button" id="send-message" type="submit" aria-label="发送消息" title="发送消息" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button>
+              </div>
+            </div>
+          </form>
+        </section>
+        <aside class="side-stack" id="context-sidebar" aria-label="经营上下文" hidden>
+          <div class="dashboard-grid">
+            <section class="panel" aria-labelledby="decision-title"><div class="panel-head"><h2 class="panel-title" id="decision-title">需要我决定</h2><span class="panel-count">3 项</span></div><div class="decision"><div class="decision-main"><span class="decision-title">华东增长计划 · 新增预算</span><span class="decision-meta">建议批准方案 B · 今天 18:00 前</span></div><span class="decision-tag urgent">高影响</span><button class="decision-action" type="button" data-mission="east">查看</button></div><div class="decision"><div class="decision-main"><span class="decision-title">生产系统升级 · 变更窗口</span><span class="decision-meta">周末停机 2 小时 · 等待确认</span></div><span class="decision-tag">待确认</span><button class="decision-action" type="button" data-mission="release">查看</button></div><div class="decision"><div class="decision-main"><span class="decision-title">PR #128 · 登录流程修复</span><span class="decision-meta">检查已通过 · 等待审查</span></div><span class="decision-tag">待验收</span><button class="decision-action" type="button" data-mission="pr">查看</button></div></section>
+            <section class="panel" aria-labelledby="strategy-title"><div class="panel-head"><h2 class="panel-title" id="strategy-title">战略推进</h2><span class="panel-count">8 项</span></div><div class="strategy-row"><div class="strategy-top"><span class="strategy-name">华东增长计划</span><span class="strategy-state risk">有风险</span></div><div class="strategy-bar"><div class="strategy-fill risk" style="width:68%"></div></div><div class="strategy-foot"><span>预计达成 13%–16%</span><span>68%</span></div></div><div class="strategy-row"><div class="strategy-top"><span class="strategy-name">产品线重构</span><span class="strategy-state">按计划</span></div><div class="strategy-bar"><div class="strategy-fill" style="width:64%"></div></div><div class="strategy-foot"><span>下一里程碑 · 11 月 18 日</span><span>64%</span></div></div><div class="strategy-row"><div class="strategy-top"><span class="strategy-name">客户交付体系</span><span class="strategy-state">按计划</span></div><div class="strategy-bar"><div class="strategy-fill" style="width:92%"></div></div><div class="strategy-foot"><span>本周完成验收</span><span>92%</span></div></div></section>
+          </div>
+          <div class="lower-grid"><section class="panel" aria-labelledby="risk-title"><div class="panel-head"><h2 class="panel-title" id="risk-title">重大风险</h2><span class="panel-count">1 项</span></div><div class="risk-card"><div class="risk-main"><strong>华南项目预计延期 9 天</strong><span>交付依赖供应商接口，替代方案正在评估</span></div><span class="risk-level">需要关注</span></div></section><section class="panel" aria-labelledby="delivery-title"><div class="panel-head"><h2 class="panel-title" id="delivery-title">最近交付</h2><span class="panel-count">过去 7 天</span></div><div class="delivery-list"><div class="delivery-item"><strong>经营分析</strong><span>已交付 · 昨天</span></div><div class="delivery-item"><strong>报价策略</strong><span>已交付 · 周一</span></div><div class="delivery-item"><strong>风险清单</strong><span>已归档 · 周一</span></div></div></section></div>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal" id="mission-modal" role="dialog" aria-modal="true" aria-labelledby="mission-title" hidden><div class="modal-card"><div class="modal-head"><div><p class="modal-eyebrow" id="mission-eyebrow">战略任务</p><h2 class="modal-title" id="mission-title">华东增长计划</h2></div><button class="modal-close" type="button" data-action="close" aria-label="关闭">×</button></div><div class="mission-grid"><div class="mission-cell"><span>目标</span><strong id="mission-objective">季度收入提升 20%</strong></div><div class="mission-cell"><span>当前状态</span><strong id="mission-state">有风险</strong></div><div class="mission-cell"><span>内部推进</span><strong id="mission-progress">销售预测与预算评估</strong></div><div class="mission-cell"><span>截止时间</span><strong id="mission-deadline">今天 18:00 前</strong></div></div><div class="mission-callout" id="mission-next">需要你决定：是否批准新增预算 300 万。建议方案 B。</div><p class="mission-evidence" id="mission-evidence">依据：销售预测、区域成本模型、客户转化数据已完成交叉验证。</p><div class="modal-actions"><button class="action secondary" type="button" data-action="close">返回概览</button><button class="action" type="button" data-action="ack">与 <span data-assistant-name>贾维斯</span> 讨论</button></div></div></div>
+
+
+
+
+<main class="settings-page" id="settings-page" aria-labelledby="settings-title" hidden>
+ <header class="settings-topbar"><div class="settings-breadcrumb"><div class="brand-mark" data-assistant-initial aria-hidden="true">贾</div><strong data-assistant-name>贾维斯</strong><span>/</span><span>设置</span></div><button class="reset" id="settings-back" type="button">返回对话</button></header>
+ <div class="unsaved-bar" id="settings-unsaved" role="status" hidden><span>有未保存的修改</span><button class="action secondary" id="settings-stay" type="button">继续编辑</button><button class="action secondary" id="settings-discard" type="button">放弃修改并返回</button></div>
+ <div class="settings-frame">
+  <nav class="settings-rail" aria-label="设置导航"><p data-assistant-name>贾维斯</p><a id="settings-nav-basic" href="#settings" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg><span>基本设置</span></a><a id="settings-nav-model" href="#settings/model"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="3"/><path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4m12-6h4m-4 6h4"/></svg><span>模型配置</span></a><p class="settings-rail-group">能力管理</p><a id="settings-nav-tools" href="#settings/tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 8-4 4 4 4m10-8 4 4-4 4m-4-11-2 14"/></svg><span>工具</span></a><a id="settings-nav-skills" href="#settings/skills"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 9 9l-6 3 6 3 3 6 3-6 6-3-6-3-3-6Z"/></svg><span>技能</span></a></nav>
+  <section class="capabilities-page" id="capabilities-page" aria-labelledby="capabilities-title" hidden></section>
+  <form class="settings-form" id="basic-form" novalidate autocomplete="off">
+   <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="basic-title" tabindex="-1">基本设置</h1></div></div>
+   <div class="settings-scroll"><div class="settings-content">
+     <div class="model-section"><h2>助手</h2><div class="model-fields"><label class="model-field wide"><span>助手名称</span><input id="setting-assistantName" type="text" value="贾维斯" maxlength="40" placeholder="贾维斯" autocomplete="off"></label></div></div>
+   </div></div>
+   <footer class="settings-footer"><p id="basic-feedback" role="status">无未保存的修改</p><button class="action" id="basic-save" type="submit" disabled>保存设置</button></footer>
+  </form>
+  <form class="settings-form" id="settings-form" hidden novalidate autocomplete="off">
+   <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="settings-title" tabindex="-1">模型配置</h1><span class="connection-status" id="connection-status">未配置</span></div>
+    <div class="model-tabs" role="tablist" aria-label="模型配置分类">
+     <button type="button" role="tab" id="settings-tab-connection" aria-controls="settings-connection" aria-selected="true">连接</button>
+     <button type="button" role="tab" id="settings-tab-generation" aria-controls="settings-generation" aria-selected="false" tabindex="-1">生成参数</button>
+     <button type="button" role="tab" id="settings-tab-request" aria-controls="settings-request" aria-selected="false" tabindex="-1">请求选项</button>
+    </div>
+   </div>
+   <div class="settings-scroll" id="settings-scroll"><div class="settings-content">
+    <section class="model-panel" id="settings-connection" role="tabpanel" aria-labelledby="settings-tab-connection">
+
+     <div class="model-section"><h2>服务连接</h2><div class="model-fields">
+      <label class="model-field wide"><span>接口协议</span><select id="setting-protocol"><option value="chat-completions">Chat Completions · 兼容接口</option></select></label>
+      <label class="model-field wide"><span>服务地址 <small>Base URL</small></span><input id="setting-endpoint" type="url" placeholder="https://api.example.com/v1" spellcheck="false"></label>
+      <label class="model-field wide"><span>访问密钥 <small>API Key</small></span><div class="secret-field"><input id="setting-key" type="password" autocomplete="new-password" placeholder="输入 API Key" spellcheck="false"><button class="reset" id="settings-key-toggle" type="button" aria-label="显示 API Key" aria-pressed="false">显示</button><button class="reset" id="settings-key-remove" type="button">移除</button></div></label>
+     </div></div>
+     <div class="model-section"><h2>对话模型</h2><div class="model-fields"><label class="model-field wide"><span>模型标识 <small>Model ID</small></span><input id="setting-model" type="text" placeholder="输入模型标识" maxlength="120" spellcheck="false"></label></div></div>
+    </section>
+    <section class="model-panel" id="settings-generation" role="tabpanel" aria-labelledby="settings-tab-generation" hidden>
+     <div class="model-section"><h2>采样</h2><div class="model-fields">
+      <label class="model-field wide"><span>采样方式</span><select id="setting-sampling"><option value="default">跟随模型默认</option><option value="temperature">Temperature</option><option value="topP">Top P</option></select></label>
+      <label class="model-field"><span>温度 <small>temperature</small></span><input id="setting-temperature" type="number" min="0" max="2" step="0.1" placeholder="模型默认" disabled></label>
+      <label class="model-field"><span>核采样 <small>top_p</small></span><input id="setting-topP" type="number" min="0.01" max="1" step="0.05" placeholder="模型默认" disabled></label>
+     </div></div>
+     <div class="model-section"><h2>输出</h2><div class="model-fields">
+      <label class="model-field"><span>最大输出 <small>Tokens</small></span><input id="setting-maxTokens" type="number" min="1" step="1" placeholder="模型默认"></label>
+      <label class="model-field"><span>推理强度 <small>reasoning_effort</small></span><select id="setting-reasoning"><option value="default">跟随模型默认</option><option value="low">低 · Low</option><option value="medium">中 · Medium</option><option value="high">高 · High</option></select></label>
+     </div></div>
+    </section>
+    <section class="model-panel" id="settings-request" role="tabpanel" aria-labelledby="settings-tab-request" hidden>
+     <div class="model-section"><h2>请求控制</h2><div class="model-fields">
+      <label class="model-field"><span>请求超时 <small>秒</small></span><input id="setting-timeout" type="number" min="1" max="3600" step="1"></label>
+      <label class="model-field"><span>失败重试 <small>次数</small></span><input id="setting-retries" type="number" min="0" max="5" step="1"></label>
+      <label class="settings-inline"><input id="setting-stream" type="checkbox">流式输出</label>
+     </div></div>
+    </section>
+   </div></div>
+   <footer class="settings-footer"><p id="settings-feedback" role="status">无未保存的修改</p><button class="action secondary" id="settings-reset" type="button">恢复参数默认</button><button class="action" id="settings-save" type="submit" disabled>保存配置</button></footer>
+  </form>
+ </div>
+</main>
+
+
+<script src="/identity.js"></script>
+<script src="/layout.js"></script>
+<script src="/model-picker.js"></script>
+<script src="/capabilities.js"></script>
+<script src="/settings.js"></script>
+<script src="/chat.js"></script>
+</body>
+</html>

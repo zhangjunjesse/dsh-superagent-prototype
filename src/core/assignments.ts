@@ -112,8 +112,10 @@ export class Assignments extends EnginePart {
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
     const at = this.now()
     const previous = ticket.attention
-    const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
-    const asked = report.question && report.question !== previous?.question ? ask(report.question) : previous
+    // An explicitly repeated answered question is a new request, even within the same clock tick.
+    const ask = (question: string) => ({ id: key('attention', ticketId, question, at,
+      ...previous?.answeredBy ? [previous.id, previous.answeredBy.commandId] : []), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
+    const asked = report.question && (report.question !== previous?.question || previous?.answeredBy) ? ask(report.question) : previous
     const attention = report.question === null || report.state === 'ready' ? undefined : asked
     if (attention) ticket.attention = attention
     else delete ticket.attention

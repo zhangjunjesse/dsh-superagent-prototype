@@ -10,6 +10,7 @@ import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
+import { commandLine, powershellQuote, powershellRun } from './command-line.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
@@ -20,11 +21,15 @@ export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bi
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
-export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
+export const credentialHelper = (cli: string): string => process.platform === 'win32' && /\.ps1$/i.test(cli)
+  // Git's bundled shell quotes the fixed helper argv. -File keeps Git's credential-protocol stdin available to the account wrapper.
+  ? '!' + ['pwsh.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', cli, 'auth', 'git-credential'].map(shellQuote).join(' ')
+  : `!${shellQuote(cli)} auth git-credential`
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
-  return real(a) === real(b)
+  const canonical = (path: string): string => process.platform === 'win32' ? real(path).toLowerCase() : real(path)
+  return canonical(a) === canonical(b)
 }
 export function withoutDirectory(path: string, dir: string): string {
   return path.split(delimiter).filter(entry => !sameDirectory(entry, dir)).join(delimiter)
@@ -60,7 +65,7 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 /** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
-  const head = (await readFile(file, 'utf8')).split('\n', 2)
+  const head = (await readFile(file, 'utf8')).split(/\r?\n/, 2)
   return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
@@ -84,25 +89,43 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   for (const name of before) { const file = join(dir, name); if (!await written(file)) throw new SetupError('foreignFile', { file }) }
   // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
   const kept = new Set<string>()
+  const commandKey = (name: string): string => process.platform === 'win32' ? name.toLowerCase() : name
   const shim = async (name: string, body: string): Promise<void> => {
-    const temporary = join(dir, `.${name}.${process.pid}.tmp`)
-    await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
-    await rename(temporary, join(dir, name))
-    kept.add(name)
+    const file = process.platform === 'win32' ? `${name}.ps1` : name
+    const temporary = join(dir, `.${file}.${process.pid}.tmp`)
+    const text = process.platform === 'win32' ? `${MARKER}\n${powershellRun(body)}\n` : `#!/bin/sh\n${MARKER}\n${body}\n`
+    await writeFile(temporary, text, { mode: 0o755 })
+    await rename(temporary, join(dir, file))
+    kept.add(commandKey(file))
   }
-  const withoutShims = [
+  const withoutShims = process.platform === 'win32' ? [
+    // Resolve junctions in every path component, not only the final component; compare Windows paths case-insensitively.
+    'function Get-SuperagentDirectory([string]$entry) {',
+    "if ($entry -eq '') { return '' }",
+    '$full = [IO.Path]::GetFullPath($entry.Trim(\'"\'))',
+    '$root = [IO.Path]::GetPathRoot($full)', '$current = $root',
+    'try { foreach ($part in $full.Substring($root.Length).Split([char[]]\'\\/\', [StringSplitOptions]::RemoveEmptyEntries)) {',
+    '$current = [IO.Path]::Combine($current, $part)', '$target = ([IO.DirectoryInfo]::new($current)).ResolveLinkTarget($true)',
+    'if ($null -ne $target) { $current = $target.FullName }',
+    '} } catch { $current = $full }', "return $current.TrimEnd([char[]]'\\/')", '}',
+    `$self = Get-SuperagentDirectory ${powershellQuote(dir)}`,
+    "$env:PATH = (@($env:PATH.Split(';') | Where-Object { (Get-SuperagentDirectory $_) -ine $self }) -join ';')",
+  ].join('\n') : [
     `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
     'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
   ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
+  const run = (program: string): string => process.platform === 'win32'
+    ? `$arguments = @($args)\n${withoutShims}\n& ${powershellQuote(program)} @arguments`
+    : `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  const fail = (message: string): string => process.platform === 'win32'
+    ? `[Console]::Error.WriteLine(${powershellQuote(message)}); exit 1` : `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', run(github.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
+  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(commandKey(name))))) {
     await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
   }
-  for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
+  for (const name of before) if (!kept.has(commandKey(name))) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [
     MARKER,
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
@@ -126,7 +149,7 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */
 export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[], cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
-  const handle = subprocess.spawn({ argv, cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
+  const handle = subprocess.spawn({ argv: commandLine(argv, cwd, { ...process.env, ...env }), cwd, graceMs: 2000, signal, ...env ? { env } : {}, stdio: { stdin: 'ignore', stdout: { maxBytes: 1 << 20 }, stderr: { maxBytes: 1 << 16 } } })
   const { exitCode } = await handle.done
   const read = (reader: SubprocessOutputReader | undefined): string => reader?.readFrom(0).text ?? ''
   if (exitCode === 0) return read(handle.collected.stdout)

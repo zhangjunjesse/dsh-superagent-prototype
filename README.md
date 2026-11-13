@@ -8,7 +8,20 @@ dsh-superagent is a proactive coding agent for one GitHub repository, packaged a
 
 It is also a way of working with an agent: **take as little human attention as possible, and give as much value as possible.** An agent that can act for a whole team can also waste a whole team's attention, so it acts only when asked or when a rule the team wrote allows it, and speaks only when someone must act or can use a result. [docs/000-philosophy.md](docs/000-philosophy.md) explains the principle and what it asks of the operator.
 
-## Setup
+## Jarvis in this fork
+
+This fork adds a single user-facing assistant to the existing DSH bundle. Users talk to Jarvis; the original superagent runtime handles authorized background work. The assistant has its own DSH session, settings, model controls and tool preferences. A durable Gateway connects task submission, status queries and results without making the conversation wait for a worker to finish.
+
+- **Interface and session:** [Jarvis](jarvis/README.md) and [DSH integration](jarvis/DSH-INTEGRATION.md). The functional entry is the **贾维斯** item in the DSH Web sidebar; `jarvis-demo/` contains earlier design references.
+- **Background work:** [Gateway integration and boundaries](docs/jarvis-gateway-integration.md), [design](docs/jarvis-gateway-design.md), and [implementation evidence](docs/jarvis-gateway-progress.md). A task does not require a GitHub Issue or a PR deliverable. The underlying runtime still requires its repository/account deployment setup.
+- **GitHub setup:** [Connection workflow](docs/github-connection-progress.md). Connect a repository using its URL or `owner/repository`, with a Token or an existing CLI account. Account connection and automatic GitHub message reception are separate settings. Managed Token storage currently uses Windows CurrentUser DPAPI.
+- **Project constraints and checks:** [AGENTS.md](AGENTS.md). The original authorization and execution rules remain the foundation; the Gateway adds constrained dispatch at their existing entry points.
+
+The integrated Windows DSH Web profile has completed a real-model, read-only public-repository task and delivered its result back to Jarvis. Controlled tests cover additional routing, isolation and recovery cases. This is not evidence of private-repository access, remote push, Issue-to-PR completion, or production readiness; current verification limits and known test failures are recorded in the linked documents.
+
+Jarvis and its Gateway are optional bundle entries and are disabled by default. Follow the integration documentation for an isolated profile; installing the package alone does not enable them. Do not run first-time profile initialization against an existing profile.
+
+## Original superagent setup
 
 Setup has many steps, so an agent does it with you. Ask your coding agent:
 

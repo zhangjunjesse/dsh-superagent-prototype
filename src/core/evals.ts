@@ -2,16 +2,20 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
-import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
+import type { ConsumptionOutcome, Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
 import type { AssessmentOutcome, Candidate, Policy } from './ports.ts'
-import { said, type Reason } from './reasons.ts'
+import { reasonText, said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Tickets } from './tickets.ts'
 
 /** An outcome for the Eval that holds a Trigger; `evalId` names the Eval it was judged for, so a later Eval refuses it. */
 export type Outcome = AssessmentOutcome & { evalId?: string }
 /** What an Eval ends with, as its Decision records it. */
-interface Finished { kind: DecisionKind; reason: Reason[]; audit?: Record<string, unknown>; ticketId?: string; mandate?: Mandate }
+interface Finished {
+  kind: DecisionKind; reason: Reason[]; audit?: Record<string, unknown>; ticketId?: string; mandate?: Mandate
+  consumptionOutcome?: ConsumptionOutcome
+  transient?: true
+}
 /** An outcome's reason: a code it carries, else the words its assessor or person wrote. */
 const reasonOf = (reason: string | Reason): Reason[] => [typeof reason === 'string' ? said(reason) : reason]
 const stronger = (a: Strength, b: Strength): Strength => a === 'explicit' || b === 'explicit' ? 'explicit' : 'inferred'
@@ -70,7 +74,21 @@ export class Evals extends EnginePart {
   /** Start one Eval of the Triggers queued on a Thread, judged by the gate, and ask the assessor for it. */
   start(threadKeyValue: string, policy: Policy): void {
     const thread = this.repo.threads.get(threadKeyValue)!
+    this.dispatch.assertBatch(thread.pending, thread)
+    thread.pending = thread.pending.filter(id => {
+      const trigger = this.repo.triggers.get(id)
+      return !trigger?.dispatch || !this.dispatch.receipt(trigger)
+    })
+    this.repo.threads.save(thread)
+    if (!thread.pending.length) return
     const at = this.now()
+    const command = this.repo.triggers.get(thread.pending[0]!)
+    const failure = command?.dispatch && this.dispatch.admission(command)
+    if (failure) {
+      this.ignore(thread, [...thread.pending], [said(failure.reason)], policy, at, failure.outcome)
+      this.repo.threads.save(thread)
+      return
+    }
     // A person's follow-up a ticket still decides is that ticket's: one an older version queued leaves the queue without a Decision.
     const delivered = (id: string) => {
       const trigger = this.repo.triggers.get(id)
@@ -132,6 +150,7 @@ export class Evals extends EnginePart {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
     const held = this.holding(triggerId)
+    this.dispatch.assertBatch(held?.evaluating?.triggerIds ?? [triggerId], held)
     if (outcome.evalId && held?.evaluating?.id !== outcome.evalId) throw new UserError('evalFinished', { eval: outcome.evalId })
     // Prevent a replayed trigger that already created a ticket from spawning a second one.
     const earlier = outcome.kind === 'accept' ? this.accepted(threadKey(trigger.threads[0]!)).get(triggerId) : undefined
@@ -167,6 +186,7 @@ export class Evals extends EnginePart {
   private requeue(triggerId: string): boolean {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
+    if (trigger.dispatch && this.dispatch.receipt(trigger)) return false
     if (this.holding(triggerId)) return false
     this.queueForEval(trigger)
     const disposition = this.repo.triggers.disposition(triggerId) ?? { fanout: [], at: this.now() }
@@ -214,6 +234,13 @@ export class Evals extends EnginePart {
     if (held?.evaluating?.triggerIds.length === 1) this.finish(held, held.evaluating, { kind: 'ignore', reason: [reason] })
     else if (held) this.reassess(held, { ...reason, triggerId }, [triggerId])
   }
+  /** Retire a terminal command's outstanding candidate without overwriting its immutable result. */
+  consumed(triggerId: string): void {
+    const trigger = this.repo.triggers.get(triggerId)!
+    this.withdraw(trigger)
+    const held = this.holding(triggerId)
+    if (held) this.finish(held, held.evaluating!, { kind: 'ignore', reason: [said('Command has a terminal receipt')], transient: true })
+  }
   /** Start the Evals in progress again under the new Policy version, and say that it changed. */
   policyChanged(from: string, to: string): void {
     for (const thread of this.repo.threads.active()) if (thread.evaluating) this.reassess(thread, { code: 'policyChanged' })
@@ -222,7 +249,7 @@ export class Evals extends EnginePart {
   /** End a Thread's Eval as unavailable for `reason` and queue its Triggers, except `without`, for a new Eval ahead of the others. */
   private reassess(thread: Thread, reason: Reason, without: string[] = []): Decision {
     const ids = thread.evaluating!.triggerIds.filter(id => !without.includes(id))
-    const decision = this.finish(thread, thread.evaluating!, { kind: 'unavailable', reason: [reason] })
+    const decision = this.finish(thread, thread.evaluating!, { kind: 'unavailable', reason: [reason], transient: true })
     const current = this.repo.threads.get(thread.key)!
     current.pending = [...ids, ...current.pending.filter(id => !ids.includes(id))]
     this.repo.threads.save(current)
@@ -244,10 +271,10 @@ export class Evals extends EnginePart {
    * Record that the queued Triggers `ids` of a Thread start no Eval, for `reason`, and take them out of its queue. Its id
    * differs from an Eval's, so it never replaces the Decision of an earlier Eval of the same Triggers.
    */
-  private ignore(thread: Thread, ids: string[], reason: Reason[], policy: Policy, at: string): void {
+  private ignore(thread: Thread, ids: string[], reason: Reason[], policy: Policy, at: string, consumptionOutcome?: ConsumptionOutcome): void {
     const evaluation = { id: key('eval', thread.key, 'ignored', policy.version, at, ...ids), threadKey: thread.key, triggerIds: ids, strength: 'inferred' as const,
       actor: { source: thread.ref.source, id: '' }, basis: { via: 'followup' as const }, policyVersion: policy.version, startedAt: at, deadline: at }
-    this.record(thread, evaluation, { kind: 'ignore', reason })
+    this.record(thread, evaluation, { kind: 'ignore', reason, ...(consumptionOutcome ? { consumptionOutcome } : {}) })
     thread.pending = thread.pending.filter(id => !ids.includes(id))
     delete thread.expired
   }
@@ -280,6 +307,7 @@ export class Evals extends EnginePart {
   }
   /** Apply an outcome to an Eval of a Thread: the one in progress, or a gate-only one. */
   private decideEval(thread: Thread, evaluation: Evaluation, outcome: AssessmentOutcome): Decision {
+    this.dispatch.assertBatch(evaluation.triggerIds, thread)
     const audit = outcome.audit ? { audit: outcome.audit } : {}
     // Requeue if Policy changed without a live policyChanged call (such as across an upgrade or restart).
     if (this.policy().version !== evaluation.policyVersion) {
@@ -309,6 +337,8 @@ export class Evals extends EnginePart {
     const { strength, policyVersion, actor } = evaluation
     const mandate: Mandate = { strength, policyVersion, basis, actor, scope: outcome.scope }
     const ticketId = key('ticket', evaluation.id)
+    for (const id of evaluation.triggerIds) this.dispatch.bindNew(this.repo.triggers.get(id)!, ticketId)
+    if (thread.commandBinding) thread.commandBinding = this.repo.threads.get(thread.key)!.commandBinding
     const audit = outcome.audit ? { audit: outcome.audit } : {}
     const decision = this.finish(thread, evaluation, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId })
     this.tickets.create(ticketId, decision.id, mandate, evaluation, outcome, at)
@@ -325,6 +355,7 @@ export class Evals extends EnginePart {
     return decision
   }
   private record(thread: Thread, evaluation: Evaluation, outcome: Finished): Decision {
+    this.dispatch.assertBatch(evaluation.triggerIds, thread)
     const at = this.now()
     const decision: Decision = { id: key('decision', evaluation.id), evalId: evaluation.id, threadKey: thread.key, triggerIds: evaluation.triggerIds,
       policyVersion: evaluation.policyVersion, at, kind: outcome.kind, reason: outcome.reason, strength: evaluation.strength,
@@ -333,6 +364,13 @@ export class Evals extends EnginePart {
     for (const id of evaluation.triggerIds) {
       const disposition = this.repo.triggers.disposition(id) ?? { fanout: [], at }
       this.repo.triggers.saveDisposition(id, { ...disposition, evalId: evaluation.id, decisionId: decision.id })
+      const trigger = this.repo.triggers.get(id)
+      if (trigger && !outcome.transient) this.dispatch.commit(trigger, {
+        outcome: outcome.consumptionOutcome ?? (outcome.kind === 'accept' || outcome.kind === 'stop' ? 'applied'
+          : outcome.kind === 'unavailable' ? 'unavailable' : 'ignored'),
+        decisionId: decision.id, ...(outcome.ticketId ? { ticketId: outcome.ticketId } : {}),
+        reason: outcome.reason.map(reason => reasonText(reason)).join('; '),
+      })
     }
     this.emit('decision.recorded', { decisionId: decision.id, kind: decision.kind, threadKey: thread.key })
     return decision

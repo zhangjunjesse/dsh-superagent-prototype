@@ -20,14 +20,18 @@ export class Intake extends EnginePart {
     // Normalize source timestamps (such as GitHub whole seconds) to canonical ISO form.
     const trigger = { ...received, at: isoTime(received.at) }
     if (!trigger.threads.length) throw new Error('A trigger must belong to at least one thread')
-    if (this.repo.triggers.get(trigger.id)) return 'duplicate'
+    if (this.dispatch.ingress(trigger)) return 'duplicate'
     const at = this.now()
+    if (trigger.dispatch) this.dispatch.claim(trigger, this.thread(trigger.threads[0]!))
     const filter = this.options.scope.scope(trigger)
     if (!filter.listened) {
       this.repo.triggers.save(trigger); this.repo.triggers.saveDisposition(trigger.id, { filtered: { code: filter.reason }, fanout: [], at })
+      this.dispatch.commit(trigger, { outcome: 'denied', reason: 'sourceNotListening' })
       return 'filtered'
     }
     this.repo.triggers.save(trigger)
+    const denied = this.dispatch.admission(trigger)
+    if (denied) { this.dispatch.commit(trigger, denied); return 'filtered' }
     const keys = trigger.threads.map(threadKey)
     // Track reached tickets and whether they were reached only via context threads (a ticket's own thread makes `context` false).
     const reached = new Map<string, { ticket: Ticket; context: boolean }>()

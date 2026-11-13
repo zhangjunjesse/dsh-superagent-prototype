@@ -123,6 +123,45 @@ div.dt-preview-head { color: var(--dsw-alias-label-secondary); }
 .dt-card-head { display: flex; align-items: center; gap: 12px; min-height: 28px; }
 .dt-card-head .dt-row-main { flex: 1 1 0; min-width: 64px; }
 .dt-card-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* GitHub connection settings keep credentials outside the receiving-preferences form. */
+.dt-github-card { gap: 20px; padding: 22px; background: var(--dsw-alias-bg-layer-1, #fff); }
+.dt-github-card .dt-card-head { align-items: flex-start; }
+.dt-github-card .dt-card-title { font-size: 17px; line-height: 24px; font-weight: 600; }
+.dt-github-brand { display: grid; place-items: center; width: 40px; height: 40px; flex: none; border: 0.5px solid var(--dsw-alias-border-l3, #e7e9ed); border-radius: 12px; color: var(--dsw-alias-label-secondary, #4b5563); }
+.dt-github-connection, .dt-github-connect-form { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.dt-github-status { display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 16px; border: 0.5px solid var(--dsw-alias-border-l3, #e7e9ed); border-radius: 12px; background: var(--dsw-alias-bg-layer-2, #f8f9fb); }
+.dt-github-status-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; line-height: 22px; }
+.dt-github-status-title strong { font-weight: 600; }
+.dt-github-current { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; color: var(--dsw-alias-label-secondary, #4b5563); font-size: 13px; line-height: 20px; }
+.dt-github-current > span { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.dt-github-current svg { flex: none; color: var(--dsw-alias-label-tertiary, #76808f); }
+.dt-github-repository { font-weight: 500; }
+.dt-github-readiness { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-tertiary, #76808f); }
+.dt-github-readiness[data-ready] { color: var(--dsw-alias-state-success-primary, #178253); }
+.dt-github-setup, .dt-github-api-error { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.dt-github-setup .dt-error, .dt-github-api-error .dt-error { flex: 1 1 220px; overflow-wrap: anywhere; }
+.dt-github-card .dt-field-head { font-size: 13px; font-weight: 500; }
+.dt-github-card .dt-input { min-height: 38px; padding-inline: 11px; border-color: var(--dsw-alias-border-l3, #e7e9ed); }
+.dt-github-card .dt-input:focus-within { border-color: var(--dsw-alias-brand-primary, #3878ed); }
+.dt-github-auth { display: flex; flex-direction: column; align-items: stretch; gap: 10px; min-width: 0; }
+.dt-github-auth > a { align-self: flex-start; }
+.dt-github-connect-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.dt-github-connect-actions > .dt-hint { flex: 1 1 220px; max-width: 440px; }
+.dt-github-connect-actions > .dt-actions { flex: none; justify-content: flex-end; }
+.dt-github-receiving { display: flex; flex-direction: column; gap: 16px; min-width: 0; padding-top: 20px; border-top: 0.5px solid var(--dsw-alias-border-l3, #e7e9ed); }
+.dt-github-receiving-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.dt-github-receiving-head h3 { margin: 0 0 4px; font-size: 14px; line-height: 22px; font-weight: 600; }
+.dt-github-receiving-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; }
+.dt-github-receiving-options .dt-switch-row { min-width: 0; }
+.dt-github-receiving > .dt-savebar { margin: 0 -22px -22px; padding: 12px 22px; border-radius: 0 0 16px 16px; }
+@container (max-width: 640px) {
+  .dt-github-card { padding: 16px; }
+  .dt-github-connect-actions { align-items: stretch; flex-direction: column; gap: 12px; }
+  .dt-github-connect-actions > .dt-hint { flex-basis: auto; }
+  .dt-github-connect-actions > .dt-actions { justify-content: flex-start; }
+  .dt-github-receiving-options { grid-template-columns: minmax(0, 1fr); }
+  .dt-github-receiving > .dt-savebar { margin-inline: -16px; margin-bottom: -16px; padding-inline: 16px; }
+}
 .dt-row-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
 .dt-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .dt-rows-item { display: grid; grid-template-columns: repeat(var(--dt-columns), minmax(0, 1fr)) auto; gap: 8px; align-items: center; }

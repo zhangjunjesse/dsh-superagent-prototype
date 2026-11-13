@@ -11,7 +11,7 @@ import type { Store } from './store.ts'
 export interface SourceContextDeps {
   readonly store: Pick<Store, 'atomic' | 'get' | 'set' | 'delete' | 'keys' | 'threads' | 'tickets' | 'triggers' | 'read'>
   readonly outbox: Pick<Outbox, 'send'>
-  readonly engine: Pick<EngineForSources, 'bindThread' | 'threadClosed'>
+  readonly engine: Pick<EngineForSources, 'bindThread' | 'threadClosed' | 'commandReceipt'>
   readonly commands: Commands
   readonly sources: SourceRegistry
   /** Throws when accessed before initial setup completes. */
@@ -44,6 +44,16 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
       return instance?.enabled ? instance.config : undefined
     },
     receive: trigger => deps.receive(trigger),
+    submitConstrained: trigger => {
+      if (!trigger.dispatch) throw new Error('A constrained submission requires a dispatch constraint')
+      if (trigger.source !== kind.kind || trigger.actor.source !== kind.kind) throw new Error('A constrained submission must belong to this Source')
+      if (!deps.configured() || !deps.sources.instance(kind.kind)?.enabled) throw new Error('The Source is unavailable for constrained submissions')
+      return deps.receive(trigger)
+    },
+    commandReceipt: triggerId => {
+      const trigger = store.triggers.get(triggerId)
+      return trigger?.source === kind.kind && trigger.dispatch ? deps.engine.commandReceipt(triggerId) : undefined
+    },
     atomic: work => store.atomic(work),
     state: {
       get: name => store.get(name),

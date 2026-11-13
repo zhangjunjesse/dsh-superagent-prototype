@@ -1,5 +1,5 @@
 /** In-memory repository implementation for testing and ephemeral engine instances. */
-import { latestAssignment, type Decision, type Thread, type Ticket, type Trigger, type TriggerDisposition } from './model.ts'
+import { latestAssignment, threadKey, type Decision, type Thread, type Ticket, type Trigger, type TriggerDisposition } from './model.ts'
 import type { Repositories } from './ports.ts'
 
 const clone = <T>(value: T): T => structuredClone(value)
@@ -24,6 +24,8 @@ export class MemoryRepositories implements Repositories {
   }
   readonly triggers = {
     get: (id: string) => clone(this.triggerRows.get(id)),
+    byThread: (key: string) => [...this.triggerRows.values()].filter(trigger => trigger.threads.some(ref => threadKey(ref) === key)).map(clone),
+    byCommand: (source: string, commandId: string) => clone([...this.triggerRows.values()].find(trigger => trigger.source === source && trigger.dispatch?.commandId === commandId)),
     save: (trigger: Trigger) => { this.triggerRows.set(trigger.id, clone(trigger)) },
     disposition: (id: string) => clone(this.dispositions.get(id)),
     saveDisposition: (id: string, value: TriggerDisposition) => { this.dispositions.set(id, clone(value)) },

@@ -13,6 +13,7 @@ import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, Source
   TicketRow, TicketStage,
   TriggerRow } from '../../src/client/api.ts'
 import { SETUP_FIELDS } from '../../src/deployment.ts'
+import { absolutePathPattern } from '../../src/infra/host-paths.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema } from '../../src/policy.ts'
 import { SetupError, type SetupCode } from '../../src/setup.ts'
 import { feishuChannel } from '../../src/sources/feishu-trigger.ts'
@@ -85,6 +86,10 @@ export const MACHINE = { stateDir: '/srv/dsh-superagent', promptMaxChars: 100000
 
 type Settings = ReturnType<typeof SettingsSchema.parse>
 export interface PanelServer {
+  /** The fake backend is Unix by default, independent of the machine running the browser tests. */
+  executionPlatform?: 'win32' | 'linux'
+  githubConnection?: ApiResponse<'GET github/connection'>
+  githubConnect?: (input: Api['POST github/connection']['body']) => Promise<ApiResponse<'GET github/connection'>>
   joined?: Record<string, string>; joining?: Record<string, string>
   joinError?: string
   settings: Settings; revisions: Record<string, number>
@@ -169,13 +174,22 @@ const settingsView = (): ApiResponse<'GET settings'> => ({
     eval: { value: server.settings.eval, revision: server.revisions.eval ?? 0 },
     executor: { value: server.settings.executor, revision: server.revisions.executor ?? 0 } },
   sources: sourceSettings(),
-  environment: { root: '/srv/dsh-superagent/work', variables: [
+  environment: { root: server.executionPlatform === 'win32' ? 'D:\\superagent\\work' : '/srv/dsh-superagent/work',
+    shell: server.executionPlatform === 'win32' ? 'pwsh' : 'sh', directoryPattern: `${absolutePathPattern(server.executionPlatform ?? 'linux').source}.*`, variables: [
     { owner: 'executor', enabled: true, variables: [{ key: 'DSH_SUPERAGENT_DIR', description: { zh: '工单的执行目录',
       en: 'The ticket directory' } },
       { key: 'DSH_SUPERAGENT_NAME', description: { zh: '工单短名', en: 'Short name' } }] },
     { owner: 'github', enabled: false, variables: [{ key: 'DSH_SUPERAGENT_GITHUB_REPOSITORY', description: { zh: '仓库',
       en: 'Repository' } }] }] },
 })
+function githubConnectionView(): ApiResponse<'GET github/connection'> {
+  if (server.githubConnection) return server.githubConnection
+  const config = server.settings.sources.github?.config ?? {}
+  return { available: true, tokenSupported: true, browserSupported: false, cli: '/usr/bin/gh', connection: {
+    repository: String(config.repository ?? ''), login: server.setup.accounts?.agent ?? null,
+    managed: false, configured: Boolean(config.repository && config.cli),
+  }, job: null }
+}
 const overviewView = (): ApiResponse<'GET overview'> => {
   const { problem, feishuProblem } = server.setup
   const setup = problem ?? feishuProblem
@@ -300,6 +314,18 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   } },
   'GET sources': { answer: sourceStatuses },
   'GET settings': { answer: settingsView },
+  'GET github/connection': { answer: githubConnectionView },
+  'POST github/connection': { body: true, answer: ({ body }) => {
+    if (server.githubConnect) return server.githubConnect(body)
+    server.githubConnection = { ...githubConnectionView(), job: { id: 'connection-1', status: 'checking', message: 'Checking GitHub connection' } }
+    return server.githubConnection
+  } },
+  'POST github/connection/cancel': { body: true, answer: ({ body }) => {
+    const current = githubConnectionView()
+    server.githubConnection = { ...current, job: current.job?.id === body.id && current.job.status === 'checking'
+      ? { ...current.job, status: 'cancelled', message: 'Connection cancelled' } : current.job }
+    return server.githubConnection
+  } },
   'POST sources/:id/labels': { answer: () => {
     // Label refresh failures come from the bot CLI and are returned verbatim.
     if (server.joinError) return refuse(500, server.joinError)
@@ -350,7 +376,9 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     if (body.revision !== (server.revisions[block] ?? 0)) return refuse(409, 'Settings changed. Reload before saving.')
     let restarting = false
     if (block === 'policy') server.settings = { ...server.settings, policy: PolicyConfigSchema.parse(body.value) }
-    else if (block === 'executor') server.settings = { ...server.settings, executor: ExecutorConfigSchema.parse(body.value) }
+    else if (block === 'executor') server.settings = { ...server.settings, executor: ExecutorConfigSchema.extend({
+      directory: z.string().trim().refine(path => path === '' || absolutePathPattern(server.executionPlatform ?? 'linux').test(path)).default(''),
+    }).parse(body.value) }
     else if (block === 'eval') server.settings = { ...server.settings, eval: EvalConfigSchema.parse(body.value) }
     else if (source) {
       const { enabled, config: value } = SourceSave.parse(body.value)

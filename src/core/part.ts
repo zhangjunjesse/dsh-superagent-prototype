@@ -1,5 +1,6 @@
 /** Shared base class and configuration for Engine domain parts. */
 import { UserError } from './errors.ts'
+import { Dispatches } from './dispatch.ts'
 import { followupOwners, reached, threadKey } from './model.ts'
 import type { Thread, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Assessor, AssessmentOutcome, DomainEvent, DomainEvents, Executor, Outbox, Policy, Repositories, SourceScope } from './ports.ts'
@@ -23,7 +24,8 @@ export interface EngineOptions {
  */
 export abstract class EnginePart {
   protected readonly repo: Repositories
-  constructor(protected readonly options: EngineOptions) { this.repo = options.repo }
+  protected readonly dispatch: Dispatches
+  constructor(protected readonly options: EngineOptions) { this.repo = options.repo; this.dispatch = new Dispatches(options) }
   protected now(): string { return this.options.now?.() ?? new Date().toISOString() }
   protected policy(): Policy { return this.options.policy() }
   /** The tickets whose worker decides a person's follow-up: see `followupOwners`. */
@@ -55,6 +57,7 @@ export abstract class EnginePart {
   }
   /** Queue a Trigger on its primary Thread for the next Eval, unless it waits there already or an Eval holds it. */
   protected queueForEval(trigger: Trigger): boolean {
+    if (trigger.dispatch && this.dispatch.receipt(trigger)) return false
     const primary = this.thread(trigger.threads[0]!)
     if (primary.pending.includes(trigger.id) || primary.evaluating?.triggerIds.includes(trigger.id)) return false
     primary.pending.push(trigger.id)

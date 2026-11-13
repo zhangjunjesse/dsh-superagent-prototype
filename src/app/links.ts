@@ -66,6 +66,8 @@ export async function candidateCard(host: LinkHost, candidate: Candidate) {
     mode: settings.eval.mode, ...others.length ? { batch: others.map(trigger => triggerCard(trigger)) } : {},
     ...handedBack.length ? { handed_back: handedBack } : {}, ...relatedTickets(candidate.tickets),
     ...(delivered.length ? { delivered_to: delivered } : {}), ...(referenced.length ? { referenced_tickets: referenced.map(ticketCard) } : {}),
-    next_action: candidate.strength === 'explicit' ? 'Route it with orchestrator_route as dispatch says: accept, attach, stop or ignore.'
+    ...(primary.dispatch ? { dispatch: triggerCard(primary).dispatch } : {}),
+    next_action: primary.dispatch ? `Constrained command ${primary.dispatch.operation}. Use only orchestrator_route: new means accept; append/answer means attach to ${primary.dispatch.targetTicketId ?? 'no target'}; stop means stop that target. Ignore if inappropriate. A refused route must not be replaced by note, retry, settings or another tool. The original command and target cannot be changed.`
+      : candidate.strength === 'explicit' ? 'Route it with orchestrator_route as dispatch says: accept, attach, stop or ignore.'
       : 'Ignore it with orchestrator_route if the card shows it touches no enabled rule; else assess it with orchestrator_eval, orchestrator_eval_read, then orchestrator_eval_decide.' }
 }

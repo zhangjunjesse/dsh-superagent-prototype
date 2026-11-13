@@ -1,5 +1,6 @@
 /** Domain model of a proactive agent: the concepts and their invariants, independent of any source, policy, or executor. */
 import type { Reason } from './reasons.ts'
+import { key } from './ids.ts'
 
 /** Actor identity in the source's own vocabulary; Policy decides which actors may originate work on that Source. */
 export interface ActorRef { source: string; id: string }
@@ -19,6 +20,50 @@ export function isoTime(value: string): string {
   return Number.isFinite(time) ? new Date(time).toISOString() : value
 }
 
+/** A source-supplied ceiling on one command's effects, never an authorization grant. */
+export interface DispatchConstraint {
+  commandId: string
+  payloadHash: string
+  operation: 'new' | 'append' | 'answer' | 'stop'
+  targetTicketId?: string
+  attentionId?: string
+  /** Gateway-owned association revision; audit only, not a cross-database CAS. */
+  bindingRevision?: number
+  controlPrecondition?: { mandateDecisionId: string }
+  expectedInitialRecipients: []
+}
+/** A command Thread remains reserved even after its subscriptions or Ticket end. */
+export interface CommandThreadBinding {
+  ownerSource: string
+  ownerCommandId: string
+  ownerTriggerId: string
+  payloadHash: string
+  allowedTicketId?: string
+}
+export type ConsumptionOutcome = 'applied' | 'ignored' | 'conflict' | 'denied' | 'unavailable'
+/** Immutable result, committed in the same transaction as this command's effects. */
+export interface ConsumptionReceipt {
+  commandId: string
+  payloadHash: string
+  triggerId: string
+  outcome: ConsumptionOutcome
+  outcomeRevision: 1
+  at: string
+  decisionId?: string
+  ticketId?: string
+  inputId?: string
+  attentionId?: string
+  reason?: string
+}
+/** Read-only receipt lookup; pending means recorded, not accepted or executed. */
+export interface CommandReceipt {
+  triggerId: string
+  commandId: string
+  payloadHash: string
+  status: 'pending' | ConsumptionOutcome
+  consumption?: ConsumptionReceipt
+}
+
 /** One immutable event produced by a source. `text` and `meta` are untrusted external data. */
 export interface Trigger {
   id: string
@@ -36,10 +81,15 @@ export interface Trigger {
   url?: string
   /** Source-native details for adapters; the core never interprets them. */
   meta: Record<string, unknown>
+  /** Optional immutable routing ceiling from a trusted source adapter. */
+  dispatch?: DispatchConstraint
 }
 
 /** Where a trigger went after intake; it grants nothing, but decides who decides a person's follow-up (see `followupOwners`). */
 export interface TriggerDisposition {
+  consumption?: ConsumptionReceipt
+  /** Invalid route proposals are auditable attempts, not terminal consumption. */
+  dispatchAttempts?: { operation: string; targetTicketId?: string; reason: string; at: string }[]
   /** Rejected by the source scope filter before entering the domain, for the Source's reason. */
   filtered?: Reason
   evalId?: string
@@ -155,6 +205,7 @@ export interface Evaluation {
 
 /** Thread aggregate: consistency boundary of eval, holder of subscriptions and decision history. */
 export interface Thread {
+  commandBinding?: CommandThreadBinding
   key: string
   ref: ThreadRef
   createdAt: string
@@ -231,6 +282,11 @@ export interface Assignment {
    */
   idleAt?: string
 }
+/** Stable identity derived from the actual saved report, shared by snapshots and Outbox context. */
+export function reportReference(assignment: Pick<Assignment, 'id' | 'report'>): string | undefined {
+  const report = assignment.report
+  return report ? key('report', assignment.id, report.state, report.at, report.summary) : undefined
+}
 
 export type TicketInput =
   /** A Trigger on one of its Threads, or attached to it; `human` when a person wrote it. */
@@ -272,7 +328,13 @@ export type TicketEndBy = 'executor' | 'human'
 /** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
-export interface Attention { id: string; question: string; triggerId?: string }
+export interface Attention {
+  id: string
+  question: string
+  triggerId?: string
+  /** CAS marker for the user's answer; distinct from the worker's answer to a human Trigger. */
+  answeredBy?: { commandId: string; triggerId: string; at: string }
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string

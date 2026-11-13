@@ -14,6 +14,11 @@
       "default": "./lib/index.js"
     },
     "./client": "./lib/client.js",
+    "./jarvis": "./jarvis/dsh/index.mjs",
+    "./jarvis-gateway": {
+      "types": "./lib/jarvis-gateway.d.ts",
+      "default": "./lib/jarvis-gateway.js"
+    },
     "./github-watch": "./lib/github-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./package.json": "./package.json",
@@ -25,7 +30,15 @@
     "locale/*.json",
     "README.md",
     "prompts",
-    "skills"
+    "skills",
+    "jarvis/dsh",
+    "!jarvis/dsh/*.test.mjs",
+    "!jarvis/dsh/*fixture*.mjs",
+    "jarvis/public",
+    "jarvis/store.mjs",
+    "jarvis/config.mjs",
+    "jarvis/vault.mjs",
+    "jarvis/DSH-INTEGRATION.md"
   ],
   "dsh": {
     "bundle": {

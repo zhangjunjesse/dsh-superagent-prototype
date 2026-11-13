@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { Store } from '../src/app/store.ts'
 import { SettingsSchema } from '../src/policy.ts'
@@ -196,12 +196,13 @@ it('sends text without HTML, entity-encoded tags included, and with images named
 it('words each settings save by what it changed from the one before, and nothing after a gap in the history', () => {
   const host = views()
   const first = store.settings()
+  const workDirectory = resolve('/srv/work')
   const allowed = (entries: { id: string; name?: string }[]) => ({ ...first.policy, sources: { ...first.policy.sources,
     feishu: { ...first.policy.sources.feishu!, allowed: entries } } })
   const alice = { id: 'ou_alice', name: 'Alice Liu' }, bob = { id: 'ou_bob', name: 'Bob' }
   store.saveSettings({ ...first, policy: allowed([alice, bob, { id: 'ou_carol' }]), paused: true,
     sources: { ...first.sources, feishu: { enabled: false, config: {} } },
-    executor: { ...first.executor, directory: '/srv/work', prepare: 'npm ci', blockedCommands: ['rm', 'curl'] } })
+    executor: { ...first.executor, directory: workDirectory, prepare: 'npm ci', blockedCommands: ['rm', 'curl'] } })
   const second = store.settings()
   store.saveSettings({ ...second, policy: allowed([alice, { id: 'ou_carol' }]), paused: false, sources: { ...second.sources,
     feishu: { enabled: true, config: {} } } })
@@ -210,7 +211,7 @@ it('words each settings save by what it changed from the one before, and nothing
   expect(changes(revision - 1)).toEqual([
     { code: 'sourceRowsAdded', source: 'feishu', part: true, field: 'allowed', items: ['Bob', 'ou_carol'] },
     { code: 'sourceRowsChanged', source: 'feishu', part: true, field: 'allowed', items: ['Alice Liu'] },
-    { code: 'paused' }, { code: 'executionDirectory', from: '', to: '/srv/work' }, { code: 'prepareCommand' },
+    { code: 'paused' }, { code: 'executionDirectory', from: '', to: workDirectory }, { code: 'prepareCommand' },
     { code: 'blockedCommands', from: '', to: 'rm curl' }, { code: 'sourceDisabled', source: 'feishu' }])
   expect(changes(revision)).toEqual([{ code: 'sourceRowsRemoved', source: 'feishu', part: true, field: 'allowed', items: ['Bob'] },
     { code: 'resumed' }, { code: 'sourceEnabled', source: 'feishu' }])

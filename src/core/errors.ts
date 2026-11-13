@@ -1,5 +1,11 @@
 /** User-facing error codes mapped to their category ('missing' or 'refused') and English message template. */
 export const USER_ERRORS = {
+  invalidDispatch: ['refused', 'Invalid immutable command constraint'],
+  commandConflict: ['refused', 'Command identity was reused with a different immutable envelope'],
+  commandThreadReserved: ['refused', 'This thread is reserved for one command and its fixed target'],
+  commandBatchMixed: ['refused', 'A constrained command cannot share an evaluation with any other trigger'],
+  commandRouteRefused: ['refused', '{reason}'],
+  commandConsumed: ['refused', 'This command already has an immutable terminal receipt; read commandReceipt'],
   unknownTicket: ['missing', 'Unknown ticket'],
   unknownProblem: ['missing', 'Unavailable Eval not found'],
   unknownTrigger: ['missing', 'Unknown trigger'],

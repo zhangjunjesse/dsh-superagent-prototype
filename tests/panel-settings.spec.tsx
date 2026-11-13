@@ -60,6 +60,31 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
     'settings/executor'])
 })
 
+it('uses the Windows host path rules and PowerShell variable syntax in execution settings', async () => {
+  server.executionPlatform = 'win32'
+  await mount()
+  await click(zh['tab.execution'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const directory = field<HTMLInputElement>(zh.executionDirectory)
+  expect(() => new RegExp(directory.pattern, 'v')).not.toThrow()
+  await type(directory, 'D:\\work files')
+  expect(directory.checkValidity()).toBe(true)
+  await type(directory, 'D:relative')
+  expect(directory.checkValidity()).toBe(false)
+  await type(directory, '/relative-to-drive')
+  expect(directory.checkValidity()).toBe(false)
+  await type(directory, 'D:\\work files')
+  const prepare = field<HTMLTextAreaElement>(zh.prepareCommand)
+  await type(prepare, 'git worktree add ')
+  prepare.setSelectionRange(prepare.value.length, prepare.value.length)
+  await click('可用的环境变量 3')
+  await click('DSH_SUPERAGENT_DIR')
+  expect(prepare.value).toBe('git worktree add "${env:DSH_SUPERAGENT_DIR}"')
+  await click(zh.save)
+  expect(server.settings.executor.directory).toBe('D:\\work files')
+  expect(server.settings.executor.prepare).toBe('git worktree add "${env:DSH_SUPERAGENT_DIR}"')
+})
+
 it('loads configuration history on demand with localized changes, Source field labels and notified Tickets', async () => {
   server.history = { current: 3, policyVersion: 'abcdef1234567890', items: [{ revision: 3, savedAt: '2026-09-22T00:00:00Z',
     source: 'sync', policyVersion: 'abcdef1234567890', policyChanged: true, notified: [{ id: 't1', title: '修复回归' }], block: 'policy',
@@ -102,10 +127,13 @@ it('shows save and discard only while a settings block has edits, at the end of 
   await click(find(zh['term.source'], '.dt-settings-link'))
   expect(all('.dt-savebar')).toHaveLength(0)
   const github = all('.dt-card').find(card => card.querySelector('.dt-card-title')?.textContent === 'GitHub')!
-  await type(field<HTMLInputElement>('智能体的 GitHub CLI'), 'gh-other')
-  expect(github.lastElementChild!.classList.contains('dt-savebar')).toBe(true)
-  // The agent CLI is read by setup, so the bar warns that saving restarts dsh-superagent and interrupts running work.
-  expect(github.lastElementChild!.textContent).toContain('2 个进行中的派工会中断')
+  await click(github.querySelector<HTMLElement>('[role="switch"][aria-label="接收仓库里的新 Issue"]')!)
+  const receiving = github.querySelector('.dt-github-receiving')!
+  expect(receiving.lastElementChild!.classList.contains('dt-savebar')).toBe(true)
+  // Receiving preferences have their own save bar; connection changes separately warn about interrupted assignments.
+  expect(github.querySelector('.dt-github-connect-actions')!.textContent).toContain('2')
+  await click(zh.discard)
+  expect(receiving.querySelector('.dt-savebar')).toBeNull()
 })
 
 it('gives the focus back to the field that had it once a block\'s save ends', async () => {

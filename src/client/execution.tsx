@@ -86,8 +86,9 @@ export function ExecutionSettings() {
   const insert = (key: string) => {
     const field = prepare.current
     const at = field?.selectionStart ?? value.prepare.length, to = field?.selectionEnd ?? at
-    edit({ prepare: `${value.prepare.slice(0, at)}"$${key}"${value.prepare.slice(to)}` })
-    requestAnimationFrame(() => { field?.focus(); const caret = at + key.length + 3; field?.setSelectionRange(caret, caret) })
+    const reference = environment.shell === 'pwsh' ? `"\${env:${key}}"` : `"$${key}"`
+    edit({ prepare: `${value.prepare.slice(0, at)}${reference}${value.prepare.slice(to)}` })
+    requestAnimationFrame(() => { field?.focus(); const caret = at + reference.length; field?.setSelectionRange(caret, caret) })
   }
   return <div className="dt-form">
     <form className="dt-form" onSubmit={event => { void draft.submit(event) }}>
@@ -105,7 +106,7 @@ export function ExecutionSettings() {
           <h2 className="dt-block-title">{t('term.environment')}<InfoTip text={t('environmentIntro')} /></h2>
           <Field label={t('executionDirectory')} hint={t('executionDirectoryHint')} note={value.directory ? undefined
             : t('executionDirectoryDefault', { root: environment.root })}>
-            <Input className="dt-mono" value={value.directory} placeholder={t('executionDirectoryEmpty')} spellCheck={false} pattern="/.*"
+            <Input className="dt-mono" value={value.directory} placeholder={t('executionDirectoryEmpty')} spellCheck={false} pattern={environment.directoryPattern ?? '/.*'}
               onChange={event => edit({ directory: event.target.value })} />
           </Field>
           <Field label={t('prepareCommand')} hint={t('prepareCommandHint')}>

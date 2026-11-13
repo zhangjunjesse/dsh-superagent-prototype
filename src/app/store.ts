@@ -51,9 +51,9 @@ export { SCHEMA_VERSION }
 export class Store implements Repositories {
   readonly db: DatabaseSync
   /**
-   * Opens or creates the SQLite database at `path`, migrating schema 10 to schema 11 in a single transaction.
+   * Opens or creates the SQLite database at `path`, migrating supported schemas in a single transaction.
    * @param report - Receives errors thrown by `afterCommit` callbacks without failing the committed transaction.
-   * @throws When the database schema is older than `OLDEST_SCHEMA` (10), newer than `SCHEMA_VERSION` (11), or when migration fails; in every case the database file is left unchanged and the SQLite handle is closed so a later attempt in the same process can open it.
+   * @throws When the schema is invalid, older than `OLDEST_SCHEMA`, newer than `SCHEMA_VERSION`, or migration fails; domain data is unchanged and the SQLite handle is closed so a later attempt can reopen it.
    */
   constructor(path: string, private readonly report: (error: unknown) => void = () => {}) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -63,9 +63,11 @@ export class Store implements Repositories {
       chmodSync(path, 0o600)
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
       const version = this.get(KV.store.schema)
+      if (version !== undefined && (!Number.isInteger(version) || version < 0)) throw new Error(`Invalid orchestrator database version ${String(version)}`)
       if (version !== undefined && version > SCHEMA_VERSION) throw new Error(`Unsupported orchestrator database version ${version}`)
       if (version !== undefined && version < OLDEST_SCHEMA) throw new Error(tooOld(version))
       const migrating = version !== undefined && version < SCHEMA_VERSION
+      let migrationStage = SCHEMA_VERSION
       try {
         this.atomic(() => {
           this.db.exec(`
@@ -81,18 +83,23 @@ export class Store implements Repositories {
               generation INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL,
               since TEXT NOT NULL, PRIMARY KEY (kind, key));
             CREATE INDEX IF NOT EXISTS trigger_at ON trigger(at);
+            CREATE UNIQUE INDEX IF NOT EXISTS trigger_command ON trigger(value ->> '$.source', value ->> '$.dispatch.commandId')
+              WHERE value ->> '$.dispatch.commandId' IS NOT NULL;
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
           `)
           this.addColumns()
-          if (migrating) migrateTo11(this)
+          if (version !== undefined && version < 11) { migrationStage = 11; migrateTo11(this) }
+          // Schema 12 keeps optional command data in the existing aggregate JSON and adds its identity index.
+          // Advancing this marker also prevents schema 11 builds from processing constraints they do not understand.
+          migrationStage = SCHEMA_VERSION
           if (version !== SCHEMA_VERSION) this.set(KV.store.schema, SCHEMA_VERSION)
         })
       } catch (error) {
         if (!migrating) throw error
         const reason = error instanceof Error ? error.message : String(error)
-        throw new Error(`The orchestrator database is unchanged at schema ${version}: its migration to schema ${SCHEMA_VERSION} failed: ${reason}`, { cause: error })
+        throw new Error(`The orchestrator database is unchanged at schema ${version}: its migration to schema ${migrationStage} failed: ${reason}`, { cause: error })
       }
     } catch (error) {
       this.db.close()
@@ -200,6 +207,8 @@ export class Store implements Repositories {
 
   readonly triggers = {
     get: (id: string): Trigger | undefined => { const row = this.db.prepare('SELECT value FROM trigger WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Trigger : undefined },
+    byThread: (thread: string): Trigger[] => this.values('SELECT trigger.value FROM trigger_thread JOIN trigger ON trigger.id = trigger_thread.id WHERE trigger_thread.thread = ? ORDER BY trigger_thread.at, trigger_thread.id', thread),
+    byCommand: (source: string, commandId: string): Trigger | undefined => this.values<Trigger>("SELECT value FROM trigger WHERE value ->> '$.source' = ? AND value ->> '$.dispatch.commandId' = ?", source, commandId)[0],
     save: (trigger: Trigger): void => this.atomic(() => {
       this.db.prepare('INSERT INTO trigger VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, at=excluded.at').run(trigger.id, JSON.stringify(trigger), trigger.at)
       this.indexThreads(trigger)
@@ -273,11 +282,11 @@ export class Store implements Repositories {
      */
     settle: (message: OutboundMessage, outcome: 'sent' | DropReason): void => {
       const settled = outcome === 'sent' ? { status: 'sent' } : { status: 'dropped', dropped: { at: new Date().toISOString(), reason: outcome } }
-      const { id, channel, text, kind, ticketId } = message
+      const { id } = message
       const updated = this.db.prepare("UPDATE outbox SET value = json_patch(value, ?) WHERE id = ? AND value ->> '$.status' = 'pending'")
         .run(JSON.stringify(settled), id)
       if (!Number(updated.changes)) this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)')
-        .run(id, JSON.stringify({ id, channel, text, kind, ...ticketId ? { ticketId } : {}, ...settled }))
+        .run(id, JSON.stringify({ ...message, ...settled }))
     },
     /**
      * Withdraws a pending message that has not yet been sent.

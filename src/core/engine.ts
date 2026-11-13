@@ -1,7 +1,8 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
+import { Dispatches } from './dispatch.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { ChannelRef, CommandReceipt, ConsumptionReceipt, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -28,8 +29,10 @@ export class Engine {
   private readonly assignments: Assignments
   private readonly evals: Evals
   private readonly intake: Intake
+  private readonly dispatch: Dispatches
   constructor(private readonly options: EngineOptions) {
     this.repo = options.repo
+    this.dispatch = new Dispatches(options)
     this.replies = new Replies(options)
     this.tickets = new Tickets(options, this.replies)
     this.assignments = new Assignments(options, this.tickets, this.replies)
@@ -46,6 +49,7 @@ export class Engine {
    * Triggers that arrive while an Eval of that Thread runs wait together for the next one.
    */
   receive(trigger: Trigger): ReceiveResult { return this.repo.atomic(() => this.intake.receive(trigger)) }
+  commandReceipt(triggerId: string): CommandReceipt | undefined { return this.dispatch.lookup(triggerId) }
   /**
    * A Source's request to make an open ticket follow one of its Threads, such as a pull request's, `own` when the ticket
    * opened it: the ticket subscribes to it, and a ready report ends it only once `followsDone` holds (see `Tickets.followsDone`).
@@ -97,7 +101,10 @@ export class Engine {
    * ticket's worker still decides the Trigger and the outcome is not a stop, or an inferred candidate is accepted outside `auto`
    * mode or without enabled matching rules.
    */
-  decide(triggerId: string, outcome: Outcome): Decision { return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
+  decide(triggerId: string, outcome: Outcome): Decision {
+    return this.consume(triggerId, outcome.kind, outcome.kind === 'stop' ? outcome.ticketId : undefined,
+      () => this.evals.decide(triggerId, outcome), receipt => receipt.decisionId ? this.repo.decisions.get(receipt.decisionId) : undefined)
+  }
   /**
    * Attach a Trigger to a ticket that the message points at: the ticket follows the Trigger's Threads and receives it as an
    * Input with the routing note, and the Eval that holds the Trigger ends, since the ticket has it now; the other Triggers of
@@ -107,17 +114,50 @@ export class Engine {
    * @throws UserError for a ticket a person stopped, which withdrew its Mandate, or one whose Mandate the Policy no longer holds.
    */
   attach(ticketId: string, triggerId: string, note?: string): Ticket {
-    return this.repo.atomic(() => {
+    return this.consume(triggerId, 'attach', ticketId, () => {
       // A message this ticket's worker handed back is not its work: attached here, no worker would decide it, and it could not be handed back again.
       const handedBack = this.repo.triggers.disposition(triggerId)?.handbacks?.some(item => item.ticketId === ticketId)
       if (handedBack) throw new UserError('handedBackHere')
       const trigger = this.tickets.attachable(ticketId, triggerId)
       this.evals.withdraw(trigger)
       this.tickets.attach(ticketId, trigger, note)
+      this.dispatch.answer(trigger)
+      this.dispatch.commit(trigger, { outcome: 'applied', ticketId,
+        inputId: this.repo.tickets.get(ticketId)!.inputs.find(input => input.kind === 'trigger' && input.triggerId === triggerId)?.id })
       this.evals.routed(triggerId, ticketId)
       this.tickets.wake(ticketId)
       return this.repo.tickets.get(ticketId)!
+    }, receipt => receipt.outcome === 'applied' && receipt.ticketId === ticketId ? this.repo.tickets.get(ticketId) : undefined)
+  }
+
+  /** Refusals commit their audit/terminal receipt before surfacing as errors; task mutations still roll back together. */
+  private consume<T>(triggerId: string, operation: string, ticketId: string | undefined, apply: () => T,
+    replay: (receipt: ConsumptionReceipt) => T | undefined): T {
+    const result = this.repo.atomic(() => {
+      const trigger = this.repo.triggers.get(triggerId)
+      if (!trigger) throw new UserError('unknownTrigger')
+      this.dispatch.assertConsumptionBatch(trigger)
+      if (!trigger.dispatch) return { value: apply() }
+      const receipt = this.dispatch.receipt(trigger)
+      if (receipt) {
+        const value = replay(receipt)
+        return value === undefined ? { error: new UserError('commandConsumed') } : { value }
+      }
+      const proposal = this.dispatch.proposal(trigger, operation, ticketId)
+      if (proposal) {
+        this.dispatch.attempt(trigger, operation, ticketId, proposal)
+        return { error: new UserError('commandRouteRefused', { reason: proposal }) }
+      }
+      const failure = this.dispatch.admission(trigger) ?? this.dispatch.control(trigger)
+      if (failure) {
+        this.dispatch.commit(trigger, { ...failure, ...(trigger.dispatch.targetTicketId ? { ticketId: trigger.dispatch.targetTicketId } : {}) })
+        this.evals.consumed(triggerId)
+        return { error: new UserError('commandRouteRefused', { reason: failure.reason }) }
+      }
+      return { value: apply() }
     })
+    if ('error' in result && result.error) throw result.error
+    return result.value!
   }
   /**
    * Ask a running worker that waits in `waiting` state for its status; any other worker is left alone.
@@ -258,7 +298,7 @@ export class Engine {
 }
 
 /** What Sources ask and tell the Engine. */
-export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
+export type EngineForSources = Pick<Engine, 'receive' | 'commandReceipt' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
 export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */

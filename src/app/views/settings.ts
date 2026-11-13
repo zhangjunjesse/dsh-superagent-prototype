@@ -1,6 +1,7 @@
 /** Settings view combining versioned configuration blocks, per-source forms and policy metadata, and execution environment details. */
 import { SETUP_FIELDS } from '../../deployment.ts'
 import { KV } from '../../kv.ts'
+import { absolutePathPattern } from '../../infra/host-paths.ts'
 import { policyVersion } from '../../policy.ts'
 import type { SourceRegistry } from '../../sources/registry.ts'
 import { declaredVariables, executionRoot } from '../execution-environment.ts'
@@ -36,7 +37,8 @@ export function settingsView(store: Store, sources: SourceRegistry, health: Heal
         restarts: SETUP_FIELDS[instance.id] ?? [], fields: kind?.fields ?? [], facts: kind?.facts?.(setup.deployment) ?? {},
         labels: store.get(KV.sources.labels(instance.id)) ?? {}, ...problem ? { problem } : {}, ...policyOf(sources, instance.id, health) }
     }),
-    environment: { root: executionRoot(settings, stateDir), variables: declaredVariables(sources, settings) },
+    environment: { root: executionRoot(settings, stateDir), shell: process.platform === 'win32' ? 'pwsh' as const : 'sh' as const,
+      directoryPattern: `${absolutePathPattern().source}.*`, variables: declaredVariables(sources, settings) },
   }
 }
 export type SettingsView = ReturnType<typeof settingsView>

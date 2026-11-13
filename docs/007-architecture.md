@@ -302,6 +302,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/ports.ts` | The ports: `Repositories`, `Policy`, `SourceScope`, `Assessor`, `Executor`, `Outbox`, and the domain events |
 | `src/core/engine.ts` | The Engine, the core's entry point, and the role interfaces `EngineForSources`, `EngineForMainSession`, `EngineForPeople`, `EngineForSettings` and `EngineForExecutor` |
 | `src/core/part.ts` | `EnginePart`, the base of the Engine's parts, and `EngineOptions` |
+| `src/core/dispatch.ts` | Persistent command identity, exclusive Thread ownership, target and authorization checks, current-question validation, and atomic consumption receipts across intake, routing and replay |
 | `src/core/intake.ts` | `Intake`: Triggers from Sources, to their Tickets and, unless a person's message reached one, to Eval |
 | `src/core/evals.ts` | `Evals`: the Evals of Threads and their Decisions |
 | `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, Subscriptions and Inputs |
@@ -320,12 +321,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/notices.ts` | The main Session's notices and relays: `eventNotice`, `reportRelay`, `resultRelay` and `followupRelay` |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
-| `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
+| `src/app/migration.ts` | Schema version bounds (current 12) and the legacy schema 10-to-11 record conversion; the Store adds the schema 12 command index without repeating that conversion |
 | `src/app/effects.ts` | Effects |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
 | `src/app/settings-history.ts` | `policyHistory`: each saved settings revision with what it changed from the one before |
+| `src/app/github-connection.ts` | Repository URL normalization, CLI discovery, bounded read-only account/repository/notification checks, recoverable connection attempts and the existing optimistic Settings save |
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
@@ -354,7 +356,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
+| `src/infra/command-line.ts` | Platform command resolution, literal PowerShell arguments and prepare commands, explicit exit propagation, and refusal of Windows batch CLIs |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
+| `src/infra/github-credentials.ts` | Immutable profile-scoped GitHub CLI wrappers and Windows CurrentUser DPAPI credential storage, with candidate cleanup and account isolation |
+| `src/infra/github-process.ts` | Bounded GitHub version/API subprocesses, safe errors, and Windows wrapper/native-child process-tree cancellation |
+| `src/infra/host-paths.ts` | Host absolute-path validation, including fully qualified Windows drives and UNC shares |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
@@ -374,6 +380,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
+| `src/jarvis-gateway/index.ts` | Optional same-process Gateway plugin, configuration, Source registration, service exposure and bounded reconciliation lifecycle |
+| `src/jarvis-gateway/contracts.ts` | Submit/query schemas, trusted user-turn identity, immutable commands and targets, feedback delivery contracts, reference matching and stable hashes |
+| `src/jarvis-gateway/ledger.ts` | Gateway-owned SQLite command transport, stable work associations, feedback deduplication and recoverable notification batches; does not own Ticket lifecycle |
+| `src/jarvis-gateway/source.ts` | Jarvis Source/Channel and the public constrained SourceContext backend; translates commands and ingests typed Outbox feedback |
+| `src/jarvis-gateway/pump.ts` | Bounded durable command delivery and receipt reconciliation, with current actionable-state compensation for feedback |
+| `src/jarvis-gateway/service.ts` | Trusted submission validation, fixed target/question references, bounded read-only queries, and notification reservation and recovery |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
@@ -381,6 +393,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
 | `src/client/overview.tsx` | The overview |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
+| `src/client/github-connection.tsx` | GitHub connection form, Token erasure, attempt polling/cancellation, advanced CLI selection and separately saved receiving preferences |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
@@ -397,18 +410,24 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
 
-`src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
+`src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the main and Source plugins, with Feishu disabled. The optional `./jarvis-gateway` and `./jarvis` entries, Jarvis preset and embedded Web panel are also packaged, but disabled until explicitly configured. Jarvis code lives in `jarvis/dsh/` and `jarvis/public/`; it uses the Gateway service rather than the Engine or Store directly. Its Session projection and Gateway transport database are separate from the authoritative superagent task state.
 
 ## Tests
 
 | Test | Covers |
 | --- | --- |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
+| `tests/gateway-routing.spec.ts` | Constrained command identity, exclusive Threads, fixed targets, current-question answers, replay, authorization, atomic consumption and rollback |
+| `tests/gateway-store.spec.ts` | Command identity indexing, schema 12 upgrade/rollback, receipt feedback context and the constrained public Source path |
+| `tests/gateway.spec.ts` | Gateway durable transport, original user messages, target/reference validation, JSON queries, feedback deduplication/batching, terminal receipts and conversation generations |
+| `tests/gateway-persistence.spec.ts` | Real SQLite transactions and abrupt subprocess exits across command registration, intake, routing and Outbox/Gateway delivery |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
+| `tests/github-connection.spec.ts` | Connection validation, immutable account replacement, optimistic saves, cancellation, persisted attempts, restart recovery and CLI discovery |
+| `tests/github-credentials.spec.ts` | Windows DPAPI and wrapper isolation through Commands, worker shims and Git credential helpers; argument/stdin/exit propagation and process-tree cancellation |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
@@ -436,20 +455,23 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
+| `tests/windows-deployment.spec.ts` | Host path validation, Windows CLI discovery, cleaned child environments and unchanged account/push checks |
+| `tests/windows-environment.spec.ts` | Real Windows PowerShell/native argv, worker shims, Git credential input, command blocking, environment restoration and prepare success/failure |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
+| `tests/panel-github-connection.spec.tsx` | GitHub URL/Token and existing-CLI forms, credential erasure, polling, cancellation, saved-connection status and independent receiving drafts |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
-`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
+`tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; `command.ts`, platform command decoding for host fixtures; `gateway-persistence.ts`, the abrupt-exit SQLite child fixture; and `async.ts`.
 
 ## Persistence
 
-One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
+The superagent domain database is `<stateDir>/orchestrator.sqlite`, which only the Store opens. Optional Jarvis/Gateway modules own separate projection/transport databases; neither replaces the domain Store as the task authority.
 
 | Table | Holds | Written by |
 | --- | --- | --- |
@@ -483,7 +505,7 @@ Read caches use bounded in-memory `TextCache` instances and are lost on restart.
 
 Nothing deletes old records yet, so these grow without bound: the `trigger`, `disposition` and `decision` rows; ended Tickets and their Threads; the outbox's receipts; and in `kv`, every saved settings revision and prompt version, the prompt revisions each Session worked under, and the Sources' records per Thread and per Issue or pull request.
 
-`SCHEMA_VERSION` only increases. A database of a newer version refuses to start; `src/app/migration.ts` upgrades a database of the pre-release schema 10 once, at start, and refuses an older one.
+`SCHEMA_VERSION` only increases and is currently 12. A database of a newer version refuses to start; `src/app/migration.ts` converts pre-release schema 10 records once, and the Store additively upgrades schema 11 with the constrained command identity index. Older binaries must not process the schema 12 constraints. Databases older than schema 10 are refused.
 
 ## Model-facing interfaces
 

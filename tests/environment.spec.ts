@@ -1,21 +1,35 @@
 import { execFile, spawn } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
+import { commandLine, powershellQuote } from '../src/infra/command-line.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 // Git and shell subprocesses can exceed the 5s default timeout when the test suite runs in parallel.
 vi.setConfig({ testTimeout: 30_000 })
 const exec = promisify(execFile)
+const windows = process.platform === 'win32'
+const eol = windows ? '\r\n' : '\n'
+const scriptName = (name: string): string => windows ? `${name}.ps1` : name
 let dir: string
-const program = (path: string, body: string): string => { writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755); return path }
+const program = (path: string, body: string, powershell: string): string => {
+  const file = scriptName(path)
+  writeFileSync(file, windows ? `${powershell}\n` : `#!/bin/sh\n${body}\n`)
+  if (!windows) chmodSync(file, 0o755)
+  return file
+}
+/** Exercise the same platform argv boundary as host and worker CLI calls. */
+const run = (program: string, args: string[], options: { env?: NodeJS.ProcessEnv; timeout?: number } = {}) => {
+  const [file = program, ...argv] = commandLine([program, ...args], undefined, options.env)
+  return exec(file, argv, options)
+}
 /** Worker shell environment after DSH strips credential-shaped variables. */
 const workerEnv = (env: Record<string, string | undefined>): Record<string, string> =>
   Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !SENSITIVE_ENV_PATTERN.test(entry[0])))
@@ -24,37 +38,45 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
 describe('worker shims', () => {
   it('run a wrapper that calls `gh` by name without reaching the shim again, and keep the caller\'s other PATH entries', async () => {
-    program(join(dir, 'real', 'gh'), 'echo "{\\"login\\":\\"agent-bot\\",\\"config\\":\\"$GH_CONFIG_DIR\\",\\"path\\":\\"$PATH\\"}"')
-    const wrapper = program(join(dir, 'gh-agent'), `GH_CONFIG_DIR=${dir}/agent-config exec gh "$@"`)
+    program(join(dir, 'real', 'gh'), 'echo "{\\"login\\":\\"agent-bot\\",\\"config\\":\\"$GH_CONFIG_DIR\\",\\"path\\":\\"$PATH\\"}"',
+      "@{ login = 'agent-bot'; config = $env:GH_CONFIG_DIR; path = $env:PATH } | ConvertTo-Json -Compress")
+    const config = join(dir, 'agent-config')
+    const wrapper = program(join(dir, 'gh-agent'), `GH_CONFIG_DIR=${config} exec gh "$@"`,
+      `$env:GH_CONFIG_DIR = ${powershellQuote(config)}; & gh @args; exit $LASTEXITCODE`)
     await writeEnvironment(testDeployment({ stateDir: dir, github: { ...testDeployment().github, cli: wrapper }, feishu: undefined }), [])
     const bin = workerBin(dir)
-    const path = [bin, join(dir, 'venv'), join(dir, 'real'), '/usr/bin', '/bin'].join(':')
-    const { stdout } = await exec('gh', ['api', 'user'], { env: { PATH: path }, timeout: 10_000 })
-    expect(JSON.parse(stdout)).toEqual({ login: 'agent-bot', config: `${dir}/agent-config`, path: [join(dir, 'venv'), join(dir, 'real'), '/usr/bin', '/bin'].join(':') })
+    const retained = [join(dir, 'venv'), join(dir, 'real'), ...windows ? process.env.PATH!.split(delimiter) : ['/usr/bin', '/bin']]
+    const env = { ...windows ? process.env : {}, PATH: [bin, ...retained].join(delimiter) }
+    const { stdout } = await run('gh', ['api', 'user'], { env, timeout: 10_000 })
+    // A fresh PowerShell process prepends its own home, then the shim must retain every caller entry in order.
+    const path = windows ? [dirname(commandLine(['pwsh.exe'], undefined, env)[0]!), ...retained].join(delimiter) : retained.join(delimiter)
+    expect(JSON.parse(stdout)).toEqual({ login: 'agent-bot', config, path })
   })
   it('make `lark-cli` fail without a Feishu bot and each blocked command fail with the agent\'s login', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir, feishu: undefined }), ['personal-gh'])
     const bin = workerBin(dir)
-    await expect(exec(join(bin, 'lark-cli'), ['im', '+chat-list'])).rejects.toMatchObject({ code: 1, stderr: 'lark-cli is unavailable: this installation has no Feishu bot.\n' })
-    await expect(exec(join(bin, 'personal-gh'), [])).rejects.toMatchObject({ code: 1, stderr: 'personal-gh is blocked in this installation; use gh, which acts as agent-bot.\n' })
+    await expect(run(join(bin, scriptName('lark-cli')), ['im', '+chat-list'])).rejects.toMatchObject({ code: 1, stderr: `lark-cli is unavailable: this installation has no Feishu bot.${eol}` })
+    await expect(run(join(bin, scriptName('personal-gh')), [])).rejects.toMatchObject({ code: 1, stderr: `personal-gh is blocked in this installation; use gh, which acts as agent-bot.${eol}` })
   })
   it('keep `gh` and `lark-cli` working, and shim no `git`, when the blocked commands name the commands workers need', async () => {
-    const gh = program(join(dir, 'gh-agent'), 'echo gh "$@"'), lark = program(join(dir, 'lark-bot'), 'echo lark "$@"')
+    const gh = program(join(dir, 'gh-agent'), 'echo gh "$@"', "[Console]::Out.WriteLine('gh ' + ($args -join ' '))")
+    const lark = program(join(dir, 'lark-bot'), 'echo lark "$@"', "[Console]::Out.WriteLine('lark ' + ($args -join ' '))")
     const base = testDeployment()
     await writeEnvironment(testDeployment({ stateDir: dir, github: { ...base.github, cli: gh }, feishu: { ...base.feishu!, cli: lark } }), ['gh', 'git', 'lark-cli'])
     const bin = workerBin(dir)
-    expect([(await exec(join(bin, 'gh'), ['api', 'user'])).stdout, (await exec(join(bin, 'lark-cli'), ['im'])).stdout]).toEqual(['gh api user\n', 'lark im\n'])
-    expect(readdirSync(bin)).not.toContain('git')
+    expect([(await run(join(bin, scriptName('gh')), ['api', 'user'])).stdout, (await run(join(bin, scriptName('lark-cli')), ['im'])).stdout]).toEqual([`gh api user${eol}`, `lark im${eol}`])
+    expect(readdirSync(bin).some(name => /^git(?:\.|$)/i.test(name))).toBe(false)
   })
   it('replace only what dsh-superagent wrote and refuse anything else in its places', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli'])
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
-    expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'])
+    expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'].map(scriptName))
     // A file that merely contains the marker on a later line, a symlink to a shim, and a foreign gitconfig are all rejected.
-    writeFileSync(join(workerBin(dir), 'notes'), `notes\nmore\n${readFileSync(join(workerBin(dir), 'gh'), 'utf8').split('\n')[1]}\n`)
+    const marker = readFileSync(join(workerBin(dir), scriptName('gh')), 'utf8').split('\n').find(line => line.startsWith('# Written by '))!
+    writeFileSync(join(workerBin(dir), 'notes'), `notes\nmore\n${marker}\n`)
     await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow(`${join(workerBin(dir), 'notes')} was not written by dsh-superagent`)
     rmSync(join(workerBin(dir), 'notes'))
-    symlinkSync(join(workerBin(dir), 'gh'), join(workerBin(dir), 'link'))
+    symlinkSync(join(workerBin(dir), scriptName('gh')), join(workerBin(dir), 'link'))
     await expect(writeEnvironment(testDeployment({ stateDir: dir }), [])).rejects.toThrow('link was not written by dsh-superagent')
     rmSync(join(workerBin(dir), 'link'))
     writeFileSync(workerGitConfig(dir), '[user]\n\tname = someone\n')
@@ -64,9 +86,9 @@ describe('worker shims', () => {
   it('replaces the files it wrote under the project\'s earlier names', async () => {
     await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli', 'older-cli'])
     const legacy = (file: string, name: string) => writeFileSync(file, readFileSync(file, 'utf8').replace('Written by dsh-superagent', `Written by ${name}`))
-    legacy(join(workerBin(dir), 'old-cli'), 'dsh-tag'); legacy(join(workerBin(dir), 'older-cli'), 'dsh-freelancer'); legacy(workerGitConfig(dir), 'dsh-go')
+    legacy(join(workerBin(dir), scriptName('old-cli')), 'dsh-tag'); legacy(join(workerBin(dir), scriptName('older-cli')), 'dsh-freelancer'); legacy(workerGitConfig(dir), 'dsh-go')
     await writeEnvironment(testDeployment({ stateDir: dir }), [])
-    expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'])
+    expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'].map(scriptName))
     expect(readFileSync(workerGitConfig(dir), 'utf8')).toContain('Written by dsh-superagent')
   })
 })
@@ -76,7 +98,8 @@ describe('agent git configuration', () => {
     const home = join(dir, 'home'); mkdirSync(home)
     // Operator configuration that rewrites HTTPS to SSH, enables commit signing, and sets a credential helper.
     writeFileSync(join(home, '.gitconfig'), '[url "git@github.com:"]\n\tinsteadOf = https://github.com/\n[commit]\n\tgpgsign = true\n[credential]\n\thelper = osxkeychain\n')
-    const deployment = testDeployment({ stateDir: dir, github: { ...testDeployment().github, cli: '/opt/agent tools/gh' } })
+    const cli = windows ? join(dir, 'agent tools', 'gh.ps1') : '/opt/agent tools/gh'
+    const deployment = testDeployment({ stateDir: dir, github: { ...testDeployment().github, cli } })
     await writeEnvironment(deployment, [])
     // Operator identity variables and git's fallback from the OS username must not apply to worker commits.
     const env = workerEnv({ PATH: process.env.PATH, HOME: home, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.abbrev', GIT_CONFIG_VALUE_0: '12', GIT_AUTHOR_NAME: 'Operator', GIT_COMMITTER_EMAIL: 'operator@example.com', ...agentVariables(dir) })
@@ -84,7 +107,9 @@ describe('agent git configuration', () => {
     await git('init', '-q', 'repo')
     await exec('git', ['-C', 'repo', 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git'], { cwd: dir, env })
     expect(await git('-C', 'repo', 'remote', 'get-url', '--push', 'origin')).toBe('https://github.com/acme/widgets.git')
-    expect(await git('config', '--show-origin', '--get-all', 'credential.https://github.com.helper')).toBe(`file:${workerGitConfig(dir)}\t${credentialHelper('/opt/agent tools/gh')}`)
+    // NUL framing keeps Git for Windows from C-quoting origin paths containing backslashes.
+    expect((await git('config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper')).split('\0'))
+      .toEqual([`file:${workerGitConfig(dir)}`, credentialHelper(cli), ''])
     expect(await git('config', '--get-all', 'credential.helper')).toBe('')
     await expect(git('config', 'commit.gpgsign')).rejects.toThrow()
     await expect(git('config', 'core.abbrev')).rejects.toThrow()
@@ -98,8 +123,9 @@ describe('agent git configuration', () => {
 
 it('fails instead of asking the operator\'s askpass helpers when the agent\'s credential helper has no answer', async () => {
   const log = join(dir, 'asked')
-  const askpass = program(join(dir, 'askpass'), `echo asked >> ${log}; echo operator-secret`)
-  const agent = program(join(dir, 'real', 'gh'), 'exit 0')
+  const askpass = program(join(dir, 'askpass'), `echo asked >> ${log}; echo operator-secret`,
+    `Add-Content -LiteralPath ${powershellQuote(log)} -Value 'asked'; Write-Output 'operator-secret'`)
+  const agent = program(join(dir, 'real', 'gh'), 'exit 0', 'exit 0')
   const deployment = testDeployment({ stateDir: dir, github: { ...testDeployment().github, cli: agent } })
   await writeEnvironment(deployment, [])
   const env = workerEnv({ PATH: process.env.PATH, HOME: dir, GIT_ASKPASS: askpass, SSH_ASKPASS: askpass, ...agentVariables(dir) })
@@ -113,9 +139,9 @@ it('fails instead of asking the operator\'s askpass helpers when the agent\'s cr
 
 it('removes every spelling of a directory from PATH and keeps the other entries', () => {
   mkdirSync(join(dir, 'state', 'worker-bin'), { recursive: true })
-  symlinkSync(join(dir, 'state'), join(dir, 'link'))
+  symlinkSync(join(dir, 'state'), join(dir, 'link'), windows ? 'junction' : undefined)
   const bin = join(dir, 'state', 'worker-bin')
-  expect(withoutDirectory([`${bin}/`, join(dir, 'link', 'worker-bin'), '/usr/bin', 'node_modules/.bin'].join(':'), bin)).toBe('/usr/bin:node_modules/.bin')
+  expect(withoutDirectory([`${bin}/`, join(dir, 'link', 'worker-bin'), '/usr/bin', 'node_modules/.bin'].join(delimiter), bin)).toBe(['/usr/bin', 'node_modules/.bin'].join(delimiter))
 })
 
 /** Minimal SubprocessRuntime backed by child_process.spawn with an isolated global git config. */
@@ -126,7 +152,7 @@ const subprocess = (config: string): SubprocessRuntime => ({
     child.stdout.on('data', chunk => { output.stdout += String(chunk) })
     child.stderr.on('data', chunk => { output.stderr += String(chunk) })
     const reader = (name: 'stdout' | 'stderr') => ({ readFrom: () => ({ text: output[name], nextOffset: 0, lossy: false }) })
-    const done = new Promise(resolve => child.on('close', code => resolve({ exitCode: code, signal: null })))
+    const done = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', code => resolve({ exitCode: code, signal: null })) })
     return { done, collected: { stdout: reader('stdout'), stderr: reader('stderr') } }
   },
 }) as unknown as SubprocessRuntime
@@ -154,7 +180,7 @@ describe('ticket directory check', () => {
     await expect(check('repo')).rejects.toThrow(/bad config/)
   })
   it('reports a failed command\'s exit status', async () => {
-    const failing = ['sh', '-c', 'echo nope >&2; exit 3']
+    const failing = [process.execPath, '-e', "process.stderr.write('nope'); process.exit(3)"]
     const error = await runAsWorker(subprocess(join(dir, 'global')), failing, dir, signal).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(CliError)
     expect(error).toMatchObject({ message: 'nope', exitCode: 3 })

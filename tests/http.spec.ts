@@ -96,3 +96,31 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
 })
+
+it('protects credential connection requests and never returns credential-bearing exceptions', async () => {
+  const secret = 'fixture-token-not-a-real-credential'
+  const seen: unknown[] = []
+  const cancelled: string[] = []
+  const view = { available: true, tokenSupported: true, cli: null, connection: { repository: '', login: null, managed: false, configured: false }, job: null }
+  const call = serve({ githubConnection: {
+    read: async () => view,
+    start: async (input: unknown) => { seen.push(input); throw new Error(`unsafe diagnostic: ${secret}`) },
+    cancel: async (id: string) => { cancelled.push(id); return view },
+  } })
+  expect(await call('GET', 'github/connection')).toEqual({ status: 200, body: view })
+  const input = { revision: 0, repository: 'https://github.com/acme/widgets', method: 'token', token: secret }
+  expect(await call('POST', 'github/connection', input, { origin: 'http://elsewhere.example' })).toMatchObject({ status: 403 })
+  expect(seen).toEqual([])
+  const failed = await call('POST', 'github/connection', input)
+  expect(failed.status).toBe(400)
+  expect(JSON.stringify(failed)).not.toContain(secret)
+  expect(seen).toEqual([input])
+  expect(await call('POST', 'github/connection', { ...input, token: 'x'.repeat(8193) })).toMatchObject({ status: 400 })
+  expect(await call('POST', 'github/connection', { ...input, revision: -1 })).toMatchObject({ status: 400 })
+  expect(await call('POST', 'github/connection', { ...input, arbitrary: secret })).toMatchObject({ status: 400 })
+  expect(seen).toHaveLength(1)
+  expect(await call('POST', 'github/connection/cancel', { id: '00000000-0000-4000-8000-000000000001' }))
+    .toEqual({ status: 200, body: view })
+  expect(await call('POST', 'github/connection/cancel', {})).toMatchObject({ status: 400 })
+  expect(cancelled).toEqual(['00000000-0000-4000-8000-000000000001'])
+})

@@ -27,6 +27,7 @@ import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
+import type { GithubConnection } from './github-connection.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -36,6 +37,7 @@ export interface HttpHost {
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
+  readonly githubConnection?: Pick<GithubConnection, 'read' | 'start' | 'cancel'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
@@ -147,11 +149,27 @@ const PromptsQuery = z.object({ revision: count.optional(), offset: count.defaul
 const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
+const GithubConnectionRequest = z.object({
+  revision: z.number().int().nonnegative(), repository: z.string().trim().max(2048),
+  method: z.enum(['token', 'existing']), token: z.string().max(8192).optional(), cli: z.string().trim().max(4096).optional(),
+}).strict()
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
+  const github = () => {
+    if (!runtime.githubConnection) throw new RouteError(404, 'GitHub connection settings are unavailable')
+    return runtime.githubConnection
+  }
+  // Credential-bearing operations must not expose raw subprocess or storage exceptions.
+  const connection = async <T>(run: () => Promise<T>): Promise<T> => {
+    try { return await run() }
+    catch (error) {
+      if (error instanceof RouteError) throw error
+      throw new RouteError(400, 'GitHub connection could not be updated. Retry from connection settings.')
+    }
+  }
   return {
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
@@ -159,6 +177,15 @@ function routes(runtime: HttpHost): Routes {
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
+    'GET github/connection': () => connection(() => github().read()),
+    'POST github/connection': async ({ body }) => {
+      const input = GithubConnectionRequest.parse(await body(20 * 1024))
+      return connection(() => github().start(input))
+    },
+    'POST github/connection/cancel': async ({ body }) => {
+      const { id } = z.object({ id: z.string().uuid() }).strict().parse(await body(1024))
+      return connection(() => github().cancel(id))
+    },
     'POST sources/:id/labels': ({ params }) => runtime.settings.refreshLabels(params.id),
     'GET threads': ({ query }) => {
       const { filter, offset, limit } = ThreadsQuery.parse(query)

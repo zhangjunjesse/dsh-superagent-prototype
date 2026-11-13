@@ -2,6 +2,47 @@
 # profile supplies the `dsh-superagent` entry's stateDir (see docs/006-deployment.md and examples/profile.cordis.patch.yml); the plugin
 # refuses to start without stateDir.
 - insert:
+    # Explicitly enable only in a combined profile after configuring deployment/user and source policy.
+    - id: dsh-superagent-jarvis-gateway
+      name: dsh-superagent/jarvis-gateway
+      disabled: true
+    # Activate explicitly with stateDir/workspace after installing the Jarvis module.
+    - id: dsh-superagent-jarvis
+      name: dsh-superagent/jarvis
+      disabled: true
+    # The client scanner resolves package roots or files, not exported subpaths.
+    # Enable with Jarvis; the nested client package ships inside this same bundle.
+    - id: dsh-superagent-jarvis-panel
+      name: ./node_modules/dsh-superagent/jarvis/dsh/panel/index.mjs
+      disabled: true
+    # Optional independent user-facing session. Enable together with the Jarvis entry.
+    - id: dsh-superagent-jarvis-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      disabled: true
+      config:
+        id: jarvis
+        name: 贾维斯
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
     - id: dsh-superagent
       name: dsh-superagent
     - id: dsh-superagent-github

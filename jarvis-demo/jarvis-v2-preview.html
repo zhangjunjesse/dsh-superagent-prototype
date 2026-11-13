@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>贾维斯</title>
+  <style>
+:root {
+  color-scheme: dark;
+  --bg: #101316;
+  --panel: #191e23;
+  --line: #343c44;
+  --text: #f0f3f5;
+  --muted: #acb6bf;
+  --blue: #b3d6ff;
+  --green: #9ce0c3;
+  --amber: #f3ca8e;
+  --red: #ffb4ae;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; font: 16px/1.65 system-ui, 'Segoe UI', sans-serif; color: var(--text); background: var(--bg); }
+button, textarea { font: inherit; }
+button { cursor: pointer; color: inherit; }
+button { transition: background 160ms ease, border-color 160ms ease, transform 160ms ease; }
+button:active { transform: translateY(1px); }
+button:focus-visible, textarea:focus-visible { outline: 2px solid var(--blue); outline-offset: 4px; }
+.shell { height: 100dvh; display: flex; flex-direction: column; }
+.topbar { height: 72px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 0 32px; border-bottom: 1px solid var(--line); }
+.brand, .top-status { display: flex; align-items: center; gap: 14px; }
+.brand-mark { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 12px; background: linear-gradient(145deg, #d1e9ff, #8dabc9); color: #142435; font-weight: 700; }
+.brand-name { overflow-wrap: anywhere; font-size: 19px; font-weight: 650; letter-spacing: .05em; }
+.brand-sub { font-size: 14px; font-weight: 400; letter-spacing: 0; margin-left: 16px; color: var(--muted); }
+.top-status { font-size: 14px; color: var(--muted); }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.reset { border: 1px solid var(--line); border-radius: 9px; background: transparent; padding: 6px 12px; font-size: 14px; }
+.reset:hover { background: #28313a; }
+.workspace { flex: 1; min-height: 0; width: 100%; max-width: 1800px; margin: auto; padding: 24px 32px; display: flex; flex-direction: column; }
+.cockpit-grid { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) clamp(360px, 30vw, 480px); gap: 24px; }
+.conversation { min-width: 0; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 24px; background: radial-gradient(ellipse at 0 0, #23303c80, transparent 55%), #161b20; overflow: hidden; }
+.conversation-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 22px 28px; border-bottom: 1px solid #ffffff0d; }
+.conversation-title { font-weight: 600; font-size: 18px; }
+.conversation-context { color: var(--muted); font-size: 14px; }
+.thread { flex: 1; min-height: 0; overflow: auto; padding: 32px clamp(20px, 3vw, 48px); scrollbar-width: thin; scrollbar-color: #465461 transparent; }
+.message { display: flex; gap: 14px; margin: 0 auto 30px; max-width: 800px; animation: arrive 220ms ease-out; }
+.message > div:last-child { min-width: 0; }
+.avatar { width: 32px; height: 32px; flex: 0 0 32px; display: grid; place-items: center; border-radius: 10px; background: #354453; color: #d9eaff; font-size: 14px; }
+.bubble { overflow-wrap: anywhere; }
+.bubble p { margin: 0; font-size: 18px; line-height: 1.9; white-space: pre-wrap; }
+.message-trigger { display: block; margin-bottom: 12px; color: var(--muted); font-size: 14px; }
+.message-meta { margin-top: 10px; font-size: 14px; color: var(--muted); }
+.message.user { flex-direction: row-reverse; }
+.user .bubble { background: #28343f; border-radius: 16px 4px 16px 16px; padding: 12px 18px; }
+.message-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+.action, .decision-action { border: 1px solid #8198ad; border-radius: 10px; padding: 9px 16px; background: #c3d9ed; color: #142332; font-size: 15px; font-weight: 550; }
+.action:hover, .decision-action:hover { background: #dfedfa; }
+.action.secondary { color: var(--text); background: transparent; border-color: #4c5965; }
+.action.secondary:hover { background: #2c3742; }
+.composer { flex-shrink: 0; padding: 16px 24px 20px; }
+.composer-box { display: flex; align-items: flex-end; gap: 12px; padding: 14px; border: 1px solid #586573; border-radius: 18px; background: #222a32; transition: box-shadow 180ms ease, border-color 180ms ease; }
+.composer-box:focus-within { border-color: #b3d6ff; box-shadow: 0 0 0 3px #b3d6ff12; }
+textarea { width: 100%; min-width: 0; min-height: 64px; resize: none; border: 0; background: transparent; color: var(--text); font-size: 18px; padding: 6px; }
+textarea::placeholder { color: #b0bac4; }
+.send { flex-shrink: 0; width: 46px; height: 46px; border-radius: 14px; border: 0; background: #c3d9ed; color: #16232f; font-size: 24px; }
+.composer-note { margin: 9px 5px 0; color: var(--muted); font-size: 14px; }
+.side-stack { min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+.side-heading { margin: 0 0 18px; display: flex; align-items: center; justify-content: space-between; font-size: 19px; font-weight: 550; }
+.side-heading span { color: var(--muted); font-size: 14px; font-weight: 400; }
+.context-tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 5px; border-radius: 13px; background: #20272e; margin-bottom: 20px; }
+.context-tab { border: 1px solid transparent; padding: 9px 2px; background: transparent; border-radius: 9px; color: #b9c3cd; font-size: 15px; }
+.context-tab[aria-selected='true'] { background: #3a4652; color: white; box-shadow: 0 2px 6px #0003; }
+.context-tab:hover { background: #303c47; }
+.panel { min-height: 0; overflow: auto; flex: 1; scrollbar-width: thin; animation: arrive 200ms ease-out; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 18px; }
+.panel-title { font-size: 16px; margin: 0; font-weight: 550; }
+.panel-count { font-size: 14px; color: var(--muted); }
+.decision { position: relative; padding: 20px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 18px; background: #1c232a; display: grid; grid-template-columns: 1fr auto; gap: 14px; transition: border-color 180ms ease, background 180ms ease; }
+.decision:hover { border-color: #627486; background: #222c35; }
+.decision:first-of-type { border-color: #64788c; background: linear-gradient(125deg, #293744, #1c232a); }
+.decision-main { grid-column: 1 / -1; min-width: 0; }
+.decision-title { display: block; font-size: 17px; font-weight: 550; }
+.decision-meta { display: block; font-size: 14px; margin-top: 8px; color: var(--muted); }
+.decision-tag { font-size: 14px; align-self: center; color: var(--amber); }
+.decision-tag.urgent { color: var(--amber); }
+.decision-action { padding: 6px 15px; }
+.strategy-row { background: #1c232a; border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin-bottom: 14px; }
+.strategy-top, .strategy-foot { display: flex; justify-content: space-between; gap: 12px; }
+.strategy-name { font-size: 17px; }
+.strategy-state { color: var(--green); font-size: 14px; }
+.strategy-state.risk { color: var(--amber); }
+.strategy-bar { background: #39444f; height: 6px; border-radius: 4px; margin: 18px 0 12px; overflow: hidden; }
+.strategy-fill { height: 100%; background: var(--blue); border-radius: 4px; }
+.strategy-fill.risk { background: var(--amber); }
+.strategy-foot { font-size: 14px; color: var(--muted); }
+.risk-card { border: 1px solid #805956; background: #342527; border-radius: 18px; padding: 24px; }
+.risk-main strong { display: block; font-size: 19px; font-weight: 550; }
+.risk-main span { display: block; color: #d4bdbb; font-size: 16px; margin: 14px 0; }
+.risk-level { color: var(--red); font-size: 14px; }
+.delivery-item { border-bottom: 1px solid var(--line); padding: 22px 6px; }
+.delivery-item strong { display: block; font-size: 18px; font-weight: 550; }
+.delivery-item span { display: block; font-size: 14px; color: var(--muted); margin-top: 6px; }
+.modal { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 24px; background: #080d15ad; backdrop-filter: blur(12px); }
+.modal-card { width: min(620px, 100%); max-height: 90dvh; overflow: auto; padding: 30px; border: 1px solid #536373; border-radius: 24px; background: #1e2730; box-shadow: 0 30px 100px #0008; animation: arrive 220ms ease-out; }
+.modal-head { display: flex; justify-content: space-between; gap: 16px; }
+.modal-eyebrow { color: var(--blue); margin: 0 0 8px; font-size: 14px; }
+.modal-title { font-size: 24px; font-weight: 550; margin: 0; }
+.modal-close { border: 0; border-radius: 10px; background: #34414d; width: 40px; height: 40px; font-size: 24px; flex-shrink: 0; }
+.mission-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+.mission-cell { padding: 14px; border-radius: 12px; background: #2b3641; }
+.mission-cell span { display: block; color: var(--muted); font-size: 14px; }
+.mission-cell strong { display: block; font-weight: 500; font-size: 16px; margin-top: 6px; }
+.mission-callout { background: #3e3426; border-left: 3px solid var(--amber); padding: 16px; border-radius: 4px 12px 12px 4px; font-size: 17px; color: #f5d6a8; }
+.mission-evidence { color: var(--muted); font-size: 15px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@keyframes arrive { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (max-height: 800px) and (min-width: 901px) {
+  .topbar { height: 60px; }
+  .workspace { padding-block: 16px; }
+  .decision { padding: 14px 18px; gap: 8px; }
+  .side-heading { margin-bottom: 12px; }
+  .context-tabs { margin-bottom: 14px; }
+}
+@media (max-width: 900px) {
+  .workspace { padding: 16px; }
+  .cockpit-grid { grid-template-columns: minmax(0, 1fr); }
+  .side-stack { display: none; }
+  .side-stack.mobile-open { display: flex; position: fixed; inset: 80px 16px 16px; padding: 20px; border: 1px solid var(--line); border-radius: 20px; background: #171e25; z-index: 5; box-shadow: 0 20px 80px #0009; }
+  .brand-sub { display: none; }
+  .topbar { padding-inline: 16px; }
+  .top-status > span { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+
+
+/* Full-page model configuration; execution policy belongs to superagent. */
+.settings-page { height:100dvh; display:flex; flex-direction:column; background:#11171d; }
+.settings-topbar { height:72px; flex-shrink:0; padding:0 32px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+.settings-breadcrumb { display:flex; align-items:center; gap:18px; font-size:16px; color:var(--muted); }
+.settings-breadcrumb strong { max-width: 40vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); font-weight:550; }
+.brand-name > [data-assistant-name] { display:inline-block; max-width:clamp(70px,18vw,300px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:middle; }
+.settings-rail [data-assistant-name] { overflow-wrap:anywhere; }
+.settings-frame { display:grid; grid-template-columns:224px minmax(0,1fr); flex:1; min-height:0; }
+.settings-rail { padding:36px 20px; border-right:1px solid var(--line); background:#151c23; }
+.settings-rail p { margin:0 14px 18px; font-size:14px; color:var(--muted); }
+.settings-rail a { display:block; margin-bottom:8px; padding:13px 16px; background:#2c3c4c; border:1px solid #47627a; border-radius:12px; color:#deedff; font-size:16px; text-decoration:none; }
+.settings-rail a:not([aria-current]) { background:transparent; border-color:transparent; color:var(--muted); }
+.settings-rail a:hover { background:#263545; }
+.settings-form { min-width:0; min-height:0; display:flex; flex-direction:column; }
+.settings-heading { padding:30px 40px 0; width:100%; max-width:1200px; margin:0 auto; }
+.settings-eyebrow { color:var(--muted); font-size:14px; letter-spacing:.1em; margin:0 0 6px; }
+.settings-title-row { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+.settings-title-row h1 { margin:0; font-size:30px; font-weight:550; letter-spacing:-.02em; }
+.connection-status { border:1px solid #59616a; border-radius:30px; padding:5px 12px; font-size:14px; color:#c1cad3; }
+.model-tabs { display:flex; gap:28px; border-bottom:1px solid var(--line); margin-top:24px; }
+.model-tabs button { background:none; border:0; border-bottom:2px solid transparent; padding:12px 0; color:var(--muted); font:inherit; }
+.model-tabs button[aria-selected='true'] { color:#cee5ff; border-bottom-color:#b3d6ff; }
+.settings-scroll { flex:1; min-height:0; overflow:auto; scrollbar-width:thin; }
+.settings-content { max-width:1200px; padding:30px 40px; margin:auto; }
+.model-panel { animation:arrive 180ms ease-out; }
+.model-section { display:grid; grid-template-columns:180px minmax(0,1fr); gap:30px; padding:0 0 28px; margin:0 0 28px; border-bottom:1px solid var(--line); }
+.model-section:last-child { margin-bottom:0; border:0; padding-bottom:0; }
+.model-section h2 { margin:5px 0 0; font-size:17px; font-weight:550; }
+.model-fields { min-width:0; display:grid; grid-template-columns:1fr 1fr; gap:22px; }
+.model-field { min-width:0; display:block; font-size:16px; }
+.model-field.wide { grid-column:1 / -1; }
+.model-field > span { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:9px; }
+.model-field small { font:13px/1.5 ui-monospace,monospace; color:#9caebb; }
+.model-field input, .model-field select { width:100%; min-width:0; height:48px; padding:10px 13px; border:1px solid #4a5b69; border-radius:10px; background:#1b2630; color:var(--text); font:inherit; }
+.model-field input::placeholder { color:#94a5b4; }
+.model-field input:disabled { opacity:.4; cursor:not-allowed; }
+.settings-page :is(input,select):focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+.secret-field { display:flex; gap:8px; }
+.secret-field .reset { flex-shrink:0; min-width:62px; }
+.settings-footer { display:flex; gap:12px; align-items:center; padding:20px 40px; border-top:1px solid var(--line); background:#171f27; }
+.settings-footer p { flex:1; margin:0; font-size:14px; color:var(--muted); }
+.settings-footer p.error { color:var(--red); }
+.settings-footer button:disabled { opacity:.45; cursor:default; }
+.settings-inline { display:flex; align-items:center; gap:12px; font-size:16px; }
+.settings-inline input { width:20px; height:20px; accent-color:#b3d6ff; }
+.unsaved-bar { display:flex; align-items:center; gap:12px; padding:14px 32px; background:#3b3224; border-bottom:1px solid #6d5734; }
+.unsaved-bar span { flex:1; }
+@media(max-width:1000px) {
+ .settings-frame { grid-template-columns:180px minmax(0,1fr); }
+ .settings-heading { padding:24px 24px 0; }
+ .settings-content { padding:24px; }
+ .model-section { grid-template-columns:1fr; gap:16px; }
+ .settings-footer { padding:16px 24px; }
+}
+@media(max-width:640px) {
+ .topbar { padding-inline:12px; gap:8px; }
+ .top-status { gap:6px; }
+ .brand-sub, .topbar #reset { display:none; }
+ .brand { gap:8px; }
+ .brand-name { font-size:16px; }
+ .settings-topbar { padding:0 18px; height:64px; }
+ .settings-frame { grid-template-columns:minmax(0,1fr); }
+ .settings-rail { display:flex; gap:8px; padding:10px 20px; border-right:0; border-bottom:1px solid var(--line); }
+ .settings-rail p { display:none; }
+ .settings-rail a { margin:0; padding:8px 16px; }
+ .settings-frame { display:flex; flex-direction:column; }
+ .settings-form { flex:1; }
+ .settings-title-row h1 { font-size:25px; }
+ .settings-heading { padding:22px 20px 0; }
+ .model-tabs { margin-top:18px; gap:22px; }
+ .settings-content { padding:24px 20px; }
+ .model-fields { grid-template-columns:1fr; }
+ .settings-footer { flex-wrap:wrap; padding:14px 20px; }
+ .settings-footer p { flex-basis:100%; }
+ .unsaved-bar { flex-wrap:wrap; padding:14px 20px; }
+ .unsaved-bar span { flex-basis:100%; }
+}
+</style>
+</head>
+<body>
+  <div class="shell" id="conversation-page">
+    <header class="topbar"><div class="brand"><div class="brand-mark" data-assistant-initial aria-hidden="true">贾</div><div class="brand-name"><span data-assistant-name>贾维斯</span> <span class="brand-sub">你的工作伙伴</span></div></div><div class="top-status"><span class="status-dot" aria-hidden="true"></span><span>工作空间</span><button class="reset" id="context-toggle" type="button" aria-expanded="false" aria-controls="context-sidebar">经营概览</button><button class="reset" id="settings-open" type="button" aria-controls="settings-page">设置</button><button class="reset" id="reset" type="button">清空对话</button></div></header>
+    <main class="workspace">
+      <div class="cockpit-grid">
+        <section class="conversation" aria-labelledby="conversation-title"><div class="conversation-head"><span class="conversation-title" id="conversation-title">与 <span data-assistant-name>贾维斯</span> 对话</span><span class="conversation-context">持续对话</span></div><div class="thread" id="thread" aria-live="polite"></div><form class="composer" id="composer"><label class="sr-only" for="input" id="composer-label">给贾维斯发消息</label><div class="composer-box"><textarea id="input" rows="1" placeholder="告诉贾维斯你想了解或推进什么…"></textarea><button class="send" type="submit" aria-label="发送">↑</button></div></form></section>
+        <aside class="side-stack" id="context-sidebar" aria-label="经营上下文">
+          <div class="dashboard-grid">
+            <section class="panel" aria-labelledby="decision-title"><div class="panel-head"><h2 class="panel-title" id="decision-title">需要我决定</h2><span class="panel-count">3 项</span></div><div class="decision"><div class="decision-main"><span class="decision-title">华东增长计划 · 新增预算</span><span class="decision-meta">建议批准方案 B · 今天 18:00 前</span></div><span class="decision-tag urgent">高影响</span><button class="decision-action" type="button" data-mission="east">查看</button></div><div class="decision"><div class="decision-main"><span class="decision-title">生产系统升级 · 变更窗口</span><span class="decision-meta">周末停机 2 小时 · 等待确认</span></div><span class="decision-tag">待确认</span><button class="decision-action" type="button" data-mission="release">查看</button></div><div class="decision"><div class="decision-main"><span class="decision-title">PR #128 · 登录流程修复</span><span class="decision-meta">检查已通过 · 等待审查</span></div><span class="decision-tag">待验收</span><button class="decision-action" type="button" data-mission="pr">查看</button></div></section>
+            <section class="panel" aria-labelledby="strategy-title"><div class="panel-head"><h2 class="panel-title" id="strategy-title">战略推进</h2><span class="panel-count">8 项</span></div><div class="strategy-row"><div class="strategy-top"><span class="strategy-name">华东增长计划</span><span class="strategy-state risk">有风险</span></div><div class="strategy-bar"><div class="strategy-fill risk" style="width:68%"></div></div><div class="strategy-foot"><span>预计达成 13%–16%</span><span>68%</span></div></div><div class="strategy-row"><div class="strategy-top"><span class="strategy-name">产品线重构</span><span class="strategy-state">按计划</span></div><div class="strategy-bar"><div class="strategy-fill" style="width:64%"></div></div><div class="strategy-foot"><span>下一里程碑 · 11 月 18 日</span><span>64%</span></div></div><div class="strategy-row"><div class="strategy-top"><span class="strategy-name">客户交付体系</span><span class="strategy-state">按计划</span></div><div class="strategy-bar"><div class="strategy-fill" style="width:92%"></div></div><div class="strategy-foot"><span>本周完成验收</span><span>92%</span></div></div></section>
+          </div>
+          <div class="lower-grid"><section class="panel" aria-labelledby="risk-title"><div class="panel-head"><h2 class="panel-title" id="risk-title">重大风险</h2><span class="panel-count">1 项</span></div><div class="risk-card"><div class="risk-main"><strong>华南项目预计延期 9 天</strong><span>交付依赖供应商接口，替代方案正在评估</span></div><span class="risk-level">需要关注</span></div></section><section class="panel" aria-labelledby="delivery-title"><div class="panel-head"><h2 class="panel-title" id="delivery-title">最近交付</h2><span class="panel-count">过去 7 天</span></div><div class="delivery-list"><div class="delivery-item"><strong>经营分析</strong><span>已交付 · 昨天</span></div><div class="delivery-item"><strong>报价策略</strong><span>已交付 · 周一</span></div><div class="delivery-item"><strong>风险清单</strong><span>已归档 · 周一</span></div></div></section></div>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal" id="mission-modal" role="dialog" aria-modal="true" aria-labelledby="mission-title" hidden><div class="modal-card"><div class="modal-head"><div><p class="modal-eyebrow" id="mission-eyebrow">战略任务</p><h2 class="modal-title" id="mission-title">华东增长计划</h2></div><button class="modal-close" type="button" data-action="close" aria-label="关闭">×</button></div><div class="mission-grid"><div class="mission-cell"><span>目标</span><strong id="mission-objective">季度收入提升 20%</strong></div><div class="mission-cell"><span>当前状态</span><strong id="mission-state">有风险</strong></div><div class="mission-cell"><span>内部推进</span><strong id="mission-progress">销售预测与预算评估</strong></div><div class="mission-cell"><span>截止时间</span><strong id="mission-deadline">今天 18:00 前</strong></div></div><div class="mission-callout" id="mission-next">需要你决定：是否批准新增预算 300 万。建议方案 B。</div><p class="mission-evidence" id="mission-evidence">依据：销售预测、区域成本模型、客户转化数据已完成交叉验证。</p><div class="modal-actions"><button class="action secondary" type="button" data-action="close">返回驾驶舱</button><button class="action" type="button" data-action="ack">与 <span data-assistant-name>贾维斯</span> 讨论</button></div></div></div>
+
+  <script>
+const assistantIdentity = { name: '贾维斯' };
+function applyAssistantName(name) {
+  assistantIdentity.name = name;
+  document.querySelectorAll('[data-assistant-name]').forEach(node => { node.textContent = name; node.title = name; });
+  document.querySelectorAll('[data-assistant-initial]').forEach(node => { node.textContent = Array.from(name)[0]; });
+  document.getElementById('input').placeholder = '告诉' + name + '你想了解或推进什么…';
+  document.getElementById('composer-label').textContent = '给' + name + '发消息';
+  document.title = (location.hash === '#settings/model' ? '模型配置 · ' : location.hash === '#settings' ? '基本设置 · ' : '') + name;
+}
+  </script>
+  <script>
+    (() => {
+      const missions = {
+        east: { eyebrow:'战略任务', title:'华东增长计划', objective:'季度收入提升 20%', state:'有风险', progress:'销售预测与预算评估', deadline:'今天 18:00 前', next:'需要你决定：是否批准新增预算 300 万。建议方案 B。', evidence:'依据：销售预测、区域成本模型、客户转化数据已完成交叉验证。' },
+        release: { eyebrow:'经营决策', title:'生产系统升级', objective:'完成核心服务版本升级', state:'等待确认', progress:'升级计划与回滚准备', deadline:'本周六 02:00', next:'需要你决定：是否接受周末 2 小时停机窗口。', evidence:'依据：回滚方案、影响范围和客户通知稿已经准备完成。' },
+        pr: { eyebrow:'执行交付', title:'PR #128 · 登录流程修复', objective:'完成 Issue #42 并交付可审查 PR', state:'等待审查', progress:'检查已通过', deadline:'现在', next:'需要你验收：查看变更和验证证据，决定是否合并。', evidence:'依据：相关检查已完成，变更范围保持在当前 Issue 内。' }
+      };
+      const composer = document.getElementById('composer'); const thread = document.getElementById('thread'); const input = document.getElementById('input'); const modal = document.getElementById('mission-modal'); let activeMission = null;
+      const escapeHtml = value => value.replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;' }[char]));
+      const addMessage = (role, text, actions = false, meta = '') => { const el = document.createElement('article'); el.className = `message ${role}`; el.innerHTML = `<div class="avatar" aria-hidden="true">${role === 'jarvis' ? '<span data-assistant-initial>' + escapeHtml(Array.from(assistantIdentity.name)[0]) + '</span>' : '你'}</div><div><div class="bubble">${meta ? `<span class="message-trigger">${escapeHtml(meta)}</span>` : ''}<p>${escapeHtml(text)}</p>${actions ? '<div class="message-actions"><button class="action" type="button" data-action="open-east">查看待决策</button><button class="action secondary" type="button" data-action="quiet">保持安静</button></div>' : ''}</div><div class="message-meta">${role === 'jarvis' ? '<span data-assistant-name>' + escapeHtml(assistantIdentity.name) + '</span> · 刚刚' : '你 · 刚刚'}</div></div>`; thread.appendChild(el); thread.scrollTop = thread.scrollHeight; };
+      const openMission = key => { const mission = missions[key]; if (!mission) return; activeMission = key; document.getElementById('mission-eyebrow').textContent = mission.eyebrow; document.getElementById('mission-title').textContent = mission.title; document.getElementById('mission-objective').textContent = mission.objective; document.getElementById('mission-state').textContent = mission.state; document.getElementById('mission-progress').textContent = mission.progress; document.getElementById('mission-deadline').textContent = mission.deadline; document.getElementById('mission-next').textContent = mission.next; document.getElementById('mission-evidence').textContent = mission.evidence; modal.hidden = false; };
+      const closeMission = () => { modal.hidden = true; activeMission = null; };
+      const reset = () => { closeMission(); thread.innerHTML = ''; addMessage('jarvis', '华东增长计划需要你决定预算；华南交付存在延期风险。其他工作继续推进。', true, '今日经营简报'); };
+      thread.addEventListener('click', event => { const action = event.target.closest('[data-action]')?.dataset.action; if (action === 'open-east') openMission('east'); if (action === 'quiet') addMessage('jarvis', '好的。我会保持安静，只有出现需要你决定、重大风险或结果可验收时再回来。'); });
+      document.querySelectorAll('[data-mission]').forEach(button => button.addEventListener('click', () => openMission(button.dataset.mission)));
+      modal.addEventListener('click', event => { const action = event.target.closest('[data-action]')?.dataset.action; if (action === 'close') closeMission(); if (action === 'ack') { const title = activeMission ? missions[activeMission].title : '这项工作'; closeMission(); addMessage('jarvis', `我们来讨论“${title}”。当前仍等待你的明确决定。`); } });
+      const handleSubmit = event => { event.preventDefault(); const text = input.value.trim(); if (!text) return; addMessage('user', text); input.value = ''; if (/华东|预算|增长/i.test(text)) { openMission('east'); addMessage('jarvis', '我已经打开华东增长计划的经营状态和决策依据。'); } else if (/PR|Issue|登录/i.test(text)) { openMission('pr'); addMessage('jarvis', '我已经打开这个执行交付的验收信息。'); } else { addMessage('jarvis', '我会把这个问题放入集团运行上下文，并判断是否需要升级给你。'); } };
+      composer.addEventListener('submit', handleSubmit); document.getElementById('reset').addEventListener('click', reset); reset();
+    })();
+  </script>
+<script>
+(() => {
+  const sidebar = document.getElementById('context-sidebar');
+  const panels = [...sidebar.querySelectorAll('.panel')];
+  const groups = [
+    { title: '待决策', count: 3 },
+    { title: '推进', count: 8 },
+    { title: '风险', count: 1 },
+    { title: '交付', count: 12 },
+  ];
+  const heading = document.createElement('h2');
+  heading.className = 'side-heading';
+  heading.innerHTML = '经营概览';
+  const tabs = document.createElement('div');
+  tabs.className = 'context-tabs';
+  tabs.setAttribute('role', 'tablist');
+  tabs.setAttribute('aria-label', '经营信息分类');
+
+  const select = index => {
+    panels.forEach((panel, i) => {
+      panel.hidden = i !== index;
+      const button = tabs.children[i];
+      button.setAttribute('aria-selected', String(i === index));
+      button.tabIndex = i === index ? 0 : -1;
+    });
+  };
+
+  panels.forEach((panel, i) => {
+    panel.id = `context-panel-${i}`;
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('aria-labelledby', `context-tab-${i}`);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'context-tab';
+    button.id = `context-tab-${i}`;
+    button.setAttribute('role', 'tab');
+    button.setAttribute('aria-controls', panel.id);
+    button.textContent = `${groups[i].title} ${groups[i].count}`;
+    button.addEventListener('click', () => select(i));
+    button.addEventListener('keydown', event => {
+      let next;
+      if (event.key === 'ArrowRight') next = (i + 1) % panels.length;
+      if (event.key === 'ArrowLeft') next = (i + panels.length - 1) % panels.length;
+      if (event.key === 'Home') next = 0;
+      if (event.key === 'End') next = panels.length - 1;
+      if (next === undefined) return;
+      event.preventDefault();
+      select(next);
+      tabs.children[next].focus();
+    });
+    tabs.append(button);
+  });
+
+  // Preserve the existing task panels and their click listeners.
+  sidebar.replaceChildren(heading, tabs, ...panels);
+  select(0);
+  const toggle = document.getElementById('context-toggle');
+  toggle.addEventListener('click', () => {
+    const mobile = window.matchMedia('(max-width: 900px)').matches;
+    const open = mobile && !sidebar.classList.contains('mobile-open');
+    sidebar.classList.toggle('mobile-open', open);
+    toggle.setAttribute('aria-expanded', String(open || !mobile));
+    if (open || !mobile) tabs.querySelector('[aria-selected="true"]').focus();
+  });
+  document.getElementById('reset').addEventListener('click', () => {
+    select(0);
+    sidebar.classList.remove('mobile-open');
+    toggle.setAttribute('aria-expanded', 'false');
+  });
+
+  // Keep keyboard focus within the existing detail dialog while it is open.
+  const modal = document.getElementById('mission-modal');
+  let returnFocus;
+  new MutationObserver(() => {
+    if (!modal.hidden) {
+      returnFocus = document.activeElement;
+      modal.querySelector('[data-action="close"]').focus();
+    } else if (returnFocus?.isConnected) {
+      returnFocus.focus();
+    }
+  }).observe(modal, { attributes: true, attributeFilter: ['hidden'] });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      if (!modal.hidden) modal.querySelector('[data-action="close"]').click();
+      else {
+        sidebar.classList.remove('mobile-open');
+        toggle.setAttribute('aria-expanded', 'false');
+      }
+    }
+    if (modal.hidden || event.key !== 'Tab') return;
+    const buttons = [...modal.querySelectorAll('button')];
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault(); first.focus();
+    }
+  });
+})();
+
+</script>
+<main class="settings-page" id="settings-page" aria-labelledby="settings-title" hidden>
+ <header class="settings-topbar"><div class="settings-breadcrumb"><div class="brand-mark" data-assistant-initial aria-hidden="true">贾</div><strong data-assistant-name>贾维斯</strong><span>/</span><span>设置</span></div><button class="reset" id="settings-back" type="button">← 返回对话</button></header>
+ <div class="unsaved-bar" id="settings-unsaved" role="status" hidden><span>有未保存的修改</span><button class="action secondary" id="settings-stay" type="button">继续编辑</button><button class="action secondary" id="settings-discard" type="button">放弃修改并返回</button></div>
+ <div class="settings-frame">
+  <nav class="settings-rail" aria-label="设置导航"><p data-assistant-name>贾维斯</p><a id="settings-nav-basic" href="#settings" aria-current="page">基本设置</a><a id="settings-nav-model" href="#settings/model">模型配置</a></nav>
+  <form class="settings-form" id="basic-form" novalidate autocomplete="off">
+   <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="basic-title" tabindex="-1">基本设置</h1></div></div>
+   <div class="settings-scroll"><div class="settings-content">
+     <div class="model-section"><h2>助手</h2><div class="model-fields"><label class="model-field wide"><span>助手名称</span><input id="setting-assistantName" type="text" value="贾维斯" maxlength="40" placeholder="贾维斯" autocomplete="off"></label></div></div>
+   </div></div>
+   <footer class="settings-footer"><p id="basic-feedback" role="status">无未保存的修改</p><button class="action" id="basic-save" type="submit" disabled>保存设置</button></footer>
+  </form>
+  <form class="settings-form" id="settings-form" hidden novalidate autocomplete="off">
+   <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="settings-title" tabindex="-1">模型配置</h1><span class="connection-status">未连接</span></div>
+    <div class="model-tabs" role="tablist" aria-label="模型配置分类">
+     <button type="button" role="tab" id="settings-tab-connection" aria-controls="settings-connection" aria-selected="true">连接</button>
+     <button type="button" role="tab" id="settings-tab-generation" aria-controls="settings-generation" aria-selected="false" tabindex="-1">生成参数</button>
+     <button type="button" role="tab" id="settings-tab-request" aria-controls="settings-request" aria-selected="false" tabindex="-1">请求选项</button>
+    </div>
+   </div>
+   <div class="settings-scroll" id="settings-scroll"><div class="settings-content">
+    <section class="model-panel" id="settings-connection" role="tabpanel" aria-labelledby="settings-tab-connection">
+
+     <div class="model-section"><h2>服务连接</h2><div class="model-fields">
+      <label class="model-field wide"><span>接口协议</span><select id="setting-protocol"><option value="chat-completions">Chat Completions · 兼容接口</option></select></label>
+      <label class="model-field wide"><span>服务地址 <small>Base URL</small></span><input id="setting-endpoint" type="url" placeholder="https://api.example.com/v1" spellcheck="false"></label>
+      <label class="model-field wide"><span>访问密钥 <small>API Key</small></span><div class="secret-field"><input id="setting-key" type="password" autocomplete="new-password" placeholder="输入 API Key" spellcheck="false"><button class="reset" id="settings-key-toggle" type="button" aria-label="显示 API Key" aria-pressed="false">显示</button></div></label>
+     </div></div>
+     <div class="model-section"><h2>对话模型</h2><div class="model-fields"><label class="model-field wide"><span>模型标识 <small>Model ID</small></span><input id="setting-model" type="text" placeholder="输入模型标识" maxlength="120" spellcheck="false"></label></div></div>
+    </section>
+    <section class="model-panel" id="settings-generation" role="tabpanel" aria-labelledby="settings-tab-generation" hidden>
+     <div class="model-section"><h2>采样</h2><div class="model-fields">
+      <label class="model-field wide"><span>采样方式</span><select id="setting-sampling"><option value="default">跟随模型默认</option><option value="temperature">Temperature</option><option value="topP">Top P</option></select></label>
+      <label class="model-field"><span>温度 <small>temperature</small></span><input id="setting-temperature" type="number" min="0" max="2" step="0.1" placeholder="模型默认" disabled></label>
+      <label class="model-field"><span>核采样 <small>top_p</small></span><input id="setting-topP" type="number" min="0" max="1" step="0.05" placeholder="模型默认" disabled></label>
+     </div></div>
+     <div class="model-section"><h2>输出</h2><div class="model-fields">
+      <label class="model-field"><span>最大输出 <small>Tokens</small></span><input id="setting-maxTokens" type="number" min="1" step="1" placeholder="模型默认"></label>
+      <label class="model-field"><span>推理强度 <small>reasoning_effort</small></span><select id="setting-reasoning"><option value="default">跟随模型默认</option><option value="low">低 · Low</option><option value="medium">中 · Medium</option><option value="high">高 · High</option></select></label>
+     </div></div>
+    </section>
+    <section class="model-panel" id="settings-request" role="tabpanel" aria-labelledby="settings-tab-request" hidden>
+     <div class="model-section"><h2>请求控制</h2><div class="model-fields">
+      <label class="model-field"><span>请求超时 <small>秒</small></span><input id="setting-timeout" type="number" min="1" max="3600" step="1"></label>
+      <label class="model-field"><span>失败重试 <small>次数</small></span><input id="setting-retries" type="number" min="0" max="5" step="1"></label>
+      <label class="settings-inline"><input id="setting-stream" type="checkbox">流式输出</label>
+     </div></div>
+    </section>
+   </div></div>
+   <footer class="settings-footer"><p id="settings-feedback" role="status">无未保存的修改</p><button class="action secondary" id="settings-reset" type="button">恢复参数默认</button><button class="action" id="settings-save" type="submit" disabled>保存配置</button></footer>
+  </form>
+ </div>
+</main>
+
+<script>
+(() => {
+  const byId = id => document.getElementById(id);
+  const page = byId('settings-page');
+  const conversation = byId('conversation-page');
+  const form = byId('settings-form');
+  const basicForm = byId('basic-form');
+  const nameField = byId('setting-assistantName');
+  const names = [ 'protocol', 'endpoint', 'model', 'sampling', 'temperature', 'topP', 'maxTokens', 'reasoning', 'timeout', 'retries', 'stream'];
+  const fields = Object.fromEntries(names.map(name => [name, byId(`setting-${name}`)]));
+  const key = byId('setting-key');
+  const tabs = [...page.querySelectorAll('[role="tab"]')];
+  const defaults = { protocol: 'chat-completions', endpoint: '', model: '', sampling: 'default', temperature: '', topP: '', maxTokens: '', reasoning: 'default', timeout: '120', retries: '2', stream: true };
+  let saved = { ...defaults };
+
+  function selectTab(index, focus = false) {
+    tabs.forEach((tab, i) => {
+      tab.setAttribute('aria-selected', String(i === index));
+      tab.tabIndex = i === index ? 0 : -1;
+      byId(tab.getAttribute('aria-controls')).hidden = i !== index;
+    });
+    byId('settings-scroll').scrollTop = 0;
+    if (focus) tabs[index].focus();
+  }
+  function readDraft() {
+    return Object.fromEntries(names.map(name => [name, fields[name].type === 'checkbox' ? fields[name].checked : fields[name].value.trim()]));
+  }
+  function isModelDirty() { return JSON.stringify(readDraft()) !== JSON.stringify(saved) || key.value !== ''; }
+  function isNameDirty() { return nameField.value.trim() !== assistantIdentity.name; }
+  function isDirty() { return isModelDirty() || isNameDirty(); }
+  function setFeedback(message, error = false) {
+    const feedback = byId('settings-feedback');
+    feedback.textContent = message;
+    feedback.classList.toggle('error', error);
+  }
+  function syncInputs() {
+    fields.temperature.disabled = fields.sampling.value !== 'temperature';
+    fields.topP.disabled = fields.sampling.value !== 'topP';
+    byId('settings-save').disabled = !isModelDirty();
+  }
+  function hideKey() {
+    key.type = 'password';
+    byId('settings-key-toggle').textContent = '显示';
+    byId('settings-key-toggle').setAttribute('aria-pressed', 'false');
+    byId('settings-key-toggle').setAttribute('aria-label', '显示 API Key');
+  }
+  function loadSaved() {
+    names.forEach(name => {
+      if (fields[name].type === 'checkbox') fields[name].checked = saved[name];
+      else fields[name].value = saved[name];
+      fields[name].removeAttribute('aria-invalid');
+    });
+    key.value = '';
+    hideKey();
+    byId('settings-unsaved').hidden = true;
+    setFeedback('无未保存的修改');
+    syncInputs();
+  }
+  function renderRoute() {
+    const open = ['#settings', '#settings/model'].includes(location.hash);
+    const modelPage = location.hash === '#settings/model';
+    if (!open && !page.hidden && isDirty()) {
+      history.replaceState(null, '', basicForm.hidden ? '#settings/model' : '#settings');
+      byId('settings-unsaved').hidden = false;
+      byId('settings-stay').focus();
+      return;
+    }
+    if (open && page.hidden) { loadSaved(); loadBasic(); selectTab(0); }
+    page.hidden = !open;
+    conversation.hidden = open;
+    basicForm.hidden = modelPage;
+    form.hidden = !modelPage;
+    byId('settings-nav-basic').removeAttribute('aria-current');
+    byId('settings-nav-model').removeAttribute('aria-current');
+    byId(modelPage ? 'settings-nav-model' : 'settings-nav-basic').setAttribute('aria-current', 'page');
+    const titleId = modelPage ? 'settings-title' : 'basic-title';
+    page.setAttribute('aria-labelledby', titleId);
+    document.title = (open ? (modelPage ? '模型配置 · ' : '基本设置 · ') : '') + assistantIdentity.name;
+    if (open) byId(titleId).focus();
+    else { key.value = ''; hideKey(); byId('settings-open').focus(); }
+  }
+  function validate(draft) {
+    if (!draft.endpoint) return ['endpoint', '请输入服务地址', 0];
+    try {
+      const url = new URL(draft.endpoint);
+      if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return ['endpoint', '服务地址须为 HTTP(S) 地址，且不包含凭据、查询参数或片段', 0];
+    } catch { return ['endpoint', '请输入有效的服务地址', 0]; }
+    if (!draft.model) return ['model', '请输入模型标识', 0];
+    const rules = [
+      ['temperature', 0, 2, false, 1, draft.sampling === 'temperature'],
+      ['topP', 0, 1, false, 1, draft.sampling === 'topP'],
+      ['maxTokens', 1, Number.MAX_SAFE_INTEGER, true, 1, draft.maxTokens !== '' || fields.maxTokens.validity?.badInput],
+      ['timeout', 1, 3600, true, 2, true],
+      ['retries', 0, 5, true, 2, true],
+    ];
+    for (const [name, min, max, integer, tab, enabled] of rules) {
+      if (!enabled) continue;
+      const value = Number(draft[name]);
+      if (draft[name] === '' || !Number.isFinite(value) || value < min || value > max || (integer && !Number.isSafeInteger(value))) {
+        const range = name === 'maxTokens' ? '正整数' : `${min}–${max}${integer ? ' 之间的整数' : ''}`;
+        return [name, `请输入${range}`, tab];
+      }
+    }
+    return null;
+  }
+  function changed() {
+    names.forEach(name => fields[name].removeAttribute('aria-invalid'));
+    syncInputs();
+    setFeedback(isModelDirty() ? '有未保存的修改' : '无未保存的修改');
+  }
+  function basicFeedback(message, error = false) {
+    byId('basic-feedback').textContent = message;
+    byId('basic-feedback').classList.toggle('error', error);
+  }
+  function loadBasic() {
+    nameField.value = assistantIdentity.name;
+    nameField.removeAttribute('aria-invalid');
+    byId('basic-save').disabled = true;
+    basicFeedback('无未保存的修改');
+  }
+  basicForm.addEventListener('input', () => {
+    nameField.removeAttribute('aria-invalid');
+    byId('basic-save').disabled = !isNameDirty();
+    basicFeedback(isNameDirty() ? '有未保存的修改' : '无未保存的修改');
+  });
+  basicForm.addEventListener('submit', event => {
+    event.preventDefault();
+    const name = nameField.value.trim();
+    if (!name || name.length > 40 || /[\u0000-\u001f\u007f]/.test(name)) {
+      nameField.setAttribute('aria-invalid', 'true');
+      nameField.focus(); basicFeedback('请输入 1–40 个字符的助手名称', true); return;
+    }
+    applyAssistantName(name);
+    loadBasic();
+    basicFeedback('设置已保存');
+    if (!isDirty()) byId('settings-unsaved').hidden = true;
+  });
+  byId('settings-open').addEventListener('click', () => { location.hash = 'settings'; });
+  byId('settings-back').addEventListener('click', () => {
+    if (isDirty()) { byId('settings-unsaved').hidden = false; byId('settings-stay').focus(); }
+    else location.hash = '';
+  });
+  byId('settings-stay').addEventListener('click', () => { byId('settings-unsaved').hidden = true; byId(basicForm.hidden ? 'settings-title' : 'basic-title').focus(); });
+  byId('settings-discard').addEventListener('click', () => { loadSaved(); loadBasic(); location.hash = ''; });
+  byId('settings-key-toggle').addEventListener('click', () => {
+    const show = key.type === 'password';
+    key.type = show ? 'text' : 'password';
+    byId('settings-key-toggle').textContent = show ? '隐藏' : '显示';
+    byId('settings-key-toggle').setAttribute('aria-label', show ? '隐藏 API Key' : '显示 API Key');
+    byId('settings-key-toggle').setAttribute('aria-pressed', String(show));
+  });
+  tabs.forEach((tab, i) => {
+    tab.addEventListener('click', () => selectTab(i));
+    tab.addEventListener('keydown', event => {
+      let next;
+      if (event.key === 'ArrowRight') next = (i + 1) % tabs.length;
+      if (event.key === 'ArrowLeft') next = (i + tabs.length - 1) % tabs.length;
+      if (event.key === 'Home') next = 0;
+      if (event.key === 'End') next = tabs.length - 1;
+      if (next !== undefined) { event.preventDefault(); selectTab(next, true); }
+    });
+  });
+  form.addEventListener('input', changed);
+  form.addEventListener('change', changed);
+  byId('settings-reset').addEventListener('click', () => {
+    for (const name of names.filter(name => !['protocol', 'endpoint', 'model'].includes(name))) {
+      if (fields[name].type === 'checkbox') fields[name].checked = defaults[name];
+      else fields[name].value = defaults[name];
+    }
+    changed();
+  });
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const draft = readDraft();
+    const error = validate(draft);
+    if (error) {
+      const [name, message, tab] = error;
+      selectTab(tab); fields[name].setAttribute('aria-invalid', 'true');
+      fields[name].focus(); setFeedback(message, true); return;
+    }
+    // Credentials never enter page state or storage. No backend call is made.
+    saved = draft;
+    loadSaved();
+    setFeedback('配置已保存');
+  });
+  window.addEventListener('hashchange', renderRoute);
+  applyAssistantName(assistantIdentity.name);
+  loadBasic();
+  renderRoute();
+})();
+</script>
+</body>
+</html>

@@ -83,38 +83,41 @@ it('renders each Source\'s settings from its kind\'s fields and saves one Source
       directMessages: false } } } })
   expect(server.settings.sources.feishu!.config).toMatchObject({ directMessages: false })
   const github = all('.dt-card')[1]!
-  await click('运行来源：GitHub')
+  await click(zh.githubReceivingEnable)
   server.revisions['source:github'] = 5
-  await act(async () => { github.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  await act(async () => { github.querySelector('form.dt-github-receiving')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
   // Another save changed nothing this draft changed, so the draft moves onto the newer revision and saves from there.
   expect(github.querySelector('.dt-savebar')?.textContent).toContain('设置已在别处修改，你的修改已合并到最新版本')
-  await act(async () => { github.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  await act(async () => { github.querySelector('form.dt-github-receiving')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
   expect(server.settings.sources.github).toMatchObject({ enabled: false })
   expect(server.revisions['source:github']).toBe(6)
 })
 
-it('shows the account each CLI signs in as, and keeps a saved CLI on screen while dsh-superagent restarts', async () => {
+it('shows the verified account while a candidate CLI is edited and validates it separately from receiving preferences', async () => {
   await mount()
   await click(tab(zh['tab.settings']))
   const github = all('.dt-card')[1]!
-  expect(github.textContent).toContain('当前账号 @agent-bot')
+  expect(github.textContent).toContain('@agent-bot')
   const labels = () => [...github.querySelectorAll('label')].map(label => label.textContent)
-  expect(labels()).toEqual(['监听的仓库', '智能体的 GitHub CLI'])
-  expect(field<HTMLInputElement>('监听的仓库').value).toBe('acme/widgets')
-  // A fact describes the saved value, so an edited CLI shows none until it is saved.
-  await type(field<HTMLInputElement>('智能体的 GitHub CLI'), 'gh-other')
-  expect(github.textContent).not.toContain('当前账号 @agent-bot')
-  await click(zh.discard)
-  expect(github.textContent).toContain('当前账号 @agent-bot')
-  await click([...github.querySelectorAll<HTMLElement>('[data-disclosure-row]')].find(row => row.textContent?.includes('高级'))!)
-  expect(labels()).toEqual(['监听的仓库', '智能体的 GitHub CLI', '轮询间隔 / 秒', '连续失败几次后报告异常'])
+  expect(labels()).toEqual([zh.githubConnectionRepository])
+  expect(field<HTMLInputElement>(zh.githubConnectionRepository).value).toBe('acme/widgets')
+  await click(find(zh.githubConnectionAdvanced, '[data-disclosure-row]'))
+  await type(field<HTMLInputElement>(zh.githubConnectionCliLabel), 'gh-other')
+  // The current account describes the saved connection, which a candidate CLI has not replaced.
+  expect(github.textContent).toContain('@agent-bot')
+  expect(github.querySelector('.dt-github-receiving .dt-savebar')).toBeNull()
+  await click([...github.querySelectorAll<HTMLElement>('.dt-github-receiving [data-disclosure-row]')]
+    .find(row => row.textContent === '高级')!)
+  expect(labels()).toEqual([zh.githubConnectionRepository, zh.githubConnectionCliLabel, '轮询间隔 / 秒', '连续失败几次后报告异常'])
   expect(all('.dt-card')[0]!.textContent).toContain('当前机器人 Widgets Bot')
   await type(field<HTMLInputElement>('智能体的 GitHub CLI'), '/opt/bin/gh-agent')
-  expect(github.textContent).toContain('保存会重启 dsh-superagent：2 个进行中的派工会中断，并带恢复说明重新开始。')
-  await act(async () => { github.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
-  expect(server.settings.sources.github!.config).toMatchObject({ cli: '/opt/bin/gh-agent' })
-  expect(text()).toContain(zh.savedRestarting)
-  // The saved value stays, and the card's fields are disabled, until the saved revision returns with the restarted dsh-superagent.
+  expect(github.textContent).toContain('更改连接会重启服务：2 个进行中的派工会中断，并带恢复说明重新开始。')
+  await act(async () => { github.querySelector('form.dt-github-connect-form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  expect(server.requests.find(request => request.path === 'github/connection' && request.method === 'POST')?.body)
+    .toEqual({ revision: 0, repository: 'acme/widgets', method: 'existing', cli: '/opt/bin/gh-agent' })
+  expect(server.requests.some(request => request.path === 'settings/source:github')).toBe(false)
+  expect(server.settings.sources.github!.config.cli).not.toBe('/opt/bin/gh-agent')
+  // Validation keeps the candidate on screen and disables its fields; current credentials are not changed yet.
   expect(field<HTMLInputElement>('智能体的 GitHub CLI').value).toBe('/opt/bin/gh-agent')
   expect(field('智能体的 GitHub CLI').matches(':disabled')).toBe(true)
   expect(sessionStorage.getItem('dsh-superagent/draft/master/source:github')).toBeNull()
@@ -270,10 +273,21 @@ it('reads the settings again as soon as dsh-superagent answers after a save rest
   onTestFinished(() => { vi.useRealTimers() })
   at({ page: 'settings', query: { group: 'source' } })
   await mount()
+  server.githubConnect = async body => {
+    const current = server.settings.sources.github!
+    server.settings.sources.github = { ...current, config: { ...current.config, cli: body.cli } }
+    server.revisions['source:github'] = 1
+    server.githubConnection = { available: true, tokenSupported: true, browserSupported: false, cli: '/usr/bin/gh',
+      connection: { repository: body.repository, login: 'agent-bot', managed: false, configured: true },
+      job: { id: 'saved-connection', status: 'connected', message: 'Connected', restarting: true } }
+    return server.githubConnection
+  }
+  await click(find(zh.githubConnectionAdvanced, '[data-disclosure-row]'))
   await type(field<HTMLInputElement>('智能体的 GitHub CLI'), '/opt/bin/gh-agent')
   const github = all('.dt-card')[1]!
-  await act(async () => { github.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
-  expect(field('智能体的 GitHub CLI').matches(':disabled')).toBe(true)
+  await act(async () => { github.querySelector('form.dt-github-connect-form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  expect(github.textContent).toContain(zh['githubConnectionStatus.connected'])
+  expect(field<HTMLInputElement>('智能体的 GitHub CLI').placeholder).toBe('/opt/bin/gh-agent')
   // dsh-superagent restarts: DSH answers with empty 404s, then it answers again.
   server.down = true
   await act(async () => { await vi.advanceTimersByTimeAsync(1000) }); await settle()
@@ -282,5 +296,5 @@ it('reads the settings again as soon as dsh-superagent answers after a save rest
   await act(async () => { await vi.advanceTimersByTimeAsync(1000) }); await settle()
   expect(server.requests.filter(request => request.path === 'settings').length).toBeGreaterThan(reads)
   expect(field('智能体的 GitHub CLI').matches(':disabled')).toBe(false)
-  expect(field<HTMLInputElement>('智能体的 GitHub CLI').value).toBe('/opt/bin/gh-agent')
+  expect(field<HTMLInputElement>('智能体的 GitHub CLI').placeholder).toBe('/opt/bin/gh-agent')
 })

@@ -69,7 +69,17 @@ export interface Executor {
 }
 
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */
-export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string }
+export interface OutboundMessage {
+  id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string
+  context?: {
+    purpose: 'acknowledgement' | 'answer' | 'attention' | 'result' | 'notice'
+    triggerId?: string
+    attentionId?: string
+    assignmentId?: string
+    /** Fingerprint of the saved assignment report, not an invented global report ID. */
+    reportRef?: string
+  }
+}
 /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
 export type ReplyStatus = 'pending' | 'sent' | 'dropped'
 /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */
@@ -107,6 +117,8 @@ export interface Repositories {
   atomic<T>(work: () => T): T
   triggers: {
     get(id: string): Trigger | undefined
+    byThread(key: string): Trigger[]
+    byCommand(source: string, commandId: string): Trigger | undefined
     save(trigger: Trigger): void
     disposition(id: string): import('./model.ts').TriggerDisposition | undefined
     saveDisposition(id: string, value: import('./model.ts').TriggerDisposition): void

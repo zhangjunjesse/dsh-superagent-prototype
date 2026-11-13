@@ -415,6 +415,7 @@ export class Tickets extends EnginePart {
   }
   /** Subscribe a ticket to a Thread; later Triggers on it reach the ticket as Inputs, as the ticket's own once it was for context. */
   private subscribe(ticketId: string, ref: ThreadRef): void {
+    this.dispatch.assertSubscription(ticketId, ref)
     const thread = this.thread(ref)
     if (!thread.subscriptions.includes(ticketId)) { thread.subscriptions.push(ticketId); this.emit('thread.subscribed', { threadKey: thread.key, ticketId }) }
     if (thread.context?.includes(ticketId)) thread.context = thread.context.filter(id => id !== ticketId)
