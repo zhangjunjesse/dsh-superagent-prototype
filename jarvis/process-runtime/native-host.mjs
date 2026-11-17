@@ -33,6 +33,7 @@ export class NativeHost {
     this.capabilityHold = capabilityHold ? { ...capabilityHold } : undefined; this.capabilitySnapshots = new Map(); this.invocationSequence = 0;
     this.lifetime = new AbortController(); this.disposers = []; this.retry = undefined; this.pumping = undefined;
     this.trusted = new Map((adoption?.sessions ?? []).map(session => [session.sessionId, session]));
+    this.adoptedAt = Date.parse(adoption?.completedAt ?? '');
     this.environment = scopedSubprocessEnvironment(ctx.subprocess);
     this.executor = original.localExecutorNative(ctx, id => Boolean(this.journal?.session(id)));
     this.wire = new NativeWire(peer, 'native.host', 'native.owner', (method, input, signal) => this.dispatch(method, input, signal));
@@ -64,12 +65,26 @@ export class NativeHost {
   capabilityAdmission() {
     if (this.capabilityHold?.frozen) throw new Error('Worker capability application has frozen new native work');
   }
+  adoptedContext(binding, message, rows) {
+    // The former in-process owner injected passive notices before the native
+    // admission journal existed. Accept only their exact pre-adoption evidence.
+    if (this.trusted.get(binding.id)?.role !== 'orchestrator' || !Number.isFinite(this.adoptedAt)
+      || typeof message.id !== 'string' || !message.id.startsWith(original.messageId('notice:'))
+      || message.role !== 'user' || message.source?.kind !== 'dsh-superagent' || message.source.form !== 'notice'
+      || typeof message.source.summary !== 'string' || Object.keys(message.source).length !== 3
+      || message.content?.length !== 1 || message.content[0].type !== 'text' || typeof message.content[0].text !== 'string'
+      || rows.some(row => original.messageId(row.input.requestId) === message.id)) return false;
+    const event = binding.agent.session.snapshotEvents().findLast(event => event.type === 'agent/inbox/spliced'
+      && event.data.inserted?.some(item => item.id === message.id));
+    return event?.data.target === 'next-step' && Number.isFinite(event.time) && event.time < this.adoptedAt
+      && event.data.inserted.some(item => item.id === message.id && nativeHash(item) === nativeHash(message));
+  }
   capabilityInboxWork(binding) {
     const work = [], rows = this.journal.deliveries(binding.id);
     for (const [target, messages] of [['nextTurn', binding.agent.inbox.nextTurn], ['nextStep', binding.agent.inbox.nextStep]]) for (const message of messages) {
       // AgentDelivery.inject is durable context for a later request and does not
-      // wake DSH. Only its exact acknowledged admission proves that distinction.
-      if (target === 'nextStep' && acknowledgedContext(message, rows)) continue;
+      // wake DSH. Require its exact acknowledgement or verified pre-adoption insertion.
+      if (target === 'nextStep' && (acknowledgedContext(message, rows) || this.adoptedContext(binding, message, rows))) continue;
       if (typeof message.id !== 'string' || !message.id) throw new Error('Native pending input has no verifiable identity');
       const inputHash = nativeHash({ target, message });
       work.push({ id: `native-input:${binding.id}:${message.id}:${inputHash}`, kind: 'native-input', sessionId: binding.id,

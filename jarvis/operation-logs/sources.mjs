@@ -17,6 +17,11 @@ const lifecycleNames={start:'开始启动',ready:'启动完成',stop:'开始停�
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const identity=(...parts)=>hash(JSON.stringify(parts));
 const sessionRefs=key=>typeof key==='string'&&key.startsWith('worker:')?{ticketId:key.slice(7)}:typeof key==='string'&&key.startsWith('delegation:')?{delegationId:key.slice(11)}:{};
+const sameWorkspace=(first,second)=>{
+  // Keep historical equal paths readable, and recognize junctions after a directory move.
+  if(relative(first,second)==='')return true;
+  try{return relative(realpathSync.native(first),realpathSync.native(second))==='';}catch{return false;}
+};
 
 /** Reads only known application stores and fixed artifacts in the managed instance state tree. */
 export class Sources {
@@ -163,7 +168,7 @@ export class Sources {
         journal=new NativeJournal(file,{instanceId:id,stateDir,workspace:realpathSync.native(item.config.workspace)},{readOnly:true});
         for(const row of journal.sessions()) {
           const prior=rows.get(row.id);
-          if(prior&&(prior.role!==row.role||relative(prior.cwd,row.cwd)!==''||row.parent))throw new Error('Native Session conflicts with adopted ownership');
+          if(prior&&(prior.role!==row.role||!sameWorkspace(prior.cwd,row.cwd)||row.parent))throw new Error('Native Session conflicts with adopted ownership');
           rows.set(row.id,row);
         }
       }

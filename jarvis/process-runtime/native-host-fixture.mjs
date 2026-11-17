@@ -228,11 +228,11 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
       skillsProvider = ctx.plugin({ name: 'fixture-skills-provider', apply(scope) { new skillsModule.SkillRegistry(scope); } });
       await skillsProvider;
     },
-    restartNative: async () => {
+    restartNative: async (adoption) => {
       await host.close(); transport.close();
       transport = new transportModule.NativeTransport(ownerPeer, config, { managementOnly }); transport.bindStore(store);
       if (!managementOnly) transport.sessions.install(callbacks);
-      host = new hostModule.NativeHost(ctx, config, hostPeer, { managementOnly, isCurrent: () => current });
+      host = new hostModule.NativeHost(ctx, config, hostPeer, { managementOnly, isCurrent: () => current, adoption });
     },
   };
 }

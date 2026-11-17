@@ -196,6 +196,41 @@ test('notice attribution alone never hides executable, modified or unacknowledge
   assert.equal(f.modelCalls.length, 0);
 });
 
+test('adopted original notices stay passive and intact without a native receipt, while newer inbox inputs still block', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t, { role: 'orchestrator', inherited: [], local: [], allowedTools: [] }); await f.ensure();
+  const id = f.policy().sessionId, agent = f.ctx.agents.get(id), delivery = new f.coreModule.AgentDelivery(f.ctx);
+  await delivery.send(agent, 'notice:historical-ticket:ended', '{"ticket_ended":"old-task"}', { inject: 'Ticket old-task ended (stopped)' }, new AbortController().signal);
+  const before = structuredClone(agent.inbox.nextStep), inserted = agent.session.snapshotEvents().findLast(event => event.type === 'agent/inbox/spliced');
+  const adoption = { completedAt: new Date(inserted.time + 1).toISOString(), sessions: [{ sessionId: id, role: 'orchestrator', cwd: f.config.workspace }] };
+  assert.equal(f.host.journal.deliveries(id).length, 0);
+  assert.equal((await f.host.capabilityActivity()).busy, true, 'unadopted attribution alone is not trusted');
+  await f.restartNative(adoption); await f.ensure();
+  assert.equal((await f.host.capabilityActivity()).busy, false);
+  assert.deepEqual((await persistedInbox(f, id))['next-step'], before, 'legacy notice remains intact in persistence');
+  assert.equal(f.modelCalls.length, 0);
+  await f.restartNative(adoption); await f.ensure();
+  assert.equal((await f.host.capabilityActivity()).busy, false, 'the same historical proof survives another restart');
+  await new Promise(resolve => setTimeout(resolve, 5));
+  agent.inbox.remove(before[0].id); agent.inbox.append('next-turn', before[0]);
+  assert.ok((await f.host.capabilityActivity()).work.some(item => item.messageId === before[0].id), 'queued turns remain executable');
+  agent.inbox.remove(before[0].id); agent.inbox.append('next-step', before[0]);
+  assert.ok((await f.host.capabilityActivity()).work.some(item => item.messageId === before[0].id), 'a later identical insertion cannot borrow old evidence');
+  const { freezeMessage } = await f.load('@deepseek-ai/dsh-llm');
+  agent.inbox.remove(before[0].id); agent.inbox.append('next-step', freezeMessage({ ...before[0], content: [{ type: 'text', text: 'Changed input' }] }));
+  assert.ok((await f.host.capabilityActivity()).work.some(item => item.messageId === before[0].id), 'changed input remains blocked');
+});
+
+test('adopted notice evidence never bypasses a native admission awaiting acknowledgement', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t, { role: 'orchestrator', inherited: [], local: [], allowedTools: [] }); await f.ensure();
+  const id = f.policy().sessionId, input = { sessionId: id, requestId: 'notice:pending-admission', text: 'Unacknowledged context', mode: { inject: 'Pending' } };
+  await f.transport.wire.call('deliver', { id: 'pending-before-adoption', input });
+  const event = f.ctx.agents.get(id).session.snapshotEvents().findLast(event => event.type === 'agent/inbox/spliced');
+  const adoption = { completedAt: new Date(event.time + 1).toISOString(), sessions: [{ sessionId: id, role: 'orchestrator', cwd: f.config.workspace }] };
+  await f.restartNative(adoption); await f.ensure();
+  assert.ok((await f.host.capabilityActivity()).work.some(item => item.messageId === f.coreModule.messageId(input.requestId)));
+  assert.equal(f.modelCalls.length, 0);
+});
+
 test('native force stops only exact confirmed executable inbox messages and preserves passive context and new input', { skip: !available, timeout: 12000 }, async t => {
   const f = await nativeFixture(t, { inherited: [], local: [], allowedTools: [] }); await f.ensure();
   const { freezeMessage } = await f.load('@deepseek-ai/dsh-llm'), agent = f.ctx.agents.get(f.policy().sessionId);

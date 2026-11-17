@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync,rmSync,readFileSync,mkdirSync,writeFileSync,realpathSync } from 'node:fs';
+import { mkdtempSync,rmSync,readFileSync,mkdirSync,writeFileSync,realpathSync,symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -302,4 +302,28 @@ test('a known Session cannot be relabeled as another organization or role',async
   assert.throws(()=>ui.logs.sources.bind('known-session',{organizationId:'root',organizationName:'Root'},'worker'),/ownership conflicts/);
   assert.equal(ui.logs.sessions.get('known-session').organizationId,'root');
   assert.equal(ui.logs.sessions.get('known-session').role,'jarvis');
+});
+
+for(const scenario of ['junction','different','missing-equal'])test(`adopted native logs preserve workspace ownership after relocation: ${scenario}`,async t=>{
+  const ui=await fixture(t),root=join(ui.directory,'managed'),stateDir=join(root,'instances','child','state'),workspace=join(root,'workspace');
+  mkdirSync(stateDir,{recursive:true});mkdirSync(workspace,{recursive:true});
+  const alias=join(root,'old-workspace');symlinkSync(workspace,alias,process.platform==='win32'?'junction':'dir');
+  const other=join(root,'different-workspace');mkdirSync(other);
+  const prior=scenario==='missing-equal'?join(root,'missing'):alias;
+  const current=scenario==='junction'?workspace:scenario==='different'?other:prior;
+  const journalPath=join(root,'adoption-journal.json');
+  const adoption={version:1,instanceId:'child',identity:{deploymentId:'fixture',principalId:'fixture'},masterId:'adopted-router',
+    sessions:[{sessionId:'adopted-router',role:'orchestrator',cwd:prior}],journalPath,
+    sourcePaths:{core:join(root,'old-core.sqlite'),gateway:join(root,'old-gateway.sqlite'),stateDir:join(root,'old-state')},
+    sourceHashes:{core:'fixture-core',gateway:'fixture-gateway'},machineDefaults:{promptMaxChars:1000,admissionContextMaxPages:1,admissionContextTimeoutMs:1000}};
+  writeFileSync(join(stateDir,'original-adoption.json'),JSON.stringify(adoption));
+  writeFileSync(journalPath,JSON.stringify({...adoption,phase:'complete',stateDir:realpathSync.native(stateDir),
+    files:['orchestrator.sqlite','jarvis-gateway.sqlite'].map(name=>({target:join(realpathSync.native(stateDir),name),staged:join(root,`adopted-${name}`),prior:null})),
+    before:{core:{hash:'fixture-core'},gateway:{hash:'fixture-gateway'}}}));
+  const native=new NativeJournal(join(stateDir,'native-host.sqlite'),{instanceId:'child',stateDir:realpathSync.native(stateDir),workspace:realpathSync.native(workspace)});
+  native.bind({id:'adopted-router',role:'orchestrator',cwd:current});native.close();
+  ui.logs.system={rootDir:root,manager:{instances:new Map([['child',{config:{organizationName:'Child',workspace}}]])}};
+  await ui.logs.refresh();
+  assert.equal(ui.opened.includes('adopted-router'),scenario!=='different');
+  if(scenario==='different')assert.match(ui.logs.coverage().sources.find(source=>source.id==='instances').detail,/conflicts with adopted ownership/);
 });
