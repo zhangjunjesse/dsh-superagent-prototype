@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { Engine, MemoryRepositories, key, reportReference } from '../src/core/index.ts'
 import type { DispatchConstraint, EngineOptions, Policy, Ticket, Trigger } from '../src/core/index.ts'
 
-function fixture() {
+function fixture(resumeCompletedCommands = false) {
   const repo = new MemoryRepositories()
   let listened = true, allowed = true, clock = 0
   const policy: Policy = {
@@ -12,7 +12,7 @@ function fixture() {
     revalidate: () => allowed, admitsInferred: () => false,
   }
   const executor = { start: vi.fn(), stop: vi.fn(), deliver: vi.fn() }
-  const options: EngineOptions = { repo, policy: () => policy,
+  const options: EngineOptions = { repo, policy: () => policy, resumeCompletedCommands,
     scope: { scope: () => listened ? { listened: true, observed: false } : { listened: false, reason: 'disabled' } },
     assessor: { request: vi.fn(), release: vi.fn() }, executor,
     outbox: { send: vi.fn(), status: () => undefined, withdraw: vi.fn() },
@@ -171,6 +171,37 @@ describe('constrained command routing', () => {
     expect(() => h.engine.attach(a.id, command.id)).toThrow()
     expect(h.engine.commandReceipt(command.id)).toMatchObject({ status: 'conflict', consumption: { reason: 'targetEnded' } })
     expect(h.repo.tickets.get(a.id)).toEqual(ended)
+  })
+
+  it.each([false, true])('completed follow-up respects its explicit runtime capability (%s)', enabled => {
+    const h=fixture(enabled), a=h.accept('A')
+    h.engine.assignmentStarted(a.id,a.assignments[0]!.id)
+    h.engine.report(a.id,{state:'ready',summary:'finished'})
+    h.engine.receive(h.command('followup','append',a))
+    if (enabled) {
+      const updated=h.engine.attach(a.id,'followup')
+      expect(updated.ended).toBeUndefined()
+      expect(updated.assignments).toHaveLength(2)
+      expect(h.repo.tickets.list()).toHaveLength(1)
+    } else {
+      expect(()=>h.engine.attach(a.id,'followup')).toThrow()
+      expect(h.engine.commandReceipt('followup')).toMatchObject({status:'conflict',consumption:{reason:'targetEnded'}})
+    }
+  })
+
+  it.each(['stopped','revoked'] as const)('completed follow-up never bypasses %s authority', reason => {
+    const h=fixture(true), a=h.accept('A')
+    if(reason==='stopped') h.engine.stopTicket(a.id)
+    else {
+      h.engine.assignmentStarted(a.id,a.assignments[0]!.id)
+      h.engine.report(a.id,{state:'ready',summary:'finished'})
+    }
+    h.engine.receive(h.command('followup','append',a))
+    if(reason==='revoked') h.setAllowed(false)
+    const previous=h.repo.tickets.get(a.id)
+    expect(()=>h.engine.attach(a.id,'followup')).toThrow()
+    expect(h.repo.tickets.get(a.id)).toEqual(previous)
+    expect(h.executor.start).toHaveBeenCalledOnce()
   })
 
   it('stops only its fixed target and never delivers a stop Input or subscription', () => {

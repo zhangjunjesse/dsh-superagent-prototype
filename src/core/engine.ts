@@ -78,8 +78,10 @@ export class Engine {
    */
   evaluateDue(): void {
     const policy = this.options.policy()
-    for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, policy) })
-    if (policy.paused) return
+    const frozen = this.options.admission?.frozen?.() === true
+    const clockPolicy = frozen ? { ...policy, paused: true } : policy
+    for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, clockPolicy) })
+    if (policy.paused || frozen) return
     for (const ticket of this.repo.tickets.active()) {
       if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => { this.tickets.wake(ticket.id) })
     }
@@ -183,6 +185,10 @@ export class Engine {
    * @throws UserError when the trigger is unknown.
    */
   reevaluate(triggerId: string): boolean { return this.repo.atomic(() => this.evals.reevaluate(triggerId)) }
+  /** Administrative cancellation of an exact assessment/input; records the original ignored Decision and command receipt. */
+  cancelAssessment(triggerId: string, reason: string, expectedEvalId?: string): boolean {
+    return this.repo.atomic(() => this.evals.cancel(triggerId, reason, expectedEvalId))
+  }
   /**
    * A person dismisses the problem an unavailable Decision shows: the overview lists it no more.
    * @throws UserError for a Decision that is unknown or not unavailable.

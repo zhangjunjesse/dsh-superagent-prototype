@@ -15,6 +15,7 @@
     },
     "./client": "./lib/client.js",
     "./jarvis": "./jarvis/dsh/index.mjs",
+    "./process-runtime": "./jarvis/process-runtime/index.mjs",
     "./jarvis-gateway": {
       "types": "./lib/jarvis-gateway.d.ts",
       "default": "./lib/jarvis-gateway.js"
@@ -34,6 +35,11 @@
     "jarvis/dsh",
     "!jarvis/dsh/*.test.mjs",
     "!jarvis/dsh/*fixture*.mjs",
+    "jarvis/process-runtime",
+    "!jarvis/process-runtime/*.test.mjs",
+    "!jarvis/process-runtime/*fixture*.mjs",
+    "jarvis/operation-logs",
+    "!jarvis/operation-logs/*.test.mjs",
     "jarvis/public",
     "jarvis/store.mjs",
     "jarvis/config.mjs",

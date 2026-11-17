@@ -1569,30 +1569,28 @@ it('keeps the Windows Router PowerShell available with the same short-turn and w
   expect(guards.get(sessionId)!(pwsh('Get-Date'))).toBe('Ticket ended; new work needs a new authorized ticket')
 })
 
-it('reads the main Session\'s preset from a registry with or without presetForSession, and takes standard\'s caps when it cannot', async () => {
+it.each(['projection', 'created-preset', 'registry', 'registry-error'] as const)(
+  'reads the main Session preset from %s, retaining the original shell caps', async source => {
   const watch = { name: 'bash', arguments: { command: 'gh pr checks 7 --watch', description: 'x' } }
   const route = { name: 'orchestrator_route', arguments: { decisions: [] } }
   const guard = async (registry: Record<string, unknown>, projections?: Record<string, unknown>) => {
-    services.agentPresets = registry
-    if (projections) services.sessionProjections = projections; else delete services.sessionProjections
-    await (await restart()).ready
+    // The guard reads the live registry for each actual call. Vary that service directly;
+    // filesystem Setup/restarts are unrelated to the four registry resolution branches.
+    const ctx = (runtime as unknown as { ctx: Context }).ctx
+    ctx.reflect.provide('agentPresets', registry)
+    if (projections) ctx.reflect.provide('sessionProjections', projections)
     return guards.get(runtime.masterId)!
   }
   // A released DSH's registry has no presetForSession: the projection says standard, so standard's caps apply, and the
   // other tools run.
-  let main = await guard({ select: vi.fn() }, { stateOf: vi.fn((_session: unknown, key: string) => key === 'agentPreset' ? 'standard' : undefined) })
+  const registry = { select: vi.fn(), ...(source === 'registry' ? { presetForSession: () => 'standard' }
+    : source === 'registry-error' ? { presetForSession: () => { throw new Error('no projection') } } : {}) }
+  const projections = source === 'projection' ? { stateOf: vi.fn((_session: unknown, key: string) => key === 'agentPreset' ? 'standard' : undefined) } : undefined
+  const main = await guard(registry, projections)
   expect(main(route)).toBeUndefined()
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
   // Without the projection either, the preset it was created with counts: the router preset.
-  main = await guard({ select: vi.fn() })
-  expect([main(route), main(watch)]).toEqual([undefined, undefined])
-  // The registry says standard though the Session was created with the router preset: standard's caps apply.
-  main = await guard({ select: vi.fn(), presetForSession: () => 'standard' })
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
-  // A registry that fails is read as standard, the safer caps, and the guard does not throw.
-  main = await guard({ select: vi.fn(), presetForSession: () => { throw new Error('no projection') } })
-  expect(main(route)).toBeUndefined()
-  expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
+  if (source === 'created-preset') expect([main(route), main(watch)]).toEqual([undefined, undefined])
+  else expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
 })
 
 it('refuses an ended ticket\'s worker its tools, and restricts the main Session to the tools it may use', async () => {

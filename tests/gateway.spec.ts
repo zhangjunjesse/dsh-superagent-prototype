@@ -48,6 +48,23 @@ function fixture() {
 }
 
 describe('Gateway commands and durable transport', () => {
+  it('refuses a completed task when its executor cannot safely continue the original work', async () => {
+    const h = fixture(), receipt = h.enqueue()
+    if (!('commandId' in receipt)) throw new Error('receipt missing')
+    await h.pump().tick()
+    const ticketId = h.accept(h.ledger.command(receipt.commandId)!.command.triggerId).ticketId!
+    h.engine.assignmentStarted(ticketId, h.repo.tickets.get(ticketId)!.assignments[0]!.id)
+    h.engine.report(ticketId, { state:'ready', summary:'Child deliverable complete' })
+    h.advance(); await h.pump().tick()
+    const service = new GatewayService(h.ledger, h.backend, identity, Date.now, { resumeCompletedCommands:true, canResumeCompleted:() => false })
+    const target = service.query({operation:'get',workRef:receipt.workRef}) as { targetToken:string; canSubmit:boolean }
+    expect(target.canSubmit).toBe(false)
+    const result = service.submit({operation:'append',targetToken:target.targetToken,request:{quote:'再修改颜色',summary:'修改颜色'}},
+      {...h.origin('followup','再修改颜色'),selectedWorkRef:receipt.workRef})
+    expect(result).toMatchObject({status:'unsupported',reason:expect.stringContaining('暂不支持原任务续改')})
+    expect(h.ledger.works()).toHaveLength(1)
+    expect(h.ledger.command(commandId(identity,h.origin('followup','再修改颜色')))).toBeUndefined()
+  })
   it('persists a receipt before delivery and replays the same user turn even after restart and summary changes', async () => {
     const h = fixture(), result = h.enqueue()
     expect(result.status).toBe('queued')

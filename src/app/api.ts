@@ -9,12 +9,47 @@ import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
 import type { GithubConnectionInput, GithubConnectionView } from './github-connection.ts'
+import type { MachineSettingsView, MachineValues } from './machine-settings.ts'
+import type { EffectiveWorkerTool } from '../process-runtime/worker-capabilities.ts'
+import type { OriginalConfigurationMigration } from '../process-runtime/original-config.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
 export type TicketFilter = typeof TICKET_FILTERS[number]
 export type ThreadFilter = typeof THREAD_FILTERS[number]
 interface Paged { offset?: number; limit?: number }
+/** A server-observed activity that may be interrupted when applying Worker authorization. */
+export interface WorkerCapabilityAffectedOrganization {
+  instanceId: string
+  name: string
+  running: boolean
+  busy: boolean
+  work: { id: string; title: string; kind: string; status?: string }[]
+  error?: string
+}
+/** Durable application of one saved Worker authorization, with actions allowed by its current state. */
+export interface WorkerCapabilityApplication {
+  id: string
+  state: 'waiting' | 'applying' | 'failed' | 'applied' | 'cancelled'
+  savedAt: string
+  appliedAt?: string
+  error?: string
+  affected: WorkerCapabilityAffectedOrganization[]
+  canCancel: boolean
+  canRetry: boolean
+  canApplyNow: boolean
+  confirmation?: string
+}
+export interface WorkerCapabilitiesView {
+  revision: number
+  tools: string[]
+  skills: string[]
+  applied: { tools: string[]; skills: string[] }
+  application?: WorkerCapabilityApplication
+  effective: { names: string[]; tools: EffectiveWorkerTool[] }
+  catalog: { tools: { name: string; label: string; group: string; available: boolean }[];
+    skills: { name: string; description: string; source?: unknown }[]; complete: boolean; error?: string }
+}
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
 
@@ -24,6 +59,13 @@ export interface Api {
   'GET search': { query: { q: string }; response: SearchView }
   'GET sources': { response: SourceStatusView[] }
   'GET settings': { response: SettingsView }
+  'GET configuration-migrations': { response: { items: OriginalConfigurationMigration[] } }
+  'GET deployment': { response: MachineSettingsView }
+  'PUT deployment': { body: { revision: number; values: MachineValues }; response: MachineSettingsView }
+  'GET worker-capabilities': { response: WorkerCapabilitiesView }
+  'PUT worker-capabilities': { body: { revision: number; tools: string[]; skills: string[] }; response: WorkerCapabilitiesView }
+  'POST worker-capabilities/application': { body: { revision: number; applicationId: string;
+    action: 'cancel' | 'retry' | 'apply-now'; confirmation?: string }; response: WorkerCapabilitiesView }
   'GET github/connection': { response: GithubConnectionView }
   'POST github/connection': { body: GithubConnectionInput; response: GithubConnectionView }
   'POST github/connection/cancel': { body: { id: string }; response: GithubConnectionView }

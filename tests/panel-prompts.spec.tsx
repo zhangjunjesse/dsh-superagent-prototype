@@ -72,6 +72,25 @@ it('loads all defaults into the draft from the history without saving them', asy
   expect(server.requests.some(request => request.path === 'prompts' && request.method === 'PUT')).toBe(false)
 })
 
+it('describes and restores the complete history draft including built-in overrides and team skills', async () => {
+  const historical = { ...defaultPrompts(), communication: 'Historical communication', scope: 'Historical scope',
+    delivery: 'Historical delivery', skills: { review: 'Historical review skill' },
+    overrides: { 'runtime/shared': { text: 'Historical shared rules', base: builtInBase(builtInParts()['runtime/shared'].text) },
+      'skill/github': { text: 'Historical GitHub instructions', base: builtInBase(builtInParts()['skill/github'].text) } } }
+  const version = promptVersion(1, historical)
+  server.prompts.revision = 2; server.prompts.current = promptVersion(2, defaultPrompts())
+  server.prompts.revisions = [{ ...version, changed: ['communication', 'scope', 'delivery', 'skills', 'overrides'] }]
+  server.promptVersions[1] = version
+  at({ page: 'settings', query: { group: 'prompts' } })
+  await mount()
+  await click(tab(zh.promptViewHistory))
+  expect(text()).toContain('内置段落和内置技能的自定义覆盖')
+  await click(zh.promptRestore)
+  expect(server.requests.some(request => request.path === 'prompts' && request.method === 'PUT')).toBe(false)
+  await click(zh.save)
+  expect(server.prompts.current.config).toEqual(historical)
+})
+
 it('keeps the Prompts save bar hidden while a preview loads for an unchanged draft', async () => {
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()

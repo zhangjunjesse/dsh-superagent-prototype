@@ -1,7 +1,7 @@
 /**
  * Optimistic settings draft state with sessionStorage persistence and three-way rebase against concurrent saves.
  */
-import { useEffect, useLayoutEffect, useReducer, useRef, type FormEvent } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useReducer, useRef, useState, type FormEvent } from 'react'
 import { ApiError } from './api.ts'
 import { usePanel } from './provider.tsx'
 import { errorText, type T } from './text.ts'
@@ -50,13 +50,30 @@ function mergeList([base, mine, theirs]: unknown[][], field: string, conflicts: 
 }
 
 interface Stored<V, M> { base: V; value: V; revision: number; meta?: M }
-function read<V, M>(key: string | undefined): Stored<V, M> | undefined {
-  if (!key) return undefined
+function compatible(value: unknown, saved: unknown): boolean {
+  if (saved === null || saved === undefined) return true
+  if (Array.isArray(saved)) return Array.isArray(value)
+  if (isRecord(saved)) return isRecord(value) && Object.entries(saved).every(([key, field]) => compatible(value[key], field))
+  return typeof value === typeof saved
+}
+function read<V, M>(key: string | undefined, saved: V): { stored?: Stored<V, M>; unmerged?: string } {
+  if (!key) return {}
+  let raw: string | null = null
   try {
-    const stored = JSON.parse(sessionStorage.getItem(key) ?? 'null') as Partial<Stored<V, M>> | null
-    // Drop drafts without `base` (stored by older versions) because they cannot be three-way merged.
-    return stored && 'base' in stored && 'value' in stored && Number.isInteger(stored.revision) ? stored as Stored<V, M> : undefined
-  } catch (error) { void error /* An unreadable draft is dropped; the saved value stays authoritative. */; return undefined }
+    raw = sessionStorage.getItem(key)
+    const stored = JSON.parse(raw ?? 'null') as Partial<Stored<V, M>> | null
+    return stored && typeof stored === 'object' && 'base' in stored && 'value' in stored && Number.isInteger(stored.revision)
+      && compatible(stored.value, saved)
+      ? { stored: stored as Stored<V, M> } : raw === null ? {} : { unmerged: raw }
+  } catch { return raw === null ? {} : { unmerged: raw } }
+}
+function preserve(key: string, raw: string) {
+  for (let index = 0; index < 1000; index++) {
+    const backup = `${key}/unmerged/${index}`, current = sessionStorage.getItem(backup)
+    if (current === raw) return
+    if (current === null) { sessionStorage.setItem(backup, raw); return }
+  }
+  throw new Error('There are too many preserved drafts; the original draft was not overwritten.')
 }
 
 export type DraftNotice = { kind: 'restored' | 'rebasing' } | { kind: 'merged'; revision: number }
@@ -134,18 +151,32 @@ export interface DraftOptions<V> {
 }
 /** Manage a settings draft, persisting unsaved edits in `sessionStorage` and rebasing them when newer server revisions arrive. */
 export function useDraft<V, M = undefined>({ key, saved, revision, save, reload }: DraftOptions<V>) {
-  const { restart } = usePanel()
+  const { restart, trackDraft } = usePanel(), draftId = useId()
+  const latestRevision = useRef(revision)
+  latestRevision.current = revision
+  const [restored] = useState(() => read<V, M>(key, saved))
+  const [unmerged, setUnmerged] = useState(restored.unmerged)
   const [state, dispatch] = useReducer(draftReducer<V, M>, undefined, () => {
-    const stored = read<V, M>(key)
+    const stored = restored.stored
     const initial: DraftState<V, M> = stored ? { phase: 'editing', draft: stored, notice: { kind: 'restored' } } : { phase: 'clean' }
     return revision === undefined ? initial : draftReducer(initial, { type: 'revisionArrived', saved, revision })
   })
   if (state.phase !== 'saving' && revision !== undefined && revision !== state.seen) dispatch({ type: 'revisionArrived', saved, revision })
+  const busy = state.phase === 'saving' || state.phase === 'awaitingRevision'
+  const dirty = state.draft !== undefined
+  const discard = useCallback(() => dispatch({ type: 'discard' }), [])
+  useEffect(() => {
+    trackDraft(draftId, { dirty, busy, discard })
+    return () => trackDraft(draftId, undefined)
+  }, [trackDraft, draftId, dirty, busy, discard])
   useEffect(() => {
     if (!key) return
-    try { if (state.draft) sessionStorage.setItem(key, JSON.stringify(state.draft)); else sessionStorage.removeItem(key) }
+    try {
+      if (unmerged !== undefined) { if (!state.draft && sessionStorage.getItem(key) === unmerged) return; preserve(key, unmerged) }
+      if (state.draft) sessionStorage.setItem(key, JSON.stringify(state.draft)); else sessionStorage.removeItem(key)
+    }
     catch (failure) { dispatch({ type: 'refused', notice: { kind: 'unstored', error: errorText(failure) } }) }
-  }, [key, state.draft])
+  }, [key, state.draft, unmerged])
   const failed = (failure: unknown) => dispatch({ type: 'refused', notice: { kind: 'failed', error: errorText(failure) } })
   const submit = async (event?: FormEvent) => {
     event?.preventDefault()
@@ -158,7 +189,10 @@ export function useDraft<V, M = undefined>({ key, saved, revision, save, reload 
     } catch (failure) {
       const fields = failure instanceof ApiError ? failure.issues.map(issue => issue.path) : []
       if (failure instanceof ApiError && failure.status === 409) {
-        await reload().then(() => dispatch({ type: 'refused', notice: { kind: 'rebasing' } }), failed)
+        dispatch({ type: 'refused', notice: { kind: 'rebasing' } })
+        await reload().catch(failed)
+        // A running-organization refusal also uses 409. Without a newer revision, show its actual reason and keep the edit.
+        if (latestRevision.current === draft.revision) failed(failure)
       } else dispatch({ type: 'refused', notice: fields.length ? { kind: 'invalid', fields } : { kind: 'failed',
         error: errorText(failure) } })
       return
@@ -167,19 +201,27 @@ export function useDraft<V, M = undefined>({ key, saved, revision, save, reload 
     if (result.restarting) restart(); else await reload().catch(failed)
   }
   return { state, value: state.sent?.value ?? state.draft?.value ?? saved, meta: state.draft?.meta,
-    revision: state.draft?.revision ?? revision ?? 0, dirty: state.draft !== undefined,
-    busy: state.phase === 'saving' || state.phase === 'awaitingRevision', submit,
-    edit: (value: V, meta?: M) => dispatch({ type: 'edit', value, meta, saved, revision }), discard: () => dispatch({ type: 'discard' }) }
+    revision: state.draft?.revision ?? revision ?? 0, dirty,
+    busy, submit,
+    edit: (value: V, meta?: M) => dispatch({ type: 'edit', value, meta, saved, revision }), discard,
+    recovery: unmerged === undefined ? undefined : { raw: unmerged, acknowledge: () => {
+      try {
+        if (key) { preserve(key, unmerged); if (sessionStorage.getItem(key) === unmerged) sessionStorage.removeItem(key) }
+        setUnmerged(undefined)
+      } catch (failure) { failed(failure) }
+    } } }
 }
 
 /** Sticky save/discard bar for a settings block; transfers focus back to its parent block when hidden so keyboard navigation does not reset. */
-export function SaveBar({ state, dirty, busy, words, status, onDiscard, onSave }: {
+export function SaveBar({ state, dirty, busy, words, status, onDiscard, onSave, recovery, saveDisabled }: {
   state: DraftState<unknown, unknown>; dirty: boolean; busy: boolean; words?: DraftWords; status?: string | undefined
+  recovery?: { raw: string; acknowledge: () => void }
   onDiscard: () => void; onSave?: () => void
+  saveDisabled?: boolean
 }) {
   const { t } = usePanel()
   const line = saveBarText(t, state, words)
-  const shown = dirty || busy || !!line.error
+  const shown = dirty || busy || !!line.error || !!recovery
   const bar = useRef<HTMLDivElement>(null)
   const block = useRef<HTMLElement | null>(null)
   const focused = useRef(false)
@@ -193,10 +235,13 @@ export function SaveBar({ state, dirty, busy, words, status, onDiscard, onSave }
   const leave = (next: Element | null) => { if (next && !bar.current?.contains(next)) focused.current = false }
   return <div ref={bar} className="dt-savebar" onFocus={() => { focused.current = true }}
     onBlur={event => leave(event.relatedTarget as Element | null)}>
+    {recovery && <div className="dt-draft-recovery"><p className="dt-error" role="alert">{t('draftUnmerged')}</p>
+      <details><summary>{t('draftOriginal')}</summary><pre className="dt-pre">{recovery.raw}</pre></details>
+      <Button size="sm" variant="outline" disabled={busy} onClick={recovery.acknowledge}>{t('draftPreserveAndContinue')}</Button></div>}
     {line.error ? <p className="dt-error dt-clamp" role="alert">{line.error}</p>
       : <p className="dt-hint" aria-live="polite">{status ?? line.status}</p>}
     <Button variant="ghost" size="sm" disabled={!dirty || busy} onClick={onDiscard}>{t('discard')}</Button>
-    <Button variant="primary" size="sm" disabled={!dirty || busy} {...onSave ? { onClick: onSave } : { type: 'submit' as const }}>
+    <Button variant="primary" size="sm" disabled={!dirty || busy || saveDisabled} {...onSave ? { onClick: onSave } : { type: 'submit' as const }}>
       {t('save')}
     </Button>
   </div>

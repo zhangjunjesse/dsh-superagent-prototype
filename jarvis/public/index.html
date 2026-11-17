@@ -6,6 +6,9 @@
   <title>贾维斯</title>
   <link rel="stylesheet" href="/ui.css">
   <link rel="stylesheet" href="/capabilities.css">
+  <link rel="stylesheet" href="/composition.css">
+  <link rel="stylesheet" href="/operation-logs.css">
+  <link rel="stylesheet" href="/prompts.css">
 </head>
 <body>
   <div class="shell" id="conversation-page">
@@ -64,11 +67,27 @@
 
 
 <main class="settings-page" id="settings-page" aria-labelledby="settings-title" hidden>
- <header class="settings-topbar"><div class="settings-breadcrumb"><div class="brand-mark" data-assistant-initial aria-hidden="true">贾</div><strong data-assistant-name>贾维斯</strong><span>/</span><span>设置</span></div><button class="reset" id="settings-back" type="button">返回对话</button></header>
+ <header class="settings-topbar"><div class="settings-breadcrumb"><div class="brand-mark" data-assistant-initial aria-hidden="true">贾</div><strong data-assistant-name>贾维斯</strong><span>/</span><span>设置</span></div><div class="workspace-page-actions"><a class="logs-entry" href="#logs" data-operation-logs-link hidden>运行日志</a><button class="reset" id="settings-back" type="button">返回对话</button></div></header>
  <div class="unsaved-bar" id="settings-unsaved" role="status" hidden><span>有未保存的修改</span><button class="action secondary" id="settings-stay" type="button">继续编辑</button><button class="action secondary" id="settings-discard" type="button">放弃修改并返回</button></div>
  <div class="settings-frame">
-  <nav class="settings-rail" aria-label="设置导航"><p data-assistant-name>贾维斯</p><a id="settings-nav-basic" href="#settings" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg><span>基本设置</span></a><a id="settings-nav-model" href="#settings/model"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="3"/><path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4m12-6h4m-4 6h4"/></svg><span>模型配置</span></a><p class="settings-rail-group">能力管理</p><a id="settings-nav-tools" href="#settings/tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 8-4 4 4 4m10-8 4 4-4 4m-4-11-2 14"/></svg><span>工具</span></a><a id="settings-nav-skills" href="#settings/skills"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 9 9l-6 3 6 3 3 6 3-6 6-3-6-3-3-6Z"/></svg><span>技能</span></a></nav>
+  <nav class="settings-rail" aria-label="设置导航"><p data-assistant-name>贾维斯</p><a id="settings-nav-basic" href="#settings" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg><span>基本设置</span></a><a id="settings-nav-model" href="#settings/model"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="3"/><path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4m12-6h4m-4 6h4"/></svg><span>贾维斯模型</span></a><p class="settings-rail-group">能力管理</p><a id="settings-nav-tools" href="#settings/tools"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 8-4 4 4 4m10-8 4 4-4 4m-4-11-2 14"/></svg><span>工具</span></a><a id="settings-nav-skills" href="#settings/skills"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 9 9l-6 3 6 3 3 6 3-6 6-3-6-3-3-6Z"/></svg><span>技能</span></a><p class="settings-rail-group">系统</p><a id="settings-nav-system" href="#settings/system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="7" height="6" rx="1.5"/><rect x="14" y="4" width="7" height="6" rx="1.5"/><rect x="8.5" y="15" width="7" height="5" rx="1.5"/><path d="M6.5 10v2h11v-2M12 12v3"/></svg><span>系统管理</span></a></nav>
   <section class="capabilities-page" id="capabilities-page" aria-labelledby="capabilities-title" hidden></section>
+  <section class="composition-page" id="composition-page" hidden aria-labelledby="composition-title"><div id="composition-main"></div><div id="composition-toast" role="status" hidden></div></section>
+  <form class="prompts-page" id="prompts-page" aria-labelledby="prompts-title" hidden novalidate autocomplete="off">
+   <div class="prompts-heading"><h1 id="prompts-title" tabindex="-1">提示词</h1><p>管理与你日常对话的贾维斯角色提示词。保存后从下一轮对话生效，进行中的回复保持原设置。</p></div>
+   <p class="prompts-unavailable" id="prompts-unavailable" hidden>当前服务未提供提示词管理。</p>
+   <div class="prompts-scroll" id="prompts-content">
+    <div class="prompts-editor-heading"><label for="prompt-text">角色提示词</label><span id="prompt-draft-state">尚未读取</span><span id="prompt-count">0 / 32000</span></div>
+    <textarea id="prompt-text" maxlength="32000" spellcheck="false" aria-describedby="prompt-text-note" disabled></textarea>
+    <p class="prompts-note" id="prompt-text-note">用于设定职责、交办原则和沟通方式。工具权限由工具设置控制。</p>
+    <details class="prompts-latest" id="prompt-latest" hidden><summary>最新已保存内容 · 当前编辑草稿已保留</summary><pre id="prompt-latest-text"></pre></details>
+    <details class="prompts-preview" id="prompt-preview">
+     <summary>查看下一轮提示词预览 <span id="prompt-preview-state">基于当前草稿</span></summary>
+     <div class="prompts-preview-body"><p class="prompts-note" id="prompt-context-note">查看下一轮对话使用的系统提示词；对话历史和工具说明另行提供。</p><div class="prompts-preview-status"><p id="prompt-preview-feedback" role="status"></p><button class="reset" id="prompt-preview-refresh" type="button">刷新预览</button></div><div id="prompt-sections"></div><details id="prompt-effective" hidden><summary>合并后的系统提示词</summary><pre id="prompt-effective-text"></pre></details></div>
+    </details>
+   </div>
+   <footer class="prompts-footer" id="prompts-footer"><p id="prompt-feedback" role="status">正在读取提示词…</p><div class="prompts-actions"><button class="action secondary" id="prompt-reload" type="button">读取最新</button><button class="action secondary" id="prompt-default" type="button" disabled>恢复默认</button><button class="action" id="prompt-save" type="submit" disabled>保存提示词</button></div></footer>
+  </form>
   <form class="settings-form" id="basic-form" novalidate autocomplete="off">
    <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="basic-title" tabindex="-1">基本设置</h1></div></div>
    <div class="settings-scroll"><div class="settings-content">
@@ -77,8 +96,8 @@
    <footer class="settings-footer"><p id="basic-feedback" role="status">无未保存的修改</p><button class="action" id="basic-save" type="submit" disabled>保存设置</button></footer>
   </form>
   <form class="settings-form" id="settings-form" hidden novalidate autocomplete="off">
-   <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="settings-title" tabindex="-1">模型配置</h1><span class="connection-status" id="connection-status">未配置</span></div>
-    <div class="model-tabs" role="tablist" aria-label="模型配置分类">
+   <div class="settings-heading"><p class="settings-eyebrow">助手设置</p><div class="settings-title-row"><h1 id="settings-title" tabindex="-1">贾维斯模型</h1><span class="connection-status" id="connection-status">未配置</span></div>
+    <div class="model-tabs" role="tablist" aria-label="贾维斯模型分类">
      <button type="button" role="tab" id="settings-tab-connection" aria-controls="settings-connection" aria-selected="true">连接</button>
      <button type="button" role="tab" id="settings-tab-generation" aria-controls="settings-generation" aria-selected="false" tabindex="-1">生成参数</button>
      <button type="button" role="tab" id="settings-tab-request" aria-controls="settings-request" aria-selected="false" tabindex="-1">请求选项</button>
@@ -118,11 +137,42 @@
  </div>
 </main>
 
+<main class="operation-logs-page" id="operation-logs-page" aria-labelledby="operation-logs-title" hidden>
+ <header class="logs-topbar"><div><p class="logs-eyebrow">SuperJarvis</p><h1 id="operation-logs-title" tabindex="-1">运行日志</h1></div><nav class="workspace-page-actions" aria-label="工作区导航"><a id="logs-organization" href="#settings/organization">组织架构管理</a><a href="#">返回对话</a></nav></header>
+ <div class="logs-workspace">
+  <form class="logs-filters" id="logs-filters" role="search" aria-label="筛选运行日志">
+   <label class="logs-search"><span>关键词</span><input id="logs-query" name="q" type="search" placeholder="搜索事件、摘要或任务" maxlength="300" autocomplete="off"></label>
+   <label><span>组织</span><select id="logs-organization-filter" name="organization"><option value="">全部组织</option></select></label>
+   <label><span>角色</span><select id="logs-role" name="role"><option value="">全部角色</option></select></label>
+   <label><span>级别</span><select id="logs-level" name="level"><option value="">全部级别</option></select></label>
+   <button class="action" type="submit">搜索</button>
+  </form>
+  <div class="logs-toolbar"><p id="logs-count" role="status">正在连接…</p><div class="logs-trace-filter" id="logs-trace-filter" hidden><span id="logs-trace-label"></span><button class="reset" id="logs-clear-trace" type="button">清除流程筛选</button></div><div class="logs-actions"><span id="logs-refresh-status"></span><button class="action secondary" id="logs-refresh" type="button">刷新</button><button class="action secondary" id="logs-toggle-refresh" type="button" aria-pressed="true">暂停更新</button></div></div>
+  <details class="logs-coverage" id="logs-coverage" hidden><summary id="logs-coverage-summary">记录范围</summary><p id="logs-coverage-since"></p><ul id="logs-coverage-sources"></ul></details>
+  <div class="logs-error" id="logs-error" role="alert" hidden><span id="logs-error-message"></span><button class="reset" id="logs-retry" type="button">重试</button></div>
+  <div class="logs-body">
+   <section class="logs-list-panel" aria-label="运行事件"><div class="logs-list-heading"><h2>最新收录</h2><span>按收录顺序</span></div><ol class="logs-list" id="logs-list"></ol><p class="logs-empty" id="logs-empty" role="status" hidden></p><button class="action secondary logs-more" id="logs-more" type="button" hidden>加载更多</button></section>
+   <aside class="logs-detail" id="logs-detail" aria-labelledby="logs-detail-title">
+    <div class="logs-detail-heading"><h2 id="logs-detail-title" tabindex="-1">事件详情</h2><button class="reset" id="logs-close-detail" type="button" hidden>关闭详情</button></div>
+    <div class="logs-detail-actions" id="logs-detail-actions" hidden><button class="action secondary" id="logs-show-trace" type="button" hidden>查看同一流程</button><button class="action secondary" id="logs-export" type="button" disabled>导出选中事件 JSON</button><button class="reset" id="logs-detail-retry" type="button" hidden>重试详情</button></div>
+    <section class="logs-related-work" id="logs-related-work" aria-label="关联任务" hidden></section>
+    <p id="logs-detail-status" role="status">选择一条事件，查看记录详情。</p>
+    <dl class="logs-detail-meta" id="logs-detail-meta" hidden></dl><p class="logs-record-note" id="logs-record-note" hidden></p>
+    <div class="logs-readable" id="logs-readable" hidden></div><p class="logs-detail-summary" id="logs-detail-summary" hidden></p>
+    <details class="logs-raw" id="logs-detail-raw" hidden><summary>原始结构化记录</summary><pre class="logs-detail-json" id="logs-detail-json" tabindex="0"><code id="logs-detail-data"></code></pre></details>
+   </aside>
+  </div>
+ </div>
+</main>
+
 
 <script src="/identity.js"></script>
 <script src="/layout.js"></script>
 <script src="/model-picker.js"></script>
 <script src="/capabilities.js"></script>
+<script src="/composition.js"></script>
+<script src="/operation-logs.js"></script>
+<script src="/prompts.js"></script>
 <script src="/settings.js"></script>
 <script src="/chat.js"></script>
 </body>

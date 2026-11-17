@@ -1,4 +1,5 @@
 /** Settings tab shell routing between stage settings (Sources, Eval, Execution), Prompts, and Deployment. */
+import { useState, type ReactNode } from 'react'
 import type { StateView } from './api.ts'
 import { DeploymentPage, type DeploymentForm } from './deployment.tsx'
 import { EvalSettings } from './eval.tsx'
@@ -10,19 +11,22 @@ import { SettingsProvider } from './settings-kit.tsx'
 import { SourceSettings } from './source.tsx'
 
 const STAGE_GROUPS: readonly SettingsGroup[] = ['source', 'eval', 'execution']
-export function SettingsPage({ group, query, state, deploymentForm }: {
+export function SettingsPage({ group, query, state, deploymentForm, machineApi, executionAddon, promptsAddon, keepMounted = false }: {
   group: SettingsGroup; query: { source?: string; version?: string }; state: StateView; deploymentForm: DeploymentForm
+  machineApi?: boolean; executionAddon?: ReactNode; promptsAddon?: ReactNode; keepMounted?: boolean
 }) {
   const { t, navigate } = usePanel()
-  const content = (() => {
-    switch (group) {
+  const [visited, setVisited] = useState<SettingsGroup[]>([group])
+  if (keepMounted && !visited.includes(group)) setVisited([...visited, group])
+  const content = (current: SettingsGroup) => {
+    switch (current) {
       case 'source': return <SettingsProvider><SourceSettings {...query.source ? { focus: query.source } : {}} /></SettingsProvider>
       case 'eval': return <SettingsProvider><EvalSettings version={query.version} /></SettingsProvider>
-      case 'execution': return <SettingsProvider><ExecutionSettings /></SettingsProvider>
-      case 'prompts': return <PromptsPage />
-      case 'deployment': return <DeploymentPage setup={state.setup} form={deploymentForm} />
+      case 'execution': return <><SettingsProvider><ExecutionSettings /></SettingsProvider>{executionAddon}</>
+      case 'prompts': return <><PromptsPage />{promptsAddon}</>
+      case 'deployment': return <DeploymentPage setup={state.setup} form={deploymentForm} machineApi={machineApi} />
     }
-  })()
+  }
   return <div className="dt-settings">
     <nav className="dt-settings-nav" aria-label={t('tab.settings')}>
       {SETTINGS_GROUPS.map(value => <button key={value} type="button" className="dt-settings-link" data-stage={STAGE_GROUPS.includes(value)
@@ -32,7 +36,8 @@ export function SettingsPage({ group, query, state, deploymentForm }: {
     </nav>
     <div className="dt-settings-body">
       <h2 className="dt-settings-title">{t(`settingsGroup.${group}`)}</h2>
-      {content}
+      {(keepMounted ? visited : [group]).map(current => <div key={current} hidden={current !== group}
+        className="dt-settings-group" data-settings-group={current}>{content(current)}</div>)}
     </div>
   </div>
 }

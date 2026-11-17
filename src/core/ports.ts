@@ -1,5 +1,5 @@
 /** Ports the core depends on. Sources, policies, assessors, executors, and channels are project-specific. */
-import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
+import type { Assignment, ChannelRef, Decision, DecisionKind, DelegationAuthority, Mandate, MandateBasis, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
   from './model.ts'
 import type { Reason } from './reasons.ts'
 
@@ -24,6 +24,14 @@ export interface Policy {
   admitsInferred(rules: readonly string[]): boolean
   /** How long an assessor may take before an eval is recorded as unavailable. */
   evalTimeoutMs: number
+}
+
+/** Trusted runtime boundary for durable machine commands; trigger text and metadata cannot establish this authority. */
+export interface DelegationAdmission {
+  /** Match the complete saved trigger, including command ID/hash, to authenticated, durable parent authority. */
+  authorize(trigger: Trigger): DelegationAuthority | undefined
+  /** Recheck saved authority and current local constraints; cross-process revocation is conveyed by durable stop commands. */
+  revalidate(mandate: Mandate): boolean
 }
 
 /** What the assessor receives: bounded facts, never authority. */

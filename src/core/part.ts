@@ -3,7 +3,7 @@ import { UserError } from './errors.ts'
 import { Dispatches } from './dispatch.ts'
 import { followupOwners, reached, threadKey } from './model.ts'
 import type { Thread, ThreadRef, Ticket, Trigger } from './model.ts'
-import type { Assessor, AssessmentOutcome, DomainEvent, DomainEvents, Executor, Outbox, Policy, Repositories, SourceScope } from './ports.ts'
+import type { Assessor, AssessmentOutcome, DelegationAdmission, DomainEvent, DomainEvents, Executor, Outbox, Policy, Repositories, SourceScope } from './ports.ts'
 
 export interface EngineOptions {
   repo: Repositories
@@ -13,6 +13,12 @@ export interface EngineOptions {
   assessor: Assessor
   executor: Executor
   outbox: Outbox
+  /** Authenticated machine delegation only; ordinary Sources and human admission retain the configured Policy. */
+  delegation?: DelegationAdmission
+  /** Local artifact workflows may accept a new human append to a completed, still-authorized task. */
+  resumeCompletedCommands?: boolean
+  /** Maintenance admission keeps queued source inputs durable while already admitted work drains. */
+  admission?: { evaluate(trigger: Trigger): boolean; resume(ticket: Ticket): boolean; frozen?(): boolean }
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
   now?: () => string
   emit?: (event: DomainEvent) => void

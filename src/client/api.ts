@@ -27,14 +27,17 @@ export interface ApiMessages {
   setup: (problem: SetupProblem) => string
   user: (failure: UserFailure) => string
 }
+/** A fixed same-origin engine endpoint. An omitted scope retains the original panel's API. */
+export interface ApiScope { base: string; csrf?: string }
 const isUserError = (code: unknown): code is UserErrorCode => typeof code === 'string' && Object.hasOwn(USER_ERRORS, code)
 
 /** Calls one management endpoint; the `x-orchestrator-request` header marks the request as originating from this page. */
-async function api<T>(messages: ApiMessages, path: string, method: string, body?: unknown): Promise<T> {
+async function api<T>(messages: ApiMessages, path: string, method: string, body?: unknown, scope?: ApiScope): Promise<T> {
   let response: Response
   const json = body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
   try {
-    response = await fetch(`/orchestrator/api/${path}`, { method, ...json, headers: { 'x-orchestrator-request': '1', ...json.headers } })
+    response = await fetch(`${scope?.base ?? '/orchestrator/api'}/${path}`, { method, ...json,
+      headers: { 'x-orchestrator-request': '1', ...(scope?.csrf && !['GET', 'HEAD'].includes(method) ? { 'x-jarvis-csrf': scope.csrf } : {}), ...json.headers } })
   } catch {
     throw new ApiError(messages.offline, 0, { unreachable: true })
   }
@@ -105,19 +108,24 @@ export const DECISION_KINDS: Readonly<Record<DecisionFilter, string>> = { work: 
 export type Call = <K extends keyof Api>(route: K, ...request: {} extends ApiRequest<K> ? [request?: ApiRequest<K>] : [request: ApiRequest<K>])
   => Promise<ApiResponse<K>>
 /** Build a typed route caller that resolves localized error messages on each request. */
-export function caller(messages: () => ApiMessages): Call {
+export function caller(messages: () => ApiMessages, target?: ApiScope): Call {
+  const scope = target ? { ...target, base: target.base.replace(/\/+$/, '') } : undefined
+  if (scope && (!/^\/(?!\/)[A-Za-z0-9_./~-]+$/.test(scope.base) || scope.base.split('/').some(part => part === '.' || part === '..'))) {
+    throw new Error('The task engine API must use a fixed same-origin path')
+  }
   return (route, ...[request]) => {
     const [method, pattern] = route.split(' ') as [string, string]
     const values = (request ?? {}) as Record<string, unknown> & { query?: Record<string, unknown>; body?: unknown }
     const path = pattern.replace(/:(\w+)/g, (_match, name: string) => encodeURIComponent(String(values[name])))
     const query = Object.entries(values.query ?? {}).filter(([, value]) => value !== undefined && value !== '')
       .map(([name, value]) => `${name}=${encodeURIComponent(String(value))}`).join('&')
-    return api(messages(), query ? `${path}?${query}` : path, method, values.body)
+    return api(messages(), query ? `${path}?${query}` : path, method, values.body, scope)
   }
 }
 
 export type StateView = ApiResponse<'GET state'>
 export type SetupView = StateView['setup']
+export type { ApiResponse }
 export type SettingsView = ApiResponse<'GET settings'>
 export type Settings = { [B in keyof SettingsView['blocks']]: SettingsView['blocks'][B]['value'] }
 export type SourceView = SettingsView['sources'][number]

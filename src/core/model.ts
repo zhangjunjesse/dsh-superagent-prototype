@@ -132,7 +132,7 @@ export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'
   if (!reached.length || records.threads.get(threadKey(trigger.threads[0]!))?.evaluating?.triggerIds.includes(trigger.id)) return []
   return reached.filter(id => {
     const ticket = records.tickets.get(id)
-    return !!ticket && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
+    return !!ticket && (liveTicket(ticket) || (!withdrawn(ticket)
       && ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
   })
 }
@@ -151,6 +151,17 @@ export type AdmissionCell = 'listedUnaddressed' | 'unlistedAddressed' | 'unliste
  * (`would_accept`) without accepting (`observe`), or not admitted (`off`).
  */
 export type AcceptMode = 'off' | 'observe' | 'auto'
+/** Native execution capabilities supported by the host's delegation adapter. Selection does not grant task authority. */
+export const DELEGATION_TOOLS = ['read', 'glob', 'grep', 'read_image', 'write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch'] as const
+/** Host-verified, single-hop authority inherited from one accepted parent task; never supplied by a model. */
+export interface DelegationAuthority {
+  delegationId: string
+  parentInstanceId: string
+  parentTicketId: string
+  parentAssignmentId: string
+  parentDecisionId: string
+  tools: readonly (typeof DELEGATION_TOOLS[number])[]
+}
 /** Where a Mandate's Trigger was received: its Source, its receiving scope as the Source recorded it, and its admission row. */
 interface Received { source?: string; scope?: Record<string, unknown>; row?: string }
 /**
@@ -170,6 +181,8 @@ export type MandateBasis = Received & { sender?: string; rules?: string[] } & (
   | { via: 'listed'; addressed?: 'mention' | 'direct'; observation?: { mode?: AcceptMode }; authority?: string }
   /** A message of a bot on its Source's bot list: an inferred candidate at most, never an explicit request or a stop. */
   | { via: 'bot'; addressed?: 'mention' | 'direct'; observation: { mode: AcceptMode } }
+  /** A trusted runtime verified the accepted parent mandate and this immutable machine command. */
+  | { via: 'delegation'; addressed?: 'direct'; delegation: DelegationAuthority }
 )
 
 /** Immutable authorization produced by an accept decision; execution is bounded by it and it never changes. */
@@ -291,6 +304,8 @@ export function reportReference(assignment: Pick<Assignment, 'id' | 'report'>): 
 export type TicketInput =
   /** A Trigger on one of its Threads, or attached to it; `human` when a person wrote it. */
   | { id: string; kind: 'trigger'; triggerId: string; at: string; note?: string; human?: true
+    /** Core-verified parent control, actionable without pretending that a person wrote it. */
+    delegated?: true
     /** It reached the ticket only on a Thread its Executor follows for context. */
     context?: true
     /**
@@ -378,6 +393,8 @@ export interface Execution { name: string; directory: string; assignment: string
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended
+/** A stop withdraws the mandate regardless of whether a person or a verified parent requested it. */
+export const withdrawn = (ticket: Pick<Ticket, 'ended'>): boolean => ticket.ended?.by === 'human' || ticket.ended?.outcome === 'stopped'
 /** How a ticket ended. */
 export const ticketOutcome = (ticket: Pick<Ticket, 'ended'>): TicketOutcome | undefined => ticket.ended?.outcome
 export const runningAssignment = (ticket: Ticket): Assignment | undefined => ticket.assignments.find(assignment => assignment.state === 'running')
@@ -411,5 +428,5 @@ export function readUntil(ticket: Pick<Ticket, 'assignments'>, progress = true):
 export function waitsForPerson(ticket: Ticket): boolean {
   const report = latestAssignment(ticket)?.report
   if (report?.state !== 'blocked' && report?.state !== 'failed') return false
-  return !ticket.inputs.some(input => input.kind === 'trigger' && input.human && !input.context && input.at > report.at)
+  return !ticket.inputs.some(input => input.kind === 'trigger' && (input.human || input.delegated) && !input.context && input.at > report.at)
 }

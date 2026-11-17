@@ -25,7 +25,11 @@
       } else {
         const parts = /^\[([^\]]+)\]\((.+)\)$/.exec(token);
         let url;
-        try { url = new URL(parts[2]); } catch {}
+        try {
+          // Local deliverables use authenticated routes; arbitrary relative links stay plain text.
+          url = /^\/jarvis\/api\/system\/[a-z][a-z0-9-]*\/artifacts\//.test(parts[2])
+            ? new URL(parts[2], location.origin) : new URL(parts[2]);
+        } catch {}
         if (url && ['http:', 'https:'].includes(url.protocol)) {
           node = document.createElement('a'); node.href = url.href;
           node.target = '_blank'; node.rel = 'noopener noreferrer'; node.textContent = parts[1];
@@ -136,6 +140,16 @@
         const action = document.createElement('button'); action.type = 'button'; action.className = 'work-reference';
         action.textContent = value.questionId ? `回答问题 · ${value.workRef}` : `继续此任务 · ${value.workRef}`;
         action.addEventListener('click', () => selectWork(value)); node.body.append(action);
+      }
+      for (const artifact of turn.artifacts || []) {
+        if (!artifact || typeof artifact.title !== 'string' || !/^\/jarvis\/api\/system\/[a-z][a-z0-9-]*\/artifacts\//.test(artifact.url || '') || artifact.downloadUrl !== artifact.url + '?download=1') continue;
+        const row = document.createElement('div'); row.className = 'task-artifact';
+        const title = document.createElement('strong'); title.textContent = artifact.title; row.append(title);
+        for (const [label, href] of [['打开', artifact.url], ['下载', artifact.downloadUrl]]) {
+          const link = document.createElement('a'); link.textContent = label; link.href = href;
+          link.target = '_blank'; link.rel = 'noopener noreferrer'; link.className = 'work-reference'; row.append(link);
+        }
+        node.body.append(row);
       }
       const lastUser = turns.findLast(item => item.source !== 'gateway' && item.role !== 'assistant');
       if (turn.source !== 'gateway' && turn.id === lastUser?.id && turn.status !== 'complete' && turn.status !== 'streaming' && !busy) {

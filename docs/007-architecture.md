@@ -43,7 +43,7 @@ Shutdown cancels turns, waits for passes, effects and agents, restores the proce
 
 ### Engine
 
-`Engine` (`src/core/engine.ts`) is the only writer of Triggers, Threads, Decisions, Tickets and Assignments. It receives these ports from `src/core/ports.ts`: `Repositories`, a current-Policy getter, `SourceScope`, `Assessor`, `Executor` and `Outbox`. Optional dependencies are `prepareTicket`, `now` and `emit`.
+`Engine` (`src/core/engine.ts`) is the only writer of Triggers, Threads, Decisions, Tickets and Assignments. It receives these ports from `src/core/ports.ts`: `Repositories`, a current-Policy getter, `SourceScope`, `Assessor`, `Executor` and `Outbox`. Optional dependencies are `prepareTicket`, `now`, `emit` and authenticated machine `delegation` admission. The latter verifies a durable source proof and revalidates delegated mandates; it never changes `human:false` to a human request. Without this optional port, machine commands cannot gain explicit authority.
 
 All Engine methods are synchronous. Each command changes its aggregates in one transaction. `evaluateDue` uses a separate transaction for each Eval or Ticket it changes. Ports enqueue external work inside the transaction; adapters perform it after commit. Invalid requests throw `UserError`.
 
@@ -95,7 +95,7 @@ Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `Eng
 
 The Engine keeps batching, authorization, fan-out, resume and attention lifecycle rules private. Several shared predicates make these rules consistent:
 
-- `waitsForPerson` (`src/core/model.ts`): the latest Assignment reported `blocked` or `failed`, and no human message has arrived since. Automatic Inputs and failed launches remain held while this is true.
+- `waitsForPerson` (`src/core/model.ts`): the latest Assignment reported `blocked` or `failed`, and no human message or verified delegated control has arrived since. Other automatic Inputs and failed launches remain held while this is true.
 - `followupOwners`: the Tickets still responsible for a human follow-up received on their own Threads. A Ticket can be live or ended without a human stop and waiting to resume. Handing back the message ends that ownership.
 - `settled`: a Decision resolved the request; stop, unavailable, routed and refused-stop Decisions do not count.
 - `ticketStage` (`src/core/stage.ts`): implements the stage table in [003 Execution](003-execution.md).
@@ -118,7 +118,7 @@ A Ticket keeps each fact once. It is open while it has no `ended`, which records
 
 Its fields are typed: `origin`, the admissible Trigger that gave its Eval's batch its strength and the batch itself (`triggerId`, `triggerIds`); `execution`, what the Executor chose (`name`, `directory` and `assignment`); `delivery`, the last failed Input delivery (`error`, `at`), until a delivery succeeds, a new Assignment starts or the Ticket ends; and `follows`, the Threads a Source made it follow, each `{thread, own, closed?}`: `own` when the Ticket opened it, and `closed` with `at` and `outcome` once it closed. Tickets alone writes `follows`; the GitHub Source reads its pull requests with `pullsOf` and `pullOf` (`src/sources/github-pull.ts`).
 
-An Input that carries a Trigger records whether a person wrote it, which `waitsForPerson` reads. A Thread also lists in `context` the subscribed Tickets that follow it only for context, and counts in `expired` the Evals of its queued Triggers that expired in a row; an Evaluation records its `primary` Trigger and when its candidate was `delivered`.
+An Input that carries a Trigger records whether a person wrote it or the optional machine-admission port verified it, which `waitsForPerson` reads. A verified delegated Input remains non-human. A Thread also lists in `context` the subscribed Tickets that follow it only for context, and counts in `expired` the Evals of its queued Triggers that expired in a row; an Evaluation records its `primary` Trigger and when its candidate was `delivered`.
 
 A Trigger's disposition records the Tickets it reached, by fan-out or attachment, a person's requeue, each Ticket that handed it back, with the reason, and each Ticket whose Executor acknowledged or answered it.
 
@@ -130,6 +130,7 @@ A Mandate's `basis` (`MandateBasis`) records how the gate admitted its Trigger. 
 | `followup` | A message arrived on a Thread with Tickets |
 | `admission` | An admission-table cell; `observation` marks an inferred candidate |
 | `bot` | A listed bot produced an inferred candidate |
+| `delegation` | The optional `DelegationAdmission` port verified a machine command and its fixed parent task, assignment and read-only tools; the same port revalidates this authority |
 
 Trigger and Thread `meta` belong to the Source. The core does not interpret them.
 
@@ -315,6 +316,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/memory.ts` | `MemoryRepositories`: the Store's repositories in memory, in the Store's order and with its nested rollback, for domain tests |
 | `src/core/index.ts` | The core's exports |
 | `src/app/runtime.ts` | The Runtime, the composition root, with its start and stop |
+| `src/app/runtime-ports.ts` | Native Session, executor, model and deployment contracts for the original Runtime in a shared DSH host |
+| `src/app/machine-settings.ts` | Organization-owned machine limits, verified defaults, validation and independent revision history |
 | `src/app/setup.ts` | Setup, and `setupChanged`, whether a save changes a field setup reads |
 | `src/app/passes.ts` | Passes, the pass scheduler |
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
@@ -354,6 +357,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/native.ts` | Same-process implementation of native executor operations using the original DSH background and Session mechanisms |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/command-line.ts` | Platform command resolution, literal PowerShell arguments and prepare commands, explicit exit propagation, and refusal of Windows batch CLIs |
@@ -365,6 +369,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
+| `src/sources/delegation-context.ts` | Typed complete parent task material, accepted mandate and source identities exposed through ownership-checked delegated resources |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
@@ -381,6 +386,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/jarvis-gateway/index.ts` | Optional same-process Gateway plugin, configuration, Source registration, service exposure and bounded reconciliation lifecycle |
+| `src/process-runtime/runtime.ts` | Independent organization entry, durable user conversations and the complete original Runtime with single-hop delegation |
+| `src/process-runtime/original-runtime.ts` | Original Runtime composition, native-port adaptation, source registration, management lifecycle and verified root adoption |
+| `src/process-runtime/original-config.ts` | Lossless legacy configuration archive and original Settings/Prompts initialization and migration through their real version mechanisms |
+| `src/process-runtime/engine-config.ts` | Legacy five-section schema and defaults retained for validation and migration archives |
+| `src/process-runtime/task-files.ts` | Durable deliverables and file access bound to the original Core execution directory |
+| `src/process-runtime/worker-capabilities.ts` | Shared supported Worker tool and selected-skill configuration schemas |
+| `src/process-runtime/capability-drain.ts` | Durable configuration admission holds, exact active-work projection and confirmed stopping through the original Runtime and Engine |
+| `src/process-runtime/delegation-contract.ts` | Strict single-hop machine command, capability catalog and task snapshot contracts |
+| `src/process-runtime/delegation-ingress.ts` | Durable authenticated child ingress, isolated preparation, core admission and command receipts |
+| `src/process-runtime/delegation-executor.ts` | Fixed parent Assignment to child binding, proxy controls, result reconciliation and completion fences |
 | `src/jarvis-gateway/contracts.ts` | Submit/query schemas, trusted user-turn identity, immutable commands and targets, feedback delivery contracts, reference matching and stable hashes |
 | `src/jarvis-gateway/ledger.ts` | Gateway-owned SQLite command transport, stable work associations, feedback deduplication and recoverable notification batches; does not own Ticket lifecycle |
 | `src/jarvis-gateway/source.ts` | Jarvis Source/Channel and the public constrained SourceContext backend; translates commands and ingests typed Outbox feedback |
@@ -396,6 +411,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/github-connection.tsx` | GitHub connection form, Token erasure, attempt polling/cancellation, advanced CLI selection and separately saved receiving preferences |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
+| `src/client/organization.tsx` | Embeds the original complete SettingsPage in the selected organization with scoped API, navigation and Session bridge |
+| `src/client/configuration-migrations.tsx` | Exact legacy configuration archives, migration status and links to the original editors |
+| `src/client/worker-capabilities.tsx` | Organization Worker tool and installed-skill authorization, real catalog and save conflicts |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
 | `src/client/prompts.tsx` | The Prompts settings: the page owns the view it read and its editor the draft, and the Edit, Full prompt and History tabs render from them; a built-in part's editor shows a changed default and keeps or drops the override |
 | `src/client/prompt-config.ts` | The prompt configuration by section, by the team sections, skill names, built-in parts (`part/<key>`, with `withOverride`) and part headings the prompt views give, and the line diff of the full prompt, as pure functions |
@@ -412,6 +430,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 
 `src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the main and Source plugins, with Feishu disabled. The optional `./jarvis-gateway` and `./jarvis` entries, Jarvis preset and embedded Web panel are also packaged, but disabled until explicitly configured. Jarvis code lives in `jarvis/dsh/` and `jarvis/public/`; it uses the Gateway service rather than the Engine or Store directly. Its Session projection and Gateway transport database are separate from the authoritative superagent task state.
 
+`jarvis/dsh/conversation-model.mjs` captures the saved daily-chat model settings once per root user request. The host-owned DSH bridge persists that non-secret snapshot and applies it to every model step of the request; Router, Worker, child-instance and delegated preparation roles retain their instance model. The host enforces the configured reply deadline, with a larger bounded IPC budget for root user calls only. Disabling streamed display still persists partial text; the HTTP projection hides it while running and retains it on settlement or recovery. This connection does not migrate the legacy conversation, tools, identity or task ownership to the independent root runtime.
+
 ## Tests
 
 | Test | Covers |
@@ -421,6 +441,23 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/gateway-store.spec.ts` | Command identity indexing, schema 12 upgrade/rollback, receipt feedback context and the constrained public Source path |
 | `tests/gateway.spec.ts` | Gateway durable transport, original user messages, target/reference validation, JSON queries, feedback deduplication/batching, terminal receipts and conversation generations |
 | `tests/gateway-persistence.spec.ts` | Real SQLite transactions and abrupt subprocess exits across command registration, intake, routing and Outbox/Gateway delivery |
+| `tests/process-runtime-core.spec.ts` | Independent runtime assembly with real SQLite/Core/Gateway: scoped calls, duplicate user requests, identity ownership, worker capacity, result retention and interrupted work without replay |
+| `tests/process-capability-drain.spec.ts` | Original Runtime admission holds, durable queued inputs, continuation, exact stop scope, restart recovery and delegated stopping |
+| `tests/process-original-runtime.spec.ts` | Complete original Runtime through native ports, local work, original prompts and management, recovery and adopted historical identity |
+| `tests/process-original-config.spec.ts` | Exact legacy defaults/custom text, original versions, conflict archives, idempotence and transactional migration failure |
+| `tests/process-engine-settings.spec.ts` | Original saved prompts in native role policies, legacy archives, task files and completed local work continuation after restart |
+| `tests/process-delegation-artifacts.spec.ts` | Fixed child provenance and verified local artifacts across the original parent/child execution chain |
+| `tests/original-task-files.spec.ts` | Historical Core directory authority and deliverable bindings without moving files or trusting an index as authorization |
+| `tests/original-management.spec.ts` | Full original management dispatcher through an organization owner, real settings/prompts and management-only lifecycle |
+| `tests/local-organization-setup.spec.ts` | Original Setup and deployment for local work without mandatory GitHub, preserving configured source checks |
+| `tests/machine-settings.spec.ts` | Actual machine defaults, validation, revision conflicts and next-use application |
+| `tests/executor-native.spec.ts` | Native executor cancellation ownership across independent organizations |
+| `jarvis/process-runtime/native-plugin-scope.test.mjs` | Installed Cordis consumer scope declares actual native subprocess, permission and workspace dependencies |
+| `tests/panel-organization.spec.tsx` | Original settings under scoped organization APIs, complete fields, Worker authorization, draft protection and history layout |
+| `tests/process-conversation.spec.ts` | Bound user reply progress, precise cancellation, persisted partial recovery and paginated Gateway feedback without changing the existing chat binding |
+| `tests/core-delegation.spec.ts` | Verified machine admission, immutable parent authority, fixed targets, actionable inputs, question CAS, revocation and nonhuman stop |
+| `tests/process-delegation.spec.ts` | Parent and child runtime flow, isolated child brain, tool intersection, fixed bindings, followups, questions, stops, local capacity and restart without replay |
+| `tests/process-delegation-races.spec.ts` | Late input and rejected-control completion fences, stop during missing-query, transport failure visibility and recovery |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |

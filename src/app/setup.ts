@@ -1,15 +1,19 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
 import type { Context } from '@deepseek-ai/cordis'
+import { delimiter } from 'node:path'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
-import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
+import { agentVariables, applyEnvironment, credentialHelper, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
+import type { DeploymentNativePort } from './runtime-ports.ts'
 
 export interface SetupHost {
   readonly context: Context
   readonly machine: Machine
   readonly lifetime: AbortSignal
+  readonly native?: Pick<DeploymentNativePort, 'probe'>
+  readonly allowLocal?: boolean
   restart(): void
 }
 
@@ -36,6 +40,10 @@ export class Setup {
   }
   /** Host command environment with agent git variables applied and the worker shim directory excluded from PATH. */
   get commandEnvironment(): Record<string, string | undefined> { return { ...this.variables, PATH: this.path } }
+  /** Applied to the owning Session's subprocesses; it must never change the shared host environment. */
+  get workerEnvironment(): Record<string, string | undefined> {
+    return { ...this.variables, PATH: [workerBin(this.host.machine.stateDir), this.path].join(delimiter) }
+  }
   get deployment(): Deployment {
     if (!this.resolved) throw new Error(`dsh-superagent is waiting for setup: ${this.problem?.detail ?? 'setup has not run'}`)
     return this.resolved
@@ -43,6 +51,8 @@ export class Setup {
   configured(): boolean { return this.resolved !== undefined }
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
   async run(settings: Settings): Promise<boolean> {
+    this.problem = undefined
+    this.feishuProblem = undefined
     try { this.resolved = await this.resolve(settings); return true }
     catch (error) {
       if (!(error instanceof SetupError)) throw error
@@ -61,7 +71,7 @@ export class Setup {
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
     const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
+      : resolveDeployment(machine, settings.sources.github?.config, this.probe(), this.path, this.host.allowLocal)
     await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
@@ -71,12 +81,15 @@ export class Setup {
   /** Probes CLIs the way worker shells run them, using `stateDir` as `cwd` since it exists even before the repository clone is valid. */
   private probe() {
     const { context, machine, lifetime } = this.host
+    if (this.host.native) return (argv: string[], env?: Record<string, string>) =>
+      this.host.native!.probe(argv, machine.stateDir, { ...this.commandEnvironment, ...env },
+        AbortSignal.any([lifetime, AbortSignal.timeout(60_000)]))
     return workerProbe(context.subprocess, machine.stateDir, machine.stateDir, lifetime)
   }
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
+    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe, this.path, this.host.allowLocal)
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
@@ -89,11 +102,19 @@ export class Setup {
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
-    this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
-    await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
+    if (!this.host.native) this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
+    const verified = this.host.native ? this.verifyNative(resolved) : verifyEnvironment(resolved, context.subprocess, lifetime)
+    await verified.catch((error: unknown) => {
       this.restore()
       machineProblem(error)
     })
     return resolved
+  }
+  private async verifyNative(deployment: Deployment): Promise<void> {
+    if (!deployment.github) return
+    const output = await this.host.native!.probe(['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'],
+      deployment.stateDir, this.workerEnvironment, AbortSignal.any([this.host.lifetime, AbortSignal.timeout(60_000)])).catch(() => '')
+    const expected = [`file:${workerGitConfig(deployment.stateDir)}`, credentialHelper(deployment.github.cli), ''].join('\0')
+    if (output !== expected) throw new SetupError('gitTooOld')
   }
 }

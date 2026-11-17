@@ -6,7 +6,7 @@ function applyAssistantName(name) {
   document.querySelectorAll('[data-assistant-initial]').forEach(node => { node.textContent = Array.from(name)[0]; });
   document.getElementById('input').placeholder = '给' + name + '发消息';
   document.getElementById('composer-label').textContent = '给' + name + '发消息';
-  document.title = (location.hash === '#settings/model' ? '模型配置 · ' : location.hash === '#settings' ? '基本设置 · ' : '') + name;
+  document.title = (location.hash.startsWith('#settings/organization') ? '组织架构管理 · ' : location.hash === '#settings/model' ? '贾维斯模型 · ' : location.hash === '#settings' ? '基本设置 · ' : '') + name;
 }
 
 const jarvis = {
@@ -15,7 +15,9 @@ const jarvis = {
   async api(path, method = 'GET', body) {
     const response = await fetch(jarvis.url(path), { method, headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(method === 'GET' ? {} : { 'X-Jarvis-CSRF': jarvis.state.csrf }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = await response.json();
-    if (!response.ok) throw new Error(value.error || '请求失败，请重试');
+    if (!response.ok) {
+      const error = new Error(value.error || '请求失败，请重试'); error.status = response.status; throw error;
+    }
     return value;
   },
   async refresh() {

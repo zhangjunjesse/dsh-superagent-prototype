@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest'
 import { z } from 'zod'
-import { registerHttp } from '../src/app/http.ts'
+import { registerHttp, managementApi } from '../src/app/http.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
@@ -49,6 +49,8 @@ it('answers each kind of failure with its own status', async () => {
   expect(saves).toHaveLength(4)
   expect(await call('POST', 'tickets/t9/retry')).toEqual({ status: 404, body: { error: 'Ticket not found' } })
   expect(await call('GET', 'nothing/here')).toEqual({ status: 404, body: { error: 'Unknown operation' } })
+  expect(await call('POST', 'worker-capabilities/application', { revision: 0, applicationId: 'pending', action: 'apply-now' }))
+    .toEqual({ status: 404, body: { error: 'Worker capability application is managed by the organization settings service' } })
   expect(await call('POST', 'executor/pause', 'not json')).toEqual({ status: 400, body: { error: 'The request body is not JSON' } })
 })
 
@@ -123,4 +125,27 @@ it('protects credential connection requests and never returns credential-bearing
     .toEqual({ status: 200, body: view })
   expect(await call('POST', 'github/connection/cancel', {})).toMatchObject({ status: 400 })
   expect(cancelled).toEqual(['00000000-0000-4000-8000-000000000001'])
+})
+
+it('uses the original operations and failure semantics for an authenticated organization transport', async () => {
+  const saves: unknown[] = []
+  const runtime = { ready: Promise.resolve(), store: {}, sources: { instances: () => [] },
+    settings: { save: async (...args: unknown[]) => {
+      if (args[2] !== 4) throw new SettingsConflict('Settings changed')
+      saves.push(args); return { revision: 5, restarting: false }
+    } },
+  } as unknown as HttpHost
+  const call = managementApi(runtime)
+  expect(await call({ method: 'PUT', path: 'settings/executor', body: { value: { maxWorkers: 2 }, revision: 4 } }))
+    .toEqual({ status: 200, body: { revision: 5, restarting: false } })
+  expect(saves).toEqual([['executor', { maxWorkers: 2 }, 4, 'panel']])
+  expect(await call({ method: 'PUT', path: 'settings/executor', body: { value: {}, revision: 3 } }))
+    .toEqual({ status: 409, body: { error: 'Settings changed' } })
+  expect(await call({ method: 'PUT', path: 'settings/executor', body: { value: 'x'.repeat(128 * 1024), revision: 4 } }))
+    .toMatchObject({ status: 400, body: { error: 'Request exceeds 131072 bytes' } })
+  for (const path of ['/settings/executor', 'https://example.test/settings', 'settings/%zz', 'settings/executor#fragment']) {
+    expect((await call({ method: 'PUT', path, body: {} })).status).toBe(400)
+  }
+  expect(await call({ method: 'GET', path: 'unknown' })).toMatchObject({ status: 404 })
+  expect(saves).toHaveLength(1)
 })

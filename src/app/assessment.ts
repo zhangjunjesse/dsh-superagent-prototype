@@ -30,6 +30,7 @@ export const AssessmentSchema = z.object({
   intent_evidence: z.string().trim().min(1).max(700).nullish().describe('For acceptance: the quotes that establish the three facts.'),
   acknowledgement: AcknowledgementSchema.nullish().describe('For acceptance: one sentence in the source language, posted as a reply to the trigger; omit only when a matched rule asks for silence.'),
   reason: z.string().min(1).max(500),
+  target_instance_id: z.string().min(1).max(80).optional().describe('accept only: one configured direct child from execution_targets, or omit for the local Worker.'),
 }).strict().refine(value => value.decision !== 'accept' || !directionAllowed(value.direction) || !value.rule_assessments.some(rule => rule.matched)
   || !!value.worktree_name, { message: 'Accepted work requires a short English worktree_name', path: ['worktree_name'] })
 
@@ -61,6 +62,9 @@ export interface AssessorHost {
   /** Delivers a candidate card to the main Session once per request ID, resolving after the Session receives it. */
   deliver(requestId: string, text: string): Promise<void>
   candidateCard(candidate: Candidate): Promise<Record<string, unknown>>
+  /** Native attachment work stays with the real Agent in a shared DSH host. */
+  image?(sessionId: string, trigger: Trigger, message: { id: string; text: string }, key: string, signal: AbortSignal): Promise<unknown>
+  selectTarget?(triggerId: string, target: string | undefined, run: () => ReturnType<AssessorHost['engine']['decide']>): ReturnType<AssessorHost['engine']['decide']>
 }
 
 /** Schema for bounded context or repository read requests during an active evaluation (`orchestrator_eval_read`). */
@@ -222,7 +226,7 @@ export class MasterAssessor implements Assessor {
    * Serves bounded paginated text or image attachments from the evaluation's thread context or repository for
    * `orchestrator_eval_read`; `agent` is the main Session, which receives images as attachments.
    */
-  async read(agent: Agent, read: EvalRead, signal: AbortSignal) {
+  async read(agent: Pick<Agent, 'id'>, read: EvalRead, signal: AbortSignal) {
       const { candidate, trigger } = this.evalFor(read.trigger_id)
       await this.seed(candidate.evalId, trigger, signal)
       const { cache } = this.reads(candidate.evalId, trigger)
@@ -235,7 +239,9 @@ export class MasterAssessor implements Assessor {
         const source = this.host.threadContext(trigger)
         if (!source) throw new Error(NO_CONTEXT)
         const key = read.image_id!.slice(read.image_id!.indexOf('/') + 1)
-        return source.image(agent, commands, image, key, this.host.deployment.stateDir, signal)
+        if (this.host.image) return this.host.image(agent.id, trigger, image, key, signal)
+        if (!('ctx' in agent) || !('session' in agent)) throw new Error('Reading an image requires its real native Session binding')
+        return source.image(agent as Agent, commands, image, key, this.host.deployment.stateDir, signal)
       }
       const cacheKey = JSON.stringify([read.resource, read.path, read.cursor, read.message_id])
       if (read.offset > 0) {
@@ -274,7 +280,9 @@ export class MasterAssessor implements Assessor {
     signal?.throwIfAborted()
     let outcome: AssessmentOutcome = assessmentOutcome(result, this.host.settings(), candidate.strength)
     if (outcome.kind === 'accept' && outcome.acknowledgement) outcome = { ...outcome, acknowledgement: checkedImText(outcome.acknowledgement) }
-    const decision = this.host.engine.decide(triggerId, { ...outcome, evalId: candidate.evalId })
+    if (result.target_instance_id && (outcome.kind !== 'accept' || !this.host.selectTarget)) throw new Error('An execution target is available only for an accepted candidate in an organization with direct children')
+    const run = () => this.host.engine.decide(triggerId, { ...outcome, evalId: candidate.evalId })
+    const decision = outcome.kind === 'accept' && this.host.selectTarget ? this.host.selectTarget(triggerId, result.target_instance_id, run) : run()
     return { state: decision.kind, ...(decision.ticketId ? { ticket_id: decision.ticketId } : {}), reason: reasonText(decision.reason) }
   }
   /** Aborts any in-flight thread context or repository read commands when the runtime stops. */

@@ -1,5 +1,5 @@
 /** Submission validation and bounded projections, with explicit dependencies and no execution loop. */
-import { latestAssignment, ticketStage } from '../core/index.ts'
+import { latestAssignment, ticketStage, type Ticket } from '../core/index.ts'
 import { boundedText, commandId, fingerprint, referenceUrls, referenceIdentity, QuerySchema, SubmitSchema, type Command, type Delivery, type Identity, type SubmitResult,
   type SuperagentBackend, type Target, type UserTurn, type WorkLink } from './contracts.ts'
 import type { GatewayLedger } from './ledger.ts'
@@ -7,7 +7,12 @@ import type { GatewayLedger } from './ledger.ts'
 /** Connects one trusted local principal to their Gateway work; model input never supplies identity. */
 export class GatewayService {
   constructor(readonly ledger: GatewayLedger, readonly backend: SuperagentBackend, readonly identity: Identity,
-    private readonly clock: () => number = Date.now) {}
+    private readonly clock: () => number = Date.now,
+    private readonly options: { resumeCompletedCommands?: boolean; canResumeCompleted?: (ticket: Ticket) => boolean } = {}) {}
+  private canResume(ticket: Ticket): boolean {
+    return this.options.resumeCompletedCommands === true && ticket.ended?.outcome === 'completed' && ticket.ended.by !== 'human'
+      && (this.options.canResumeCompleted?.(ticket) ?? true)
+  }
   submit(raw: unknown, origin: UserTurn): SubmitResult {
     if (origin.source !== 'user') return { status: 'denied', reason: '后台反馈没有用户交办权限。' }
     const parsed = SubmitSchema.safeParse(raw)
@@ -53,7 +58,12 @@ export class GatewayService {
     if (!this.backend.available()) return { status: 'unavailable', reason: '任务执行入口尚未就绪，未提交。' }
     if (target) {
       const ticket = this.backend.ticket(target.ticketId)
-      if (!ticket || ticket.decisionId !== target.decisionId || (ticket.ended && input.operation !== 'stop')) {
+      const resumesCompleted = input.operation === 'append' && !!ticket && this.canResume(ticket)
+      if (ticket && ticket.decisionId === target.decisionId && input.operation === 'append' && this.options.resumeCompletedCommands
+        && ticket.ended?.outcome === 'completed' && ticket.ended.by !== 'human' && !resumesCompleted) {
+        return { status: 'unsupported', reason: '这个已完成的下级任务暂不支持原任务续改；未提交新任务，请先明确新的交办要求。' }
+      }
+      if (!ticket || ticket.decisionId !== target.decisionId || (ticket.ended && input.operation !== 'stop' && !resumesCompleted)) {
         return { status: 'conflict', reason: '任务已结束或授权关联改变，请重新查询。' }
       }
       if (questionId && (ticket.attention?.id !== questionId || ticket.attention?.answeredBy)) return { status: 'conflict', reason: '原问题已不再等待回答。' }
@@ -107,6 +117,7 @@ export class GatewayService {
     const assignment = latestAssignment(ticket)
     // DSH validates the returned value before JSON rendering; absent fields must not contain undefined.
     return { ...head, status: ticket.ended?.outcome ?? ticketStage(ticket), updatedAt: ticket.updatedAt, canSubmit: !ticket.ended,
+      ...(this.canResume(ticket) ? { canSubmit:true } : {}),
       targetToken: target.token, ...(!ticket.ended && ticket.attention && !ticket.attention.answeredBy
         ? { question: { id: ticket.attention.id, text: boundedText(ticket.attention.question) } } : {}),
       ...(assignment?.report ? { result: { state: assignment.report.state, summary: boundedText(assignment.report.summary, detail ? 4000 : 240),

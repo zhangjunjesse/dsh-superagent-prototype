@@ -124,7 +124,7 @@
     finally { working = false; controls(); }
   });
   byId('model-picker-close').addEventListener('click', () => close(true));
-  byId('model-picker-settings').addEventListener('click', () => { close(); location.hash = 'settings/model'; });
+  byId('model-picker-settings').addEventListener('click', () => { close(); location.hash = jarvis.state.runtime==='dsh'?'settings/organization/root/jarvis/model':'settings/model'; });
   document.addEventListener('pointerdown', event => { if (!popup.contains(event.target) && !button.contains(event.target)) close(); });
   document.addEventListener('keydown', event => { if (event.key === 'Escape' && !popup.hidden) { event.preventDefault(); close(true); } });
   document.addEventListener('focusin', event => { if (!popup.hidden && !popup.contains(event.target) && !button.contains(event.target)) close(); });

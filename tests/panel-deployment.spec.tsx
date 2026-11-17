@@ -9,6 +9,35 @@ import { usePanel, mount, remount, settle, all, find, tab, click, type, text, fi
 import { server, problemOf, fakeForm } from './fixtures/panel-server.ts'
 
 usePanel()
+it('uses the adopted root machine API from the original panel when its DSH config form is unavailable', async () => {
+  server.setup = { ...server.setup, machineApi: true }
+  server.form = undefined
+  at({ page: 'settings', query: { group: 'deployment' } })
+  await mount()
+  expect(field<HTMLInputElement>(zh.deploymentPromptMaxChars).disabled).toBe(false)
+  expect(text()).toContain(zh.deploymentNextUse)
+  await type(field<HTMLInputElement>(zh.deploymentPromptMaxChars), '140000')
+  await click(zh.save)
+  expect(server.deployment.values.promptMaxChars).toBe(140000)
+  expect(server.deployment.revision).toBe(1)
+  expect(server.requests.some(request => request.method === 'PUT' && request.path === 'deployment')).toBe(true)
+  expect(vi.mocked(fetch).mock.calls.every(([url]) => String(url).startsWith('/orchestrator/api/'))).toBe(true)
+})
+
+it('keeps the original Plugin Manager page writable against the adopted machine API and displays its real account summary', async () => {
+  server.setup = { ...server.setup, machineApi: true }
+  const container = document.createElement('div'); document.body.append(container)
+  const root = createRoot(container)
+  onTestFinished(() => { act(() => { root.unmount() }); container.remove() })
+  await act(async () => { root.render(<PluginConfig t={translator(zh)} view="page" form={undefined} />) })
+  await settle()
+  expect(text()).toContain('@agent-bot')
+  expect(field<HTMLInputElement>(zh.deploymentContextTimeout).disabled).toBe(false)
+  await type(field<HTMLInputElement>(zh.deploymentContextTimeout), '23000')
+  await click(zh.save)
+  expect(server.deployment.values.admissionContextTimeoutMs).toBe(23000)
+})
+
 it('saves this machine\'s settings in the Deployment settings through DSH\'s configuration form, without a restart', async () => {
   const { form: editable, mutations } = fakeForm()
   server.form = editable

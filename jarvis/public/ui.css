@@ -327,6 +327,9 @@ svg { display:block; }
 /* A small explicit task reference keeps follow-ups attached without adding a task dashboard. */
 .work-reference { display:inline-flex; margin:10px 8px 0 0; padding:5px 9px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; color:#475569; font:inherit; font-size:12px; cursor:pointer; }
 .work-reference:hover { background:#eef2ff; color:#3456b8; }
+.task-artifact { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:12px 0; padding:12px 14px; border:1px solid #e2e8f0; border-radius:12px; background:#f8fafc; }
+.task-artifact strong { margin-right:auto; overflow-wrap:anywhere; font-size:14px; }
+.task-artifact .work-reference { margin:0; text-decoration:none; }
 .reply-context { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 14px; font-size:13px; color:#52637a; }
 .reply-context[hidden] { display:none; }
 .reply-context button { border:0; background:transparent; color:inherit; font-size:20px; cursor:pointer; }

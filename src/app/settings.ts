@@ -62,6 +62,7 @@ export interface SettingsHost {
   readonly health: Pick<HealthBoard, 'claim'>
   /** DSH Cordis context used to validate and resolve role models. */
   readonly context: Context
+  resolveModel?(model: SettingsValue['eval']['model'] & {}): Promise<unknown>
   readonly lifetime: AbortSignal
   /** Session manager through which the main Session is notified of saved settings. */
   readonly sessions: Pick<Sessions, 'notify' | 'delivery'>
@@ -160,7 +161,7 @@ export class Settings {
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
     if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-      try { await resolveRoleModel(this.host.context, model) }
+      try { await (this.host.resolveModel ? this.host.resolveModel(model) : resolveRoleModel(this.host.context, model)) }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
     rules.guard?.(current, candidate, origin)

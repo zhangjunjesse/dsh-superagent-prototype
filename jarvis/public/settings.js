@@ -7,6 +7,12 @@
   const basicForm = byId('basic-form');
   const nameField = byId('setting-assistantName');
   const capabilitiesPage = byId('capabilities-page');
+  const compositionPage = byId('composition-page');
+  const compositionUI = window.compositionUI;
+  const logsPage = byId('operation-logs-page');
+  const logsUI = window.operationLogsUI;
+  const promptsPage = byId('prompts-page');
+  const promptsUI = window.jarvisPromptsUI;
   form.inert = true; basicForm.inert = true;
   try { await jarvis.ready; } catch { return; }
   form.inert = false; basicForm.inert = false;
@@ -25,21 +31,62 @@
     byId('settings-tab-connection').textContent = '模型选择';
     byId('settings-connection').querySelector('h2').textContent = '模型服务';
   }
+  const organization = dsh && !!compositionUI;
+  const organizationBase = '#settings/organization';
+  const rootRoleBase = organizationBase+'/root/jarvis/';
+  const rootRole = hash => organization && (promptsUI?.isRoute(hash) ? 'prompts' : /^#settings\/organization\/root\/jarvis\/(basic|model|tools|skills)(?:\/[^/]+)?$/.exec(hash)?.[1]);
+  const canonicalRoute = hash => !organization ? hash : hash==='#settings'||hash==='#settings/system' ? organizationBase :
+    hash===organizationBase+'/root/jarvis' ? rootRoleBase+'model' :
+    /^#settings\/(model|tools|skills)(?:\/.*)?$/.test(hash) ? rootRoleBase+hash.slice('#settings/'.length) : hash;
+  const roleHeader = document.createElement('section'); roleHeader.id='organization-role-header'; roleHeader.hidden=true;
+  if (organization) {
+    page.classList.add('organization-settings');
+    page.querySelector('.settings-rail').hidden=true;
+    page.querySelector('.settings-frame').prepend(roleHeader);
+    const home=document.createElement('a'); home.href=organizationBase; home.textContent='组织架构管理'; home.id='organization-home';
+    home.addEventListener('click',event=>{
+      if(location.hash!==organizationBase)return;
+      event.preventDefault(); if(compositionUI.isBusy())return;
+      if(compositionUI.isDirty()) {
+        pendingRoute=organizationBase; byId('settings-unsaved').hidden=false;
+        byId('settings-discard').textContent='放弃修改并继续'; byId('settings-stay').focus();
+      } else { compositionUI.discard(); compositionUI.render(organizationBase); }
+    });
+    page.querySelector('.settings-breadcrumb > span:last-child').replaceWith(home);
+    byId('basic-title').textContent='身份'; byId('settings-title').textContent='模型';
+    basicForm.querySelector('.settings-eyebrow').textContent='贾维斯';
+    form.querySelector('.settings-eyebrow').textContent='贾维斯';
+    byId('settings-save').textContent='保存贾维斯模型'; byId('basic-save').textContent='保存贾维斯身份';
+    form.querySelector('.model-tabs').hidden=true;
+  }
+  const htmlText = value => String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  function renderRoleHeader() {
+    if (!organization || roleHeader.hidden) return;
+    const context=compositionUI.context(), category=rootRole(location.hash);
+    const sections=[['organization','组织信息'],['jarvis/model','贾维斯'],['engine/sources','任务引擎'],['connections','连接与资源'],['runtime','部署与运行']];
+    const tabs=[['basic','身份'],['model','模型'],['tools','工具'],['skills','技能']];
+    if(jarvis.state.promptManagement===true&&promptsUI)tabs.push(['prompts','提示词']);
+    roleHeader.innerHTML='<div class="organization-context"><a href="'+organizationBase+'">'+htmlText(context.name)+'</a><span> / </span><strong>'+htmlText(context.brainName)+'</strong></div><p class="organization-purpose">与你对话、理解目标和反馈进展；这里的设置只属于当前组织的贾维斯。</p><nav class="organization-sections" aria-label="实例配置分区">'+sections.map(([path,label])=>'<a href="'+organizationBase+'/root/'+path+'"'+(path.startsWith('jarvis')?' aria-current="page"':'')+'>'+label+'</a>').join('')+'</nav><nav class="organization-role-tabs" aria-label="贾维斯设置">'+tabs.map(([id,label])=>'<a href="'+rootRoleBase+id+'"'+(id===category?' aria-current="page"':'')+'>'+label+'</a>').join('')+'</nav>';
+  }
+  document.addEventListener('jarvis:organization-updated',renderRoleHeader);
+  document.addEventListener('jarvis:organization-navigation',()=>{ currentRoute=location.hash; });
+  let saving = false;
   let keyRemoved = false;
   const names = dsh ? ['endpoint', 'model', 'temperature', 'maxTokens', 'reasoning', 'timeout', 'stream'] : [ 'protocol', 'endpoint', 'model', 'sampling', 'temperature', 'topP', 'maxTokens', 'reasoning', 'timeout', 'retries', 'stream'];
   const fields = Object.fromEntries(names.map(name => [name, byId(`setting-${name}`)]));
   const key = byId('setting-key');
-  const tabs = [...page.querySelectorAll('[role="tab"]')];
+  const tabs = [...form.querySelectorAll('[role="tab"]')];
   const defaults = { protocol: 'chat-completions', endpoint: '', model: '', sampling: 'default', temperature: '', topP: '', maxTokens: '', reasoning: 'default', timeout: '120', retries: '2', stream: true };
   let saved = { ...jarvis.state.model.value };
   let modelRevision = jarvis.state.model.revision;
   let currentRoute = location.hash, pendingRoute = '';
+  let organizationReturnRoute = organizationBase;
 
   function selectTab(index, focus = false) {
     tabs.forEach((tab, i) => {
       tab.setAttribute('aria-selected', String(i === index));
       tab.tabIndex = i === index ? 0 : -1;
-      byId(tab.getAttribute('aria-controls')).hidden = i !== index;
+      byId(tab.getAttribute('aria-controls')).hidden = organization ? false : i !== index;
     });
     byId('settings-scroll').scrollTop = 0;
     if (focus) tabs[index].focus();
@@ -47,10 +94,10 @@
   function readDraft() {
     return Object.fromEntries(names.map(name => [name, fields[name].type === 'checkbox' ? fields[name].checked : fields[name].value.trim()]));
   }
-  function isModelDirty() { return JSON.stringify(readDraft()) !== JSON.stringify(saved) || key.value !== '' || keyRemoved; }
+  function isModelDirty() { const draft=readDraft(); return names.some(name=>draft[name]!==saved[name]) || key.value !== '' || keyRemoved; }
   function isNameDirty() { return nameField.value.trim() !== assistantIdentity.name; }
-  function isDirty() { return isModelDirty() || isNameDirty() || capabilitiesUI.isDirty(); }
-  const isSettingsRoute = hash => ['#settings', '#settings/model'].includes(hash) || capabilitiesUI.isRoute(hash);
+  function isDirty() { return isModelDirty() || isNameDirty() || capabilitiesUI.isDirty() || compositionUI?.isDirty() || promptsUI?.isDirty(); }
+  const isSettingsRoute = hash => ['#settings', '#settings/model'].includes(hash) || capabilitiesUI.isRoute(hash) || compositionUI?.isRoute(hash) || promptsUI?.isRoute(hash);
   function setFeedback(message, error = false) {
     const feedback = byId('settings-feedback');
     feedback.textContent = message;
@@ -86,37 +133,50 @@
     syncInputs();
   }
   function renderRoute() {
-    const wasOpen = !page.hidden;
-    const requested = location.hash;
-    const open = isSettingsRoute(requested);
-    const modelPage = requested === '#settings/model';
-    const capabilityPage = capabilitiesUI.isRoute(requested);
-    if ((!open && !page.hidden && isDirty()) || (!capabilitiesPage.hidden && capabilitiesUI.isDirty() && requested !== capabilitiesPage.dataset.route)) {
-      pendingRoute = requested;
-      history.replaceState(null, '', capabilitiesPage.hidden ? currentRoute : capabilitiesPage.dataset.route);
-      byId('settings-unsaved').hidden = false;
-      byId('settings-discard').textContent = open ? '放弃修改并继续' : '放弃修改并返回';
-      byId('settings-stay').focus();
-      return;
+    const wasOpen = !page.hidden, wasCompositionOpen = !!compositionPage && !compositionPage.hidden;
+    const requested = canonicalRoute(location.hash);
+    if (requested!==location.hash) history.replaceState(null,'',requested);
+    const role=rootRole(requested), open=isSettingsRoute(requested);
+    const logsOpen=!!logsUI?.isRoute(requested);
+    const modelPage=role==='model'||requested==='#settings/model';
+    const capabilityPage=['tools','skills'].includes(role)||capabilitiesUI.isRoute(requested);
+    const promptPage=!!promptsUI?.isRoute(requested);
+    const systemPage=compositionUI?.isRoute(requested)&&!role&&!promptPage;
+    if (wasOpen && requested!==currentRoute && (saving || compositionUI?.isBusy() || capabilitiesUI.isBusy?.() || promptsUI?.isBusy())) {
+      history.replaceState(null,'',currentRoute); return;
     }
-    if (open && page.hidden) { loadSaved(); loadBasic(); selectTab(0); }
-    currentRoute = requested;
-    byId('settings-unsaved').hidden = true;
-    page.hidden = !open;
-    conversation.hidden = open;
-    basicForm.hidden = modelPage || capabilityPage;
-    form.hidden = !modelPage;
-    capabilitiesPage.hidden = !capabilityPage;
-    if (capabilityPage) capabilitiesUI.render(requested);
-    else capabilitiesUI.discard();
-    const group = capabilityPage ? requested.split('/')[1] : modelPage ? 'model' : 'basic';
-    for (const section of ['basic', 'model', 'tools', 'skills']) byId('settings-nav-' + section).removeAttribute('aria-current');
-    byId('settings-nav-' + group).setAttribute('aria-current', 'page');
-    const titleId = capabilityPage ? 'capabilities-title' : modelPage ? 'settings-title' : 'basic-title';
-    page.setAttribute('aria-labelledby', titleId);
-    document.title = (open ? byId(titleId).textContent + ' · ' : '') + assistantIdentity.name;
-    if (open) byId(titleId).focus();
-    else { key.value = ''; hideKey(); if (wasOpen) byId('settings-open').focus(); }
+    const leavingRootRole=organization&&rootRole(currentRoute)&&requested!==currentRoute&&(isModelDirty()||isNameDirty());
+    const leavingInstance=wasCompositionOpen&&compositionUI?.isDirty()&&(!systemPage||(organization&&!compositionUI.canNavigate(requested)));
+    const leavingPrompts=promptsPage&&!promptsPage.hidden&&promptsUI?.isDirty()&&requested!==currentRoute;
+    if ((!open&&wasOpen&&isDirty()) || (!capabilitiesPage.hidden&&capabilitiesUI.isDirty()&&requested!==capabilitiesPage.dataset.route) || leavingInstance || leavingRootRole || leavingPrompts) {
+      pendingRoute=requested;
+      history.replaceState(null,'',currentRoute);
+      byId('settings-unsaved').hidden=false;
+      byId('settings-discard').textContent=open?'放弃修改并继续':'放弃修改并返回';
+      byId('settings-stay').focus(); return;
+    }
+    if (open && !wasOpen) { loadSaved(); loadBasic(); selectTab(0); }
+    if (open && organization) organizationReturnRoute=requested;
+    currentRoute=requested; byId('settings-unsaved').hidden=true;
+    page.hidden=!open; conversation.hidden=open||logsOpen;
+    if(logsPage)logsPage.hidden=!logsOpen;
+    basicForm.hidden=organization ? role!=='basic' : modelPage||capabilityPage||systemPage||promptPage;
+    form.hidden=!modelPage; capabilitiesPage.hidden=!capabilityPage;
+    if(compositionPage)compositionPage.hidden=!systemPage;
+    if(promptsPage)promptsPage.hidden=!promptPage;
+    roleHeader.hidden=!role;
+    if(role){renderRoleHeader();compositionUI.loadContext().then(renderRoleHeader).catch(()=>{});}
+    if(capabilityPage)capabilitiesUI.render(requested);else if(!logsOpen)capabilitiesUI.discard();
+    if(systemPage)compositionUI.render(requested);else if(wasCompositionOpen&&!logsOpen)compositionUI?.discard();
+    if(logsOpen)logsUI.enter(organizationReturnRoute);else logsUI?.leave();
+    if(promptPage)promptsUI.render();else promptsUI?.leave();
+    const group=capabilityPage?requested.split('/')[1]:systemPage?'system':modelPage?'model':'basic';
+    for(const section of ['basic','model','tools','skills','system'])byId('settings-nav-'+section)?.removeAttribute('aria-current');
+    byId('settings-nav-'+group)?.setAttribute('aria-current','page');
+    const titleId=promptPage?'prompts-title':capabilityPage?'capabilities-title':systemPage?'composition-title':modelPage?'settings-title':'basic-title';
+    page.setAttribute('aria-labelledby',titleId);
+    document.title=(logsOpen?'运行日志 · ':open?(organization?'组织架构管理':systemPage?'系统管理':byId(titleId).textContent)+' · ':'')+assistantIdentity.name;
+    if(open)byId(titleId)?.focus();else {key.value='';hideKey();if(logsOpen)byId('operation-logs-title')?.focus();else if(wasOpen)byId('settings-open').focus();}
   }
   function validate(draft) {
     if (!draft.endpoint) return ['endpoint', '请输入服务地址', 0];
@@ -189,28 +249,32 @@
       nameField.setAttribute('aria-invalid', 'true');
       nameField.focus(); basicFeedback('请输入 1–40 个字符的助手名称', true); return;
     }
-    basicForm.inert = true;
+    basicForm.inert = true; saving=true;
     basicFeedback('正在保存…');
     try {
       jarvis.state.basic = await jarvis.api('/api/basic', 'PUT', { revision: jarvis.state.basic.revision, value: { assistantName: name } });
       applyAssistantName(jarvis.state.basic.value.assistantName);
-      loadBasic();
+      loadBasic(); renderRoleHeader();
       basicFeedback('设置已保存');
       if (!isDirty()) byId('settings-unsaved').hidden = true;
     } catch (error) { basicFeedback(error.message, true); }
-    finally { basicForm.inert = false; }
+    finally { basicForm.inert = false; saving=false; }
   });
-  byId('settings-open').addEventListener('click', () => { location.hash = 'settings'; });
+  byId('settings-open').addEventListener('click', () => { location.hash = organization?organizationBase:'settings'; });
   byId('settings-back').addEventListener('click', () => {
+    if(promptsUI?.isBusy())return;
     if (isDirty()) { pendingRoute = ''; byId('settings-discard').textContent = '放弃修改并返回'; byId('settings-unsaved').hidden = false; byId('settings-stay').focus(); }
     else location.hash = '';
   });
   byId('settings-stay').addEventListener('click', () => { byId('settings-unsaved').hidden = true; byId(page.getAttribute('aria-labelledby')).focus(); });
   byId('settings-discard').addEventListener('click', () => {
+    if(promptsUI?.isBusy())return;
     capabilitiesUI.discard();
-    if (!isSettingsRoute(pendingRoute)) { loadSaved(); loadBasic(); }
+    compositionUI?.discard();
+    promptsUI?.discard();
+    if (organization || !isSettingsRoute(pendingRoute)) { loadSaved(); loadBasic(); }
     byId('settings-unsaved').hidden = true;
-    location.hash = pendingRoute;
+    if(location.hash===pendingRoute)renderRoute();else location.hash = pendingRoute;
   });
   byId('settings-key-remove').addEventListener('click', () => { key.value = ''; keyRemoved = true; key.placeholder = '保存后移除密钥'; changed(); });
   byId('settings-key-toggle').addEventListener('click', () => {
@@ -249,7 +313,7 @@
       selectTab(tab); fields[name].setAttribute('aria-invalid', 'true');
       fields[name].focus(); setFeedback(message, true); return;
     }
-    form.inert = true;
+    form.inert = true; saving=true;
     setFeedback('正在保存…');
     try {
       const input = { revision: modelRevision, value: draft };
@@ -260,10 +324,11 @@
       document.dispatchEvent(new Event('jarvis:model-updated'));
       setFeedback('配置已保存');
     } catch (error) { setFeedback(error.message, true); }
-    finally { form.inert = false; }
+    finally { form.inert = false; saving=false; }
 
   });
   window.addEventListener('hashchange', renderRoute);
+  window.addEventListener('beforeunload', event => { if (organization && (isDirty() || saving || capabilitiesUI.isBusy?.() || promptsUI?.isBusy())) { event.preventDefault(); event.returnValue=''; } });
   applyAssistantName(jarvis.state.basic.value.assistantName);
   loadSaved();
   loadBasic();

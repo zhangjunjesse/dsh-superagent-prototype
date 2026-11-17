@@ -1,13 +1,19 @@
 /** Persistent command ceilings shared by ingress, subscriptions, and every consumption path. */
 import { UserError } from './errors.ts'
-import { liveTicket, threadKey } from './model.ts'
-import type { CommandReceipt, ConsumptionOutcome, ConsumptionReceipt, Thread, ThreadRef, Trigger } from './model.ts'
+import { DELEGATION_TOOLS, liveTicket, threadKey } from './model.ts'
+import type { CommandReceipt, ConsumptionOutcome, ConsumptionReceipt, DelegationAuthority, Mandate, Thread, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { GateResult, Policy } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 
 export interface DispatchFailure { outcome: 'denied' | 'conflict' | 'ignored'; reason: string }
 const canonical = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) =>
   item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item)
+const present = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
+const validAuthority = (value: DelegationAuthority): boolean =>
+  [value.delegationId, value.parentInstanceId, value.parentTicketId, value.parentAssignmentId, value.parentDecisionId].every(present)
+  && Array.isArray(value.tools) && value.tools.every(tool => DELEGATION_TOOLS.includes(tool))
+  && new Set(value.tools).size === value.tools.length
 
 /** Enforces the same immutable command identity, target, and terminal result across domain entry points. */
 export class Dispatches {
@@ -34,12 +40,12 @@ export class Dispatches {
 
   private validate(trigger: Trigger): void {
     const c = trigger.dispatch!
-    const present = (value: unknown) => typeof value === 'string' && value.trim().length > 0
     const target = c.operation !== 'new'
     if (!present(c.commandId) || !present(c.payloadHash) || !['new', 'append', 'answer', 'stop'].includes(c.operation)
       || !Array.isArray(c.expectedInitialRecipients) || c.expectedInitialRecipients.length
       || trigger.threads.length !== 1 || trigger.threads[0]!.source !== trigger.source
-      || !trigger.human || !trigger.addressed || !present(trigger.actor.id)
+      || !trigger.addressed || !present(trigger.actor.id)
+      || (!trigger.human && (trigger.addressed !== 'direct' || trigger.actor.source !== trigger.source))
       || (target ? !present(c.targetTicketId) || !present(c.controlPrecondition?.mandateDecisionId)
         : c.targetTicketId !== undefined || c.controlPrecondition !== undefined)
       || (c.operation === 'answer' ? !present(c.attentionId) : c.attentionId !== undefined)
@@ -114,8 +120,29 @@ export class Dispatches {
     if (!this.options.scope.scope(trigger).listened) return { outcome: 'denied', reason: 'sourceNotListening' }
     const thread = this.repo.threads.get(threadKey(trigger.threads[0]!))!
     const tickets = thread.subscriptions.flatMap(id => this.repo.tickets.get(id) ?? [])
-    const gate = this.options.policy().gate(trigger, thread, tickets)
-    return !gate.admissible || gate.strength !== 'explicit' ? { outcome: 'denied', reason: 'commandNotExplicit' } : undefined
+    const gate = this.gate(trigger, thread, tickets)
+    if (!gate.admissible || gate.strength !== 'explicit') return { outcome: 'denied', reason: 'commandNotExplicit' }
+    const basis = thread.evaluating?.basis
+    if (!trigger.human && basis && canonical(basis) !== canonical(gate.basis)) return { outcome: 'denied', reason: 'delegationChanged' }
+    return undefined
+  }
+
+  /** Machine commands need an independent trusted proof; a permissive human or bot Policy cannot grant one. */
+  gate(trigger: Trigger, thread: Thread, tickets: Ticket[], policy: Policy = this.options.policy()): GateResult {
+    if (trigger.human || !trigger.dispatch) return policy.gate(trigger, thread, tickets)
+    const authority = this.options.delegation?.authorize(trigger)
+    if (!authority || !validAuthority(authority) || trigger.actor.id !== authority.parentInstanceId
+      || trigger.actor.source !== trigger.source || trigger.addressed !== 'direct') return { admissible: false, reason: 'delegationUnverified' }
+    return { admissible: true, strength: 'explicit', basis: { via: 'delegation', source: trigger.source, scope: trigger.meta,
+      addressed: 'direct', delegation: structuredClone(authority) } }
+  }
+
+  /** Delegated mandates are revalidated by their trusted owner, never by the human sender list. */
+  revalidate(mandate: Mandate): boolean {
+    if (mandate.basis.via !== 'delegation') return this.options.policy().revalidate(mandate)
+    const { delegation, source } = mandate.basis
+    return mandate.strength === 'explicit' && validAuthority(delegation) && mandate.actor.source === source
+      && mandate.actor.id === delegation.parentInstanceId && this.options.delegation?.revalidate(mandate) === true
   }
 
   control(trigger: Trigger): DispatchFailure | undefined {
@@ -124,8 +151,17 @@ export class Dispatches {
     const ticket = this.repo.tickets.get(c.targetTicketId)
     if (!ticket) return { outcome: 'conflict', reason: 'unknownTarget' }
     if (ticket.decisionId !== c.controlPrecondition?.mandateDecisionId) return { outcome: 'conflict', reason: 'mandateChanged' }
-    if (!liveTicket(ticket)) return { outcome: c.operation === 'stop' ? 'ignored' : 'conflict', reason: 'targetEnded' }
-    if (!this.options.policy().revalidate(ticket.mandate)) return { outcome: 'denied', reason: 'mandateRevoked' }
+    if (!trigger.human) {
+      const authority = this.options.delegation?.authorize(trigger)
+      if (!authority || ticket.mandate.basis.via !== 'delegation' || ticket.mandate.actor.source !== trigger.source
+        || ticket.mandate.actor.id !== trigger.actor.id || canonical(authority) !== canonical(ticket.mandate.basis.delegation)) {
+        return { outcome: 'denied', reason: 'delegationTargetMismatch' }
+      }
+    }
+    const resumesCompleted = this.options.resumeCompletedCommands === true && trigger.human && c.operation === 'append'
+      && ticket.ended?.outcome === 'completed' && ticket.ended.by !== 'human'
+    if (!liveTicket(ticket) && !resumesCompleted) return { outcome: c.operation === 'stop' ? 'ignored' : 'conflict', reason: 'targetEnded' }
+    if (!this.revalidate(ticket.mandate)) return { outcome: 'denied', reason: 'mandateRevoked' }
     if (c.operation === 'answer' && (!ticket.attention || ticket.attention.id !== c.attentionId || ticket.attention.answeredBy)) {
       return { outcome: 'conflict', reason: 'attentionChangedOrAnswered' }
     }

@@ -1,18 +1,18 @@
 /**
  * Deployment settings view shared between the panel Settings tab and the DSH Plugin Manager config page.
- * Edits host-level plugin configuration limits through DSH `ConfigForm` when writable.
+ * Edits the actual owner's machine limits through its API, or the standalone DSH `ConfigForm`.
  */
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { ConfigPageForm } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import { LIMITS } from '../limits.ts'
-import type { SetupView } from './api.ts'
+import { usePoll, type ApiResponse, type SetupView } from './api.ts'
 import { InfoTip, Input } from './controls.tsx'
 import { SaveBar, useDraft } from './draft.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
 import { Field, Fields } from './settings-kit.tsx'
 import { setupText, type T } from './text.ts'
-import { CheckSetupButton, Hint, KeyValues, Section, SetupMessage } from './widgets.tsx'
+import { CheckSetupButton, Hint, KeyValues, LoadState, Section, SetupMessage } from './widgets.tsx'
 
 export type DeploymentForm = ConfigPageForm | undefined
 type Op = Parameters<ConfigPageForm['mutate']>[0][number]
@@ -30,7 +30,10 @@ export function usePageForm(form: ConfigForm<Record<string, unknown>> | undefine
 }
 
 /** Deployment configuration form; falls back to read-only display when DSH config forms are unavailable or read-only. */
-export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup: SetupView; form: DeploymentForm; accounts?: boolean }) {
+export function DeploymentPage(props: { setup: SetupView; form: DeploymentForm; accounts?: boolean; machineApi?: boolean }) {
+  return props.machineApi || props.setup.machineApi ? <MachineDeploymentPage setup={props.setup} accounts={props.accounts} /> : <DshDeploymentPage {...props} />
+}
+function DshDeploymentPage({ setup, form, accounts: showAccounts }: { setup: SetupView; form: DeploymentForm; accounts?: boolean }) {
   const { t, notify } = usePanel()
   const snapshot = form?.state
   const editable = snapshot?.status === 'ready' && snapshot.writable
@@ -44,13 +47,44 @@ export function DeploymentPage({ setup, form, accounts: showAccounts }: { setup:
       notify(t('saved'))
       return { revision: revision + 1, restarting: false }
     } })
-  const accounts = setup.accounts
   // Remote browsers (`memory` mode) are read-only; `unavailable` indicates `dsh-superagent` is still starting.
   const readOnlyHint = !form ? t('deploymentNoForms') : snapshot?.mode === 'memory' ? t('deploymentReadOnly')
     : snapshot?.status === 'loading' ? t('loading') : snapshot?.status === 'unavailable' ? t('deploymentUnavailable')
     : !editable ? t('deploymentReadOnly') : undefined
+  return <DeploymentFields setup={setup} draft={draft} editable={!!editable} readOnlyHint={readOnlyHint} showAccounts={showAccounts} />
+}
+
+/** The organization host persists the original machine limits under their own CAS revision. */
+function MachineDeploymentPage({ setup, accounts }: { setup: SetupView; accounts?: boolean | undefined }) {
+  const { call } = usePanel()
+  const { restarts } = usePanelData()
+  const { data, error, reload } = usePoll(() => call('GET deployment'), [call, restarts])
+  return data ? <MachineDeploymentForm setup={setup} view={data} reload={reload} error={error} accounts={accounts} /> : <LoadState error={error} loading />
+}
+function MachineDeploymentForm({ setup, view, reload, error, accounts }: {
+  setup: SetupView; view: ApiResponse<'GET deployment'>; reload: () => Promise<void>; error: Error | undefined; accounts?: boolean | undefined
+}) {
+  const { t, call, notify } = usePanel()
+  const { state } = usePanelData()
+  const draft = useDraft({ key: `dsh-superagent/draft/${state!.masterId}/deployment`, saved: limitsOf(view.values), revision: view.revision,
+    reload, save: async (value, revision) => {
+      const values = Object.fromEntries(MACHINE_LIMITS.flatMap(key => value[key].trim() ? [[key, Number(value[key])]] : []))
+      const result = await call('PUT deployment', { body: { revision, values } })
+      notify(t('saved'))
+      return { revision: result.revision }
+    } })
+  return <>{error && <LoadState error={error} loading={false} />}<DeploymentFields setup={setup} draft={draft}
+    editable={view.writable} readOnlyHint={view.writable ? t('deploymentNextUse') : t('deploymentReadOnly')} defaults={view.defaults} showAccounts={accounts} /></>
+}
+function DeploymentFields({ setup, draft, editable, readOnlyHint, showAccounts, defaults }: {
+  setup: SetupView; draft: ReturnType<typeof useDraft<Limits>>; editable: boolean; readOnlyHint: string | undefined
+  showAccounts?: boolean | undefined; defaults?: ApiResponse<'GET deployment'>['defaults']
+}) {
+  const { t } = usePanel()
+  const accounts = setup.accounts
   const limit = (key: typeof MACHINE_LIMITS[number], label: string) => <Field label={label}>
     <Input type="number" min={LIMITS[key].min} max={LIMITS[key].max} step={1} value={draft.value[key]} disabled={!editable}
+      placeholder={defaults ? String(defaults[key]) : undefined}
       onChange={event => draft.edit({ ...draft.value, [key]: event.target.value })} />
   </Field>
   const feishu = accounts?.feishu ? accounts.feishu.name || accounts.feishu.botId

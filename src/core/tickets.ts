@@ -1,7 +1,7 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
+import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson, withdrawn } from './model.ts'
 import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
   Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
@@ -10,8 +10,8 @@ import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
-/** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
-export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human)
+/** Whether an Input is ordinary automation without human or verified delegated authority. */
+export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human && !input.delegated)
 /**
  * Whether a ticket's worker read a Trigger Input before `until`, its latest report or turn end: its Session took the message
  * into a step before then. One delivered before reads were recorded counts as read once it reached the worker by then.
@@ -109,8 +109,9 @@ export class Tickets extends EnginePart {
     // A follow-up that reached a ticket goes elsewhere only once the workers that decide it hand it back.
     this.leftToWorkers(trigger)
     const current = this.require(ticketId)
-    if (current.ended?.by === 'human') throw new UserError('ticketStopped')
-    if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
+    if (withdrawn(current)) throw new UserError('ticketStopped')
+    if (this.options.admission?.resume(current) === false) throw new Error('Task continuation is held for a pending Worker capability change')
+    if (!liveTicket(current) && !this.dispatch.revalidate(current.mandate)) throw new UserError('mandateRevoked')
     return trigger
   }
   /**
@@ -130,8 +131,9 @@ export class Tickets extends EnginePart {
     const id = key('input', ticketId, 'trigger', trigger.id)
     const existing = ticket.inputs.find(input => input.id === id)
     const at = this.now()
+    const delegated = !trigger.human && trigger.dispatch && !this.dispatch.admission(trigger) && !this.dispatch.control(trigger)
     const input = (inputId: string): TicketInput => ({ id: inputId, kind: 'trigger', triggerId: trigger.id, at, ...(note ? { note } : {}),
-      ...trigger.human ? { human: true } : {} })
+      ...trigger.human ? { human: true } : {}, ...delegated ? { delegated: true } : {} })
     if (existing?.kind !== 'trigger') this.addInput(ticket, input(id))
     else if (note && ticket.undelivered.includes(id)) { existing.note = note; ticket.updatedAt = at; this.repo.tickets.save(ticket) }
     // A person sent it to Eval, or the ticket let it go before its worker took it up, read it for context only, or ended after
@@ -167,6 +169,7 @@ export class Tickets extends EnginePart {
    */
   retry(ticketId: string): Ticket {
     const ticket = this.require(ticketId)
+    if (this.options.admission?.resume(ticket) === false) throw new Error('Task continuation is held for a pending Worker capability change')
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
     this.endAssignment(ticket, latest, 'retried')
@@ -251,10 +254,11 @@ export class Tickets extends EnginePart {
    */
   wake(ticketId: string): void {
     const ticket = this.repo.tickets.get(ticketId)
-    if (!ticket || liveTicket(ticket) || ticket.ended?.by === 'human' || !ticket.undelivered.length) return
+    if (!ticket || liveTicket(ticket) || withdrawn(ticket) || !ticket.undelivered.length) return
+    if (this.options.admission?.resume(ticket) === false) return
     const policy = this.policy()
     if (policy.paused) return
-    if (!policy.revalidate(ticket.mandate)) { this.refuse(ticket); return }
+    if (!this.dispatch.revalidate(ticket.mandate)) { this.refuse(ticket); return }
     // Only a human's message resumes an ended ticket; bot/CI triggers wait alongside inputs from before the ticket ended.
     const first = ticket.undelivered.map(id => ticket.inputs.find(input => input.id === id)).find(input => input?.kind === 'trigger' && input.human)
     if (first?.kind !== 'trigger') return

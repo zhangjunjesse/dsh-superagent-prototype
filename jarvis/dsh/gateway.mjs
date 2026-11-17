@@ -1,6 +1,7 @@
 import { GatewayDelivery } from './gateway-delivery.mjs';
 import { UserError } from '../config.mjs';
 import { createHash } from 'node:crypto';
+import { OrganizationGateway } from './organization-gateway.mjs';
 
 const textHash = text => createHash('sha256').update(text).digest('hex');
 const queue = agent => [...(agent.inbox?.nextTurn || []), ...(agent.inbox?.nextStep || [])];
@@ -47,15 +48,36 @@ export class JarvisGateway {
       child.effect(() => () => {
         if (this.boundService !== service) return;
         this.boundService = undefined;
-        clearInterval(this.timer); this.timer = undefined;
-        if (runtime.active?.kind === 'background') runtime.active.cancel?.('unavailable');
-        runtime.removeGatewayTools?.();
+        if (!this.organization) {
+          clearInterval(this.timer); this.timer = undefined;
+          if (runtime.active?.kind === 'background') runtime.active.cancel?.('unavailable');
+          runtime.removeGatewayTools?.();
+        }
       });
     });
   }
-  service() {
+  legacyService() {
     if (this.managed) return this.boundService;
     try { return this.runtime.ctx.get?.('jarvisGateway'); } catch { return undefined; }
+  }
+  service() { return this.organization ?? this.legacyService(); }
+  connectOrganization(manager, dataFile, { adoptedRoot } = {}) {
+    if (this.organization instanceof OrganizationGateway) {
+      this.organization.manager = manager;
+      return;
+    }
+    const legacy = () => this.legacyService();
+    try {
+      this.organization = new OrganizationGateway({ manager, dataFile, legacy, adoptedRoot, binding: () => this.runtime.store.sessionBinding() });
+    } catch {
+      const failure = () => ({ status: 'unavailable', reason: '组织任务关联暂不可读取，原记录已保留，请检查服务日志。' });
+      const refuseClear = () => { throw new UserError('组织任务关联暂不可读取，当前无法安全清空对话；原记录已保留。', 409); };
+      this.organization = { ledger: { pendingCount: () => 0, deliveries: () => [], reserve: () => undefined,
+        assertComplete: refuseClear, transfer: refuseClear }, submit: async () => failure(), query: async () => failure(), reviewDelivery: () => false };
+      this.lastError = failure().reason;
+    }
+    this.runtime.refreshGatewayTools?.();
+    if (this.started) this.start();
   }
   connected() {
     const service = this.service();
@@ -68,14 +90,20 @@ export class JarvisGateway {
   start() {
     this.started = true;
     if (this.timer || !this.connected() || this.runtime.closing) return;
-    this.timer = setInterval(() => { this.kick().catch(() => {}); }, 1500);
+    this.timer = setInterval(() => { this.poll().catch(() => {}); }, 1500);
     this.timer.unref?.();
-    this.kick().catch(() => {});
+    this.poll().catch(() => {});
+  }
+  async poll() {
+    try { await this.service()?.sync?.(); }
+    catch { /* The source ledger and its cursor retain feedback for the next bounded pass. */ }
+    if (!this.runtime.closing) return this.kick();
   }
   async close() {
     this.started = false; clearInterval(this.timer); this.timer = undefined;
     if (this.runtime.active?.kind === 'background') this.runtime.active.cancel?.('shutdown');
     await this.draining;
+    await this.organization?.close?.();
   }
   async ownsQueue(agent, deliveries) {
     const pending = queue(agent), snapshot = JSON.stringify(pending);
@@ -202,6 +230,7 @@ export class JarvisGateway {
     }
     const finished = Promise.withResolvers(), operation = new AbortController();
     const active = { kind: 'background', turn: { id: 'notification:' + manifest.batchId, source: 'gateway' }, done: finished.promise,
+      promptSnapshot: runtime.promptSettings.snapshot('background'),
       cancel: (reason = 'user') => { active.cancelReason = reason; operation.abort(); } };
     runtime.active = active;
     this.draining = this.express(service, manifest, binding, active, operation.signal).finally(() => {
@@ -228,6 +257,7 @@ export class JarvisGateway {
     const timer = setTimeout(() => active.cancel('timeout'), Number(this.runtime.model().value.timeout) * 1000);
     try {
       agent = await this.runtime.ensureAgent();
+      active.promptSnapshot = await this.runtime.promptSettings.prepare(active.promptSnapshot, agent);
       this.authorize(service, binding, active);
       const existing = this.runtime.store.turn('notification:' + item.batchId);
       if (existing) { service.ledger.saveDelivery({ ...item, state: 'projected', assistantText: existing.assistant }); return true; }
@@ -263,7 +293,7 @@ export class JarvisGateway {
       }
       if (!evidence.admitted) {
         if (queue(agent).length || agent.status !== 'idle') return false;
-        if (service.reviewDelivery && !service.reviewDelivery(item)) return false;
+        if (service.reviewDelivery && !await service.reviewDelivery(item)) return false;
         const text = notificationText(item);
         evidence = await this.delivery.send(agent, { deliveryId: item.deliveryId, text }, { signal, authorize: () => this.authorizeFresh(service, binding, active, agent) });
       }
@@ -322,11 +352,11 @@ export class JarvisGateway {
       execute: async (args, execution) => { execution?.signal?.throwIfAborted(); return run(args); },
     }));
   }
-  query(args) {
+  async query(args) {
     if (!this.runtime.allowed('jarvis_work_query')) return { status: 'denied', reason: '任务查询工具已被用户关闭。' };
     const service = this.service();
     if (!service?.query) return { status: 'unavailable', reason: '任务执行入口尚未接通。' };
-    try { return service.query(args); } catch { return { status: 'needs_clarification', reason: '查询参数不正确。' }; }
+    try { return await service.query(args); } catch { return { status: 'needs_clarification', reason: '查询参数不正确。' }; }
   }
   origin(agent) {
     const { active, store } = this.runtime;
@@ -339,15 +369,15 @@ export class JarvisGateway {
       source: 'user', ...(persisted.selectedWorkRef ? { selectedWorkRef: persisted.selectedWorkRef } : {}),
       ...(persisted.selectedQuestionId ? { selectedQuestionId: persisted.selectedQuestionId } : {}) };
   }
-  submit(agent, args) {
+  async submit(agent, args) {
     if (!this.runtime.allowed('jarvis_work_submit')) return { status: 'denied', reason: '交办工具已被用户关闭。' };
     const origin = this.origin(agent);
     if (!origin) return { status: 'denied', reason: '只能根据当前真实用户轮次交办；后台反馈和历史消息不提供新授权。' };
     const service = this.service();
     if (!service?.submit) return { status: 'unavailable', reason: '任务执行入口尚未接通。' };
-    const result = service.submit(args, origin);
+    const turn = this.runtime.active.turn;
+    const result = await service.submit(args, origin);
     if (result.status === 'queued' || result.status === 'replayed') {
-      const turn = this.runtime.active.turn;
       turn.gatewayReceipts = [{ status: result.status, commandId: result.commandId, workRef: result.workRef, receivedAt: result.receivedAt }];
       this.runtime.store.updateTurn(turn);
     }
@@ -364,14 +394,20 @@ export class JarvisGateway {
     const questions = new Map(), service = this.service();
     for (const turn of [...turns].reverse()) for (const ref of turn.workRefs || []) {
       if (!ref.questionId || questions.has(ref.workRef) || questions.size >= 20) continue;
-      try { questions.set(ref.workRef, service?.query?.({ operation: 'get', workRef: ref.workRef })?.question?.id); }
+      try { questions.set(ref.workRef, typeof service?.currentQuestion === 'function'
+        ? service.currentQuestion(ref.workRef) : service?.query?.({ operation: 'get', workRef: ref.workRef })?.question?.id); }
       catch { questions.set(ref.workRef, undefined); }
     }
     return questions;
   }
   viewTurns(turns, questions = this.currentQuestions(turns)) {
-    return turns.map(turn => turn.workRefs ? { ...turn, workRefs: turn.workRefs.map(ref => ref.questionId
-      ? { ...ref, inactive: questions.get(ref.workRef) !== ref.questionId } : ref) } : turn);
+    return turns.map(turn => {
+      const refs = [...(turn.workRefs ?? []), ...(turn.gatewayReceipts ?? [])];
+      const artifacts = typeof this.service()?.artifactsFor === 'function'
+        ? [...new Map(refs.flatMap(ref => this.service().artifactsFor(ref.workRef)).map(item => [item.url, item])).values()] : [];
+      return { ...turn, ...(turn.workRefs ? { workRefs: turn.workRefs.map(ref => ref.questionId
+        ? { ...ref, inactive: questions.get(ref.workRef) !== ref.questionId } : ref) } : {}), ...(artifacts.length ? { artifacts } : {}) };
+    });
   }
   project(delivery, assistantText) {
     const ledger = this.service().ledger;
@@ -387,6 +423,7 @@ export class JarvisGateway {
   async sealGeneration(record) {
     const ledger = this.service()?.ledger;
     if (!ledger?.deliveries) return;
+    ledger.assertComplete?.();
     for (const item of ledger.deliveries(record.from.conversationId)) {
       if (item.generation !== record.from.generation || item.state === 'projected' || item.state === 'parked') continue;
       let evidence = await this.delivery.inspect(record.from.dshSessionId, item.deliveryId);

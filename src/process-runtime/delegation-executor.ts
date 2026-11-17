@@ -1,0 +1,187 @@
+/** Proxy executor: persistent bindings and polling, without occupying a local Worker slot. */
+import { Engine, key, latestAssignment, liveTicket, type Assignment, type Ticket } from '../core/index.ts'
+import type { Store } from '../app/store.ts'
+import { family } from '../kv.ts'
+import { fingerprint } from '../jarvis-gateway/contracts.ts'
+import { verifiedDelegationArtifacts, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
+import { DelegationTaskContextSchema } from '../sources/delegation-context.ts'
+
+export interface DelegationBinding {
+  request: DelegationRequest; accepted?: boolean; stopped?: boolean; finished?: boolean;
+  commands: Record<string, { request: DelegationRequest; inputId?: string; settled?: boolean; rejected?: boolean }>;
+  snapshot?: DelegationSnapshot; reportHash?: string; question?: { parentId: string; childId: string }; error?: string;
+  retryAt?: number; failures?: number;
+}
+const selections = family<string, [string]>('process-delegation:route:')
+type Binding = DelegationBinding
+const outgoing = family<Binding, [string]>('process-delegation:out:')
+type Config = { instanceId: string; workerTools: string[]; delegationTargets?: Capability[] }
+
+/** Keeps one parent Assignment bound to one child and reconciles its commands and evidence. */
+export class DelegationExecutor {
+  constructor(private config: Config, private store: Store, private engine: Engine,
+    private send?: (request: DelegationRequest) => Promise<DelegationSnapshot>, private frozen: () => boolean = () => false) {}
+
+  select(triggerId: string, target?: string): void {
+    const prior = this.store.get(selections(triggerId)), selection = target ?? 'local'
+    if (prior && prior !== selection) throw new Error('Task execution target is already fixed')
+    if (target && (!this.send || !this.config.delegationTargets?.some(item => item.instanceId === target))) throw new Error('Unknown or unavailable delegation target')
+    const trigger = this.store.triggers.get(triggerId)
+    if (target && trigger?.source === 'delegation') throw new Error('This stage permits only one delegation hop')
+    this.store.set(selections(triggerId), selection)
+  }
+  remote(ticket: Ticket): boolean {
+    const selection = this.store.get(selections(ticket.origin.triggerId))
+    return !!selection && selection !== 'local'
+  }
+  private name(ticketId: string, assignmentId: string) { return outgoing(key(ticketId, assignmentId)) }
+  start(ticket: Ticket, assignment: Assignment): void {
+    const target = this.store.get(selections(ticket.origin.triggerId)), capability = this.config.delegationTargets?.find(item => item.instanceId === target)
+    if (!capability) throw new Error('The fixed child target is no longer configured')
+    const name = this.name(ticket.id, assignment.id)
+    if (this.store.get(name)) return
+    const tools = capability.tools.filter(tool => this.config.workerTools.includes(tool))
+    if (!tools.length) throw new Error('Parent and child have no common execution capability')
+    const delegationId = key('delegation', this.config.instanceId, ticket.id, assignment.id)
+    const source = this.store.triggers.get(ticket.origin.triggerId)
+    if (!source) throw new Error('A delegated task requires its actual original source record')
+    const taskContext = DelegationTaskContextSchema.parse({ scope: ticket.mandate.scope, strength: ticket.mandate.strength,
+      assignment: ticket.execution?.assignment ?? '', source: { triggerId: source.id, kind: source.source, actor: source.actor,
+        human: source.human, at: source.at, text: source.text, ...(source.url ? { url: source.url } : {}) } })
+    const request: DelegationRequest = { targetInstanceId: capability.instanceId, delegationId, parentTicketId: ticket.id,
+      parentAssignmentId: assignment.id, parentDecisionId: ticket.decisionId, operation: 'submit', commandId: key(delegationId, 'submit'),
+      text: ticket.title, tools, path: [this.config.instanceId], taskContext }
+    this.store.set(name, { request, commands: {} })
+  }
+  stop(ticket: Ticket, assignment: Assignment): void {
+    const name = this.name(ticket.id, assignment.id), row = this.store.get(name)
+    if (!row || row.finished) return
+    // Completion of this proxy's own verified report is not a new stop request.
+    if (row.snapshot?.status === 'completed' && assignment.report?.state === 'ready') return
+    row.stopped = true; this.store.set(name, row)
+  }
+  owns(ticket: Ticket): boolean { return this.remote(ticket) }
+  private current(row: Binding): Ticket | undefined {
+    const ticket = this.store.tickets.get(row.request.parentTicketId)
+    return ticket && liveTicket(ticket) && latestAssignment(ticket)?.id === row.request.parentAssignmentId && latestAssignment(ticket)?.state !== 'ended' ? ticket : undefined
+  }
+  private verify(row: Binding, snapshot: DelegationSnapshot): void {
+    const r = row.request
+    if (snapshot.delegationId !== r.delegationId || snapshot.parentTicketId !== r.parentTicketId
+      || snapshot.parentAssignmentId !== r.parentAssignmentId || snapshot.childInstanceId !== r.targetInstanceId) throw new Error('Child response does not match the fixed assignment')
+    if (row.snapshot?.ticketId && snapshot.ticketId !== row.snapshot.ticketId) throw new Error('Child ticket binding changed')
+    verifiedDelegationArtifacts(snapshot)
+  }
+  private controls(row: Binding, ticket: Ticket): void {
+    for (const input of ticket.inputs.filter(input => ticket.undelivered.includes(input.id))) {
+      if (input.kind !== 'trigger' || ticket.origin.triggerIds.includes(input.triggerId)) continue
+      const trigger = this.store.triggers.get(input.triggerId), operation = trigger?.dispatch?.operation
+      if (!trigger || !operation || !['append', 'answer'].includes(operation)) continue
+      const commandId = key(row.request.delegationId, 'input', input.id)
+      if (row.commands[commandId]) continue
+      if (operation === 'answer' && row.question?.parentId !== trigger.dispatch?.attentionId) throw new Error('Parent question no longer maps to the child question')
+      row.commands[commandId] = { inputId: input.id, request: { ...row.request, operation: operation as 'append' | 'answer', commandId,
+        text: trigger.text, ...(operation === 'answer' ? { questionId: row.question!.childId } : {}) } }
+    }
+  }
+  private apply(row: Binding, snapshot: DelegationSnapshot): void {
+    this.verify(row, snapshot); row.snapshot = snapshot
+    const ticket = this.current(row)
+    if (!ticket) return
+    // IPC yields to user turns. Capture all inputs committed while a child reply was in flight.
+    this.controls(row, ticket)
+    const assignmentId = row.request.parentAssignmentId
+    if (latestAssignment(ticket)?.state === 'pending') this.engine.assignmentStarted(ticket.id, assignmentId)
+    if (snapshot.ticketId && !row.accepted) {
+      const ids = ticket.inputs.filter(input => input.kind === 'trigger' && ticket.origin.triggerIds.includes(input.triggerId)).map(input => input.id)
+      this.engine.inputsDelivered(ticket.id, assignmentId, ids); this.engine.inputsRead(ticket.id, ids); row.accepted = true
+    }
+    for (const command of Object.values(row.commands)) {
+      const receipt = snapshot.receipts[command.request.commandId]
+      if (receipt === 'applied' && command.inputId && !command.settled) {
+        this.engine.inputsDelivered(ticket.id, assignmentId, [command.inputId]); this.engine.inputsRead(ticket.id, [command.inputId]); command.settled = true
+      } else if (receipt && receipt !== 'pending' && receipt !== 'applied' && !command.settled) {
+        command.settled = true; command.rejected = true; this.engine.deliveryFailed(ticket.id, assignmentId, `Child rejected ${command.request.operation}: ${receipt}`)
+      }
+    }
+    // Never accept a result while a newer user input is still awaiting child admission.
+    const outstanding = Object.values(row.commands).some(command => !command.settled || command.rejected)
+    if (snapshot.status === 'completed' && outstanding) {
+      this.engine.report(ticket.id, { state: 'blocked', summary: 'Child completed before the newer input was admitted; review the result and pending request.' }); return
+    }
+    const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question])
+    if (hash === row.reportHash) return
+    if (snapshot.status === 'completed' && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim()) {
+      // Record evidence identity before Engine calls stop during terminal reporting.
+      row.finished = true; this.store.set(this.name(ticket.id, assignmentId), row)
+      this.engine.report(ticket.id, { state: 'ready', summary: snapshot.summary, question: null })
+    } else if (['blocked', 'failed', 'stopped'].includes(snapshot.status)) {
+      this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed',
+        summary: snapshot.summary ?? `Child delegation ${snapshot.status}`, question: snapshot.question?.text ?? null })
+      const attention = this.store.tickets.get(ticket.id)?.attention
+      if (snapshot.question && attention) row.question = { parentId: attention.id, childId: snapshot.question.id }
+    } else this.engine.report(ticket.id, { state: 'waiting', summary: snapshot.ticketId ? 'Child accepted the task and is executing.' : 'Waiting for child admission.', question: null })
+    row.reportHash = hash
+  }
+  async tick(): Promise<void> {
+    if (!this.send) return
+    for (const name of this.store.keys(outgoing)) {
+      let row = this.store.get(name)!
+      if (row.finished || (row.retryAt ?? 0) > Date.now()) continue
+      try {
+        const ticket = this.current(row)
+        if (!ticket && !row.stopped) { row.stopped = true; this.store.set(name, row) }
+        let snapshot = await this.send({ ...row.request, operation: 'query', commandId: key(row.request.delegationId, 'query'), text: undefined })
+        this.verify(row, snapshot)
+        row = this.store.get(name)!
+        if (!this.current(row)) { row.stopped = true; this.store.set(name, row) }
+        // Query before every possible submit: a lost acknowledgement never creates another task.
+        if (snapshot.status === 'missing') {
+          if (row.stopped) { row.finished = true; this.store.set(name, row); continue }
+          if (this.frozen()) continue
+          snapshot = await this.send(row.request); this.verify(row, snapshot)
+        }
+        // Reload because a human stop or a new input can arrive while the IPC request is in flight.
+        row = this.store.get(name)!
+        if (row.stopped) {
+          const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
+          snapshot = await this.send(request); this.verify(row, snapshot)
+          row.snapshot = snapshot
+          if (snapshot.status === 'stopped' || snapshot.status === 'completed' || snapshot.receipts[request.commandId] === 'ignored') row.finished = true
+        } else {
+          const current = this.current(row)
+          if (!current) continue
+          this.controls(row, current); this.store.set(name, row)
+          if (snapshot.ticketId) for (const command of Object.values(row.commands)) {
+            if (command.settled) continue
+            if (this.frozen()) break
+            if (this.store.get(name)?.stopped || !this.current(row)) break
+            snapshot = await this.send(command.request); this.verify(row, snapshot)
+          }
+          // A stop during control delivery fences late reports as well.
+          const latest = this.store.get(name)!
+          if (latest.stopped) { row.stopped = true; this.store.set(name, row); continue }
+          this.apply(row, snapshot)
+        }
+        delete row.error; delete row.retryAt; delete row.failures; this.store.set(name, row)
+      } catch (error) {
+        const latest = this.store.get(name)!
+        const message = String(error), ticket = this.current(latest)
+        if (ticket && latest.error !== message) this.engine.report(ticket.id, { state: 'blocked',
+          summary: 'Child connection or command outcome is unavailable. The fixed task will be queried again; no replacement task was created.' })
+        delete latest.reportHash
+        const failures = (latest.failures ?? 0) + 1
+        this.store.set(name, { ...latest, error: message, failures, retryAt: Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)) })
+      }
+    }
+  }
+  list() { return this.store.keys(outgoing).map(name => this.store.get(name)!) }
+  artifacts(ticketId: string): VerifiedArtifact[] {
+    const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    if (!ticket || !assignment) return []
+    const row = this.store.get(this.name(ticketId, assignment.id))
+    if (!row?.snapshot) return []
+    this.verify(row, row.snapshot)
+    return verifiedDelegationArtifacts(row.snapshot)
+  }
+}

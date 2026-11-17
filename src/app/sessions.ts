@@ -6,11 +6,11 @@ import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
 import { z } from 'zod'
-import { key, liveTicket, type Ticket } from '../core/index.ts'
+import { key, latestAssignment, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
-import type { Effects } from './effects.ts'
+import { Later, type Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
@@ -19,23 +19,38 @@ import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+import type { NativeSession, NativeSessionEvent, NativeSessionPolicy, NativeSourceContext, SessionNativePort } from './runtime-ports.ts'
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
+  /** Omit for the original same-process DSH path. */
+  readonly native?: SessionNativePort
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
   readonly masterId: string
+  readonly masterDirectory?: string
   readonly lifetime: AbortSignal
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
-  tools(agent: Agent, ticket?: Ticket): Tool[]
+  tools(agent: Pick<Agent, 'id'>, ticket?: Ticket): Tool[]
+  /** Organization and delegated-mandate ceiling, intersected with the original role tools. */
+  workerTools?(ticket: Ticket): readonly string[]
+  workerSkills?(ticket: Ticket): readonly string[]
+  sourceContext?(sessionId: string, triggerId: string): NativeSourceContext
+  nativeEnvironment?(): Record<string, string | undefined>
+  skillDirectory?(): string
+  localTicket?(ticket: Ticket): boolean
+  /** Freeze new model requests and input deliveries while an exact stop set is confirmed. */
+  executionHeld?(): boolean
+  /** Independent of execution admission: permits only exact frozen-owner receipt cancellation. */
+  authorizeCapabilityStop?(operationId: string): void
 }
 
 /**
@@ -58,7 +73,7 @@ declare module '@deepseek-ai/cordis' {
  * changes the profile, schedules work or starts goals outside the worker slots, the pause and a person's hold, starts or
  * messages other Sessions, or edits documents.
  */
-const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
+export const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
@@ -76,7 +91,7 @@ const POWERSHELL_SLEEP = /(?:^|[;&|({\n])\s*(?:&\s*)?(?:Microsoft\.PowerShell\.U
  * a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
  * job wait its timeout; the router preset ends both after 5 seconds.
  */
-function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
+export function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
   const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
   if (name === 'bash' || name === 'pwsh') {
     const sleeps = typeof args.command === 'string' && (name === 'pwsh' ? POWERSHELL_SLEEP : SLEEP).test(args.command)
@@ -93,7 +108,8 @@ function noWait({ name, arguments: input }: { name: string; arguments: unknown }
  * Feeds session events into `RetryHealth` to report model budget waits on the `models` `HealthEntry`, and durably records which prompt revisions each session has worked under in `Store` (`KV.sessions.prompts`) to authorize prompt version reads.
  */
 export class Sessions {
-  private readonly agentDelivery: AgentDelivery
+  private readonly agentDelivery?: AgentDelivery
+  private nativeDispose?: () => void
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
@@ -101,13 +117,37 @@ export class Sessions {
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
-    this.agentDelivery = new AgentDelivery(host.context)
+    if (!host.native) this.agentDelivery = new AgentDelivery(host.context)
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
   install(): void {
+    if (this.host.native) {
+      if (this.nativeDispose) return
+      this.nativeDispose = this.host.native.install({
+        policy: (id, bind) => this.nativePolicy(id, bind),
+        authorize: (id, operation, tool) => this.authorizeNative(id, operation, tool),
+        authorizeCapabilityStop: operationId => {
+          if (this.host.closing() || this.host.lifetime.aborted) throw new Error('Superagent is stopping')
+          if (!this.host.authorizeCapabilityStop) throw new Error('Native delivery cancellation has no capability maintenance owner')
+          return this.host.authorizeCapabilityStop(operationId)
+        },
+        capabilityFrozen: () => Boolean(this.host.executionHeld?.()),
+        tool: async (id, name, args, signal) => {
+          this.authorizeNative(id, 'tool', name)
+          const ticket = this.ticketForId(id)
+          const definition = this.host.tools({ id: id as SessionId }, ticket).find(tool => tool.name === name)
+          if (!definition) throw new Error('Tool is not registered for this Session')
+          signal.throwIfAborted()
+          return definition.execute(definition.schema.parse(args), signal)
+        },
+        event: event => this.nativeEvent(event),
+        sourceContext: this.host.sourceContext?.bind(this.host),
+      })
+      return
+    }
     const ctx = this.ctx
     ctx.on('agent/disposed', ({ agent }) => {
       this.release(agent)
@@ -137,7 +177,15 @@ export class Sessions {
     })
   }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent | NativeSession> {
+    if (role === 'worker' && this.host.executionHeld?.()) throw new Later('Worker creation is frozen for a pending capability change')
+    if (this.host.native) {
+      const settings = this.host.store.settings()
+      // Attachment snapshots and following events share the native journal's
+      // order. A separate inspect/restore here can race a newer retry event.
+      return this.host.native.ensure({ sessionId: id, cwd, title, role,
+        model: role === 'orchestrator' ? settings.eval.model : settings.executor.model })
+    }
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
@@ -157,15 +205,17 @@ export class Sessions {
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
+    if (this.host.native) return this.host.native.holds(sessionId, key(requestId))
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
-    return !('error' in result) && await this.agentDelivery.holds(result.agent, key(requestId))
+    return !('error' in result) && await this.agentDelivery!.holds(result.agent, key(requestId))
   }
   /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
     accepted?: () => void): Promise<void> {
+    if (this.host.native) return this.host.native.deliver({ sessionId, requestId: key(requestId), text, mode }, { authorize, accepted })
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
-    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
+    await this.agentDelivery!.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
@@ -180,18 +230,24 @@ export class Sessions {
   }
   /** Injects a notice into the main Session without waking it; no-op if the main Session does not exist yet. */
   private async inject(name: string, value: Record<string, unknown>, summary: string): Promise<void> {
+    if (this.host.native) {
+      if (!this.host.native.current(this.host.masterId)) return
+      const text = JSON.stringify(value)
+      return this.host.native.deliver({ sessionId: this.host.masterId, requestId: `notice:${name}:${key(text)}`, text, mode: { inject: summary } })
+    }
     const resolved = await this.ctx.sessionController.resolveAgent(this.host.masterId as SessionId)
     if ('error' in resolved) return
     // Deduplicate by notice name and payload hash so retries are idempotent while updated payloads still deliver.
     const text = JSON.stringify(value)
-    await this.agentDelivery.send(resolved.agent, `notice:${name}:${key(text)}`, text, { inject: summary }, this.host.lifetime)
+    await this.agentDelivery!.send(resolved.agent, `notice:${name}:${key(text)}`, text, { inject: summary }, this.host.lifetime)
   }
   /** Returns the current prompt revision, the active prompt revision of each loaded Session, and whether the main Session still has a pending `'prompts'` notice. */
   status() {
     const { store, prompts, effects } = this.host
     const sessions = store.keys(KV.sessions.prompts).flatMap(name => {
       const sessionId = name.slice(KV.sessions.prompts.prefix.length), revision = store.get(name)?.at(-1)
-      return this.ctx.agents.get(sessionId as SessionId) && revision !== undefined ? [{ sessionId, revision }] : []
+      const loaded = this.host.native ? this.host.native.current(sessionId) : this.ctx.agents.get(sessionId as SessionId)
+      return loaded && revision !== undefined ? [{ sessionId, revision }] : []
     })
     return { revision: prompts.current().revision, sessions, notificationPending: effects.pending('notice', 'prompts') }
   }
@@ -230,8 +286,58 @@ export class Sessions {
       : { state: 'ready', detail: 'No managed Session is waiting on a model budget retry' })
   }
   private ticketOf(agent: Agent): Ticket | undefined {
-    const ticketId = ticketOfSession(agent.id)
+    return this.ticketForId(agent.id)
+  }
+  private ticketForId(sessionId: string): Ticket | undefined {
+    const ticketId = ticketOfSession(sessionId)
     return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
+  }
+  private authorizeNative(sessionId: string, operation: 'request' | 'tool' | 'delivery', toolName?: string): void {
+    if (operation !== 'tool' && this.host.executionHeld?.()) throw new Later('Task execution is frozen for a pending Worker capability change')
+    if (this.host.closing() || this.host.lifetime.aborted) throw new Error('Superagent is stopping')
+    if (sessionId === this.host.masterId) return
+    const ticket = this.ticketForId(sessionId)
+    if (!ticket) throw new Error('Session does not belong to this application')
+    if (this.host.localTicket?.(ticket) === false) throw new Error('Ticket execution belongs to a child instance')
+    if (!liveTicket(ticket)) throw new Error('Ticket ended; new work needs a new authorized ticket')
+    if (operation === 'tool' && toolName && WORK_TOOLS.includes(toolName)) {
+      const ceiling = this.host.workerTools?.(ticket)
+      if (ceiling && !ceiling.includes(toolName)) throw new Error('Tool is outside the organization or delegated capability')
+    }
+  }
+  /** Uses the same original composition, skill text and version binding as the local DSH path. */
+  nativePolicy(sessionId: string, bind: boolean): NativeSessionPolicy {
+    const ticket = this.ticketForId(sessionId), master = sessionId === this.host.masterId
+    if (!master && !ticket) throw new Error('Session does not belong to this application')
+    // Preview/recovery reads never admit work. Binding a real request still requires the current live owner.
+    if (bind) this.authorizeNative(sessionId, 'request')
+    const version = this.versionFor(sessionId, bind), settings = this.host.store.settings()
+    const prompt = this.host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', ticket ? this.host.environment(ticket) : undefined)
+    const ceiling = ticket && this.host.workerTools?.(ticket)
+    return { sessionId, role: master ? 'orchestrator' : 'worker', ...(ticket ? { ticketId: ticket.id, assignmentId: latestAssignment(ticket)?.id } : {}),
+      cwd: ticket?.execution?.directory ?? this.host.masterDirectory ?? '', promptRevision: version.revision,
+      prompt: `[dsh-superagent prompt revision ${version.revision}]\n${prompt}\n${ticket ? mandateInstructions(ticket.mandate) : ''}`,
+      complete: master, skillDirectory: this.host.skillDirectory?.() ?? this.host.masterDirectory ?? '',
+      skills: this.skillsFor(version), environment: this.host.nativeEnvironment?.() ?? {},
+      ...(ticket && this.host.workerSkills ? { selectedSkills: [...this.host.workerSkills(ticket)] } : {}),
+      tools: this.host.tools({ id: sessionId as SessionId }, ticket).map(tool => ({ name: tool.name, description: tool.description,
+        parameters: JSON.parse(JSON.stringify(z.toJSONSchema(tool.schema))) as Record<string, unknown> })),
+      allowedTools: master ? ['skill', 'bash', 'pwsh', 'read', 'read_image', 'job_output', 'job_list', 'job_kill']
+        : WORK_TOOLS.filter(name => !ceiling || ceiling.includes(name)),
+      initialModel: master ? settings.eval.model : settings.executor.model }
+  }
+  private nativeEvent(event: NativeSessionEvent): void {
+    // The original local listener observes only this application's main and
+    // ticket Workers. A guarded native subagent is not an additional managed
+    // Worker and must not contribute to the application's model health.
+    if (event.sessionId !== this.host.masterId && !this.ticketForId(event.sessionId)) return
+    if (event.kind === 'restored') {
+      this.retryHealth.restore(event.sessionId, event.events)
+      if (event.status === 'idle') this.retryHealth.clear(event.sessionId)
+    }
+    if (event.kind === 'event') this.retryHealth.observe(event.sessionId, event.event)
+    if (event.kind === 'disposed' || event.kind === 'status' && event.status === 'idle' && !this.host.closing()) this.retryHealth.clear(event.sessionId)
+    this.updateModelHealth()
   }
   private async decorate(agent: Agent): Promise<void> {
     if (this.bindings.has(agent)) return
@@ -296,9 +402,11 @@ export class Sessions {
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
-    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    const ticket = store.tickets.get(ticketId), ceiling = ticket && this.host.workerTools?.(ticket)
+    const allow = WORK_TOOLS.filter(name => (!ceiling || ceiling.includes(name)) && agent.ctx.tools.get(name, parent))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
+      if (current && this.host.localTicket?.(current) === false) return 'Ticket execution belongs to a child instance'
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
     })]
   }
@@ -323,26 +431,36 @@ export class Sessions {
     if (!scope || previous?.revision === version.revision) return
     previous?.dispose()
     const disposers: (() => void)[] = []
-    for (const [name, content] of this.host.prompts.skills(version.config)) {
-      const bundled = name === 'feishu' || name === 'github' ? bundledSkills[name] : undefined
-      const body = version.config.skills[name] ?? ''
-      const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
-      disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
-        ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
+    for (const skill of this.skillsFor(version)) {
+      disposers.push(scope.skills.register({ name: skill.name, description: skill.description, content: skill.content, source: 'runtime',
+        ...(skill.resourceDirectory ? { resourceBase: { kind: 'directory' as const, path: skill.resourceDirectory } } : {}) }))
     }
     binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
   }
   /** Return the current prompt version, updating the agent's skills and recording the revision in Store when bound to a model request. */
   private promptFor(agent: Agent, bind: boolean): PromptVersion {
-    const version = this.host.prompts.current()
+    const version = this.versionFor(agent.id, bind)
     if (!bind) return version
     const binding = this.bindings.get(agent)
     if (binding) this.bindSkills(binding, version)
-    const { store } = this.host
-    const revisions = store.get(KV.sessions.prompts(agent.id)) ?? []
-    const bound = [...revisions.filter(revision => revision !== version.revision), version.revision]
-    if (revisions.at(-1) !== version.revision) store.set(KV.sessions.prompts(agent.id), bound)
     return version
+  }
+  private versionFor(sessionId: string, bind: boolean): PromptVersion {
+    const version = this.host.prompts.current()
+    if (!bind) return version
+    const { store } = this.host
+    const revisions = store.get(KV.sessions.prompts(sessionId)) ?? []
+    const bound = [...revisions.filter(revision => revision !== version.revision), version.revision]
+    if (revisions.at(-1) !== version.revision) store.set(KV.sessions.prompts(sessionId), bound)
+    return version
+  }
+  private skillsFor(version: PromptVersion) {
+    return this.host.prompts.skills(version.config).map(([name, content]) => {
+      const bundled = name === 'feishu' || name === 'github' ? bundledSkills[name] : undefined
+      const body = version.config.skills[name] ?? ''
+      return { name: `${SKILL_PREFIX}${name}`, description: bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.'),
+        content, ...(bundled ? { resourceDirectory: dirname(bundled.path) } : {}) }
+    })
   }
   /** Releases registrations for `agent` in reverse order (LIFO); disposing its skill scope releases its skills as well. */
   private release(agent: Agent): void {
@@ -355,5 +473,8 @@ export class Sessions {
     }
   }
   /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents. */
-  dispose(): void { for (const agent of [...this.bindings.keys()]) this.release(agent) }
+  dispose(): void {
+    this.nativeDispose?.(); this.nativeDispose = undefined
+    for (const agent of [...this.bindings.keys()]) this.release(agent)
+  }
 }

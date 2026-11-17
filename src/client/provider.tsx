@@ -1,7 +1,8 @@
 /** Shared panel React contexts, state polling, restart detection, and action runner hook. */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { caller, usePoll, type ApiMessages, type Call, type SetupView, type StateView } from './api.ts'
+import { caller, usePoll, type ApiMessages, type ApiScope, type Call, type SetupView, type StateView } from './api.ts'
+import { PortalRoot, usePortalRoot } from './controls.tsx'
 import type { Route } from './route.ts'
 import STYLES from './client.css?raw'
 import { errorText, setupText, valueLabel, type T } from './text.ts'
@@ -15,7 +16,9 @@ export interface PanelContext {
   openSession: (sessionId: string) => Promise<void>
   notify: (text: string) => void
   restart: () => void
+  trackDraft: (id: string, activity: DraftActivity | undefined) => void
 }
+export interface DraftActivity { dirty: boolean; busy: boolean; discard: () => void }
 export interface PanelData {
   state: StateView | undefined
   error: Error | undefined
@@ -63,23 +66,36 @@ const messages = (t: T): ApiMessages => ({
   user: ({ code, values }) => t(`userError.${code}`, values.part ? { ...values, part: valueLabel(t, 'promptPart', values.part) } : values),
 })
 function Toast({ text, onDone, holdMs = 3000 }: { text: string; onDone: () => void; holdMs?: number }) {
+  const portalRoot = usePortalRoot()
   const done = useRef(onDone)
   done.current = onDone
   useEffect(() => { const timer = setTimeout(() => done.current(), holdMs + 1000); return () => clearTimeout(timer) }, [holdMs])
   return createPortal(<div className="dt-toast" role="status" style={{ ['--dt-toast-hold' as string]: `${holdMs}ms` }}>{text}</div>,
-    document.body)
+    portalRoot)
 }
 const stay = () => {}
 const noSession = async () => {}
-export function PanelProvider({ t, interval = 5000, openSession = noSession, navigate = stay, back = stay, backLabel = '', children }: {
+export function PanelProvider({ t, interval = 5000, openSession = noSession, navigate = stay, back = stay, backLabel = '', apiScope,
+  onDraftStateChange, portalRoot, children }: {
   t: T; interval?: number; openSession?: (sessionId: string) => Promise<void>; navigate?: PanelContext['navigate']; back?: () => void
   backLabel?: string
+  apiScope?: ApiScope
+  onDraftStateChange?: (activity: DraftActivity) => void
+  portalRoot?: HTMLElement
   children: ReactNode
 }) {
   // Read the current translator via ref so locale changes do not recreate `call` and restart polling.
   const copy = useRef(t)
   copy.current = t
-  const call = useMemo(() => caller(() => messages(copy.current)), [])
+  const call = useMemo(() => caller(() => messages(copy.current), apiScope), [apiScope?.base, apiScope?.csrf])
+  const drafts = useRef(new Map<string, DraftActivity>()), draftListener = useRef(onDraftStateChange)
+  draftListener.current = onDraftStateChange
+  const trackDraft = useCallback((id: string, activity: DraftActivity | undefined) => {
+    if (activity) drafts.current.set(id, activity); else drafts.current.delete(id)
+    const entries = [...drafts.current.values()]
+    draftListener.current?.({ dirty: entries.some(entry => entry.dirty), busy: entries.some(entry => entry.busy),
+      discard: () => { for (const entry of drafts.current.values()) if (!entry.busy) entry.discard() } })
+  }, [])
   const [toast, setToast] = useState<{ text: string; id: number }>()
   const notify = useCallback((text: string) => setToast({ text, id: Date.now() }), [])
   // Poll at 1s during a restart until the server goes down and answers again, or time out after 30s if the restart completed between polls.
@@ -96,13 +112,13 @@ export function PanelProvider({ t, interval = 5000, openSession = noSession, nav
     const timer = setTimeout(() => setRestarting(undefined), 30_000)
     return () => clearTimeout(timer)
   }, [restarting])
-  const context = useMemo(() => ({ t, call, navigate, back, backLabel, openSession, notify, restart }), [t, call, navigate, back, backLabel,
-    openSession, notify, restart])
+  const context = useMemo(() => ({ t, call, navigate, back, backLabel, openSession, notify, restart, trackDraft }), [t, call, navigate, back, backLabel,
+    openSession, notify, restart, trackDraft])
   const data = useMemo(() => ({ state, error, reload, setup: state?.setup, running: state?.load.running ?? 0, restarts }), [state, error,
     reload, restarts])
-  return <Panel.Provider value={context}><PanelState.Provider value={data}>
+  return <Panel.Provider value={context}><PanelState.Provider value={data}><PortalRoot.Provider value={portalRoot}>
     <style>{STYLES}</style>
     {children}
     {toast && <Toast key={toast.id} text={toast.text} onDone={() => setToast(undefined)} />}
-  </PanelState.Provider></Panel.Provider>
+  </PortalRoot.Provider></PanelState.Provider></Panel.Provider>
 }

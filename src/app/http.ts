@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
+import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams, type WorkerCapabilitiesView } from './api.ts'
 import { sourceSkills } from './context.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
@@ -28,6 +28,7 @@ import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import type { GithubConnection } from './github-connection.ts'
+import type { MachineSettings } from './machine-settings.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -42,6 +43,12 @@ export interface HttpHost {
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
+  /** Present for organizations whose machine limits are managed in this runtime's own Store. */
+  readonly machineSettings?: Pick<MachineSettings, 'view' | 'save'>
+  readonly workerCapabilities?: {
+    read(): Promise<WorkerCapabilitiesView>
+    save(input: { revision: number; tools: string[]; skills: string[] }): Promise<WorkerCapabilitiesView>
+  }
   readonly masterId: string
   /** Resolves once startup finishes or setup determines what is still missing. */
   readonly ready: Promise<void>
@@ -99,8 +106,8 @@ function machineView({ stateDir, promptMaxChars, admissionContextMaxPages, admis
 function setupView(runtime: HttpHost) {
   const resolved = runtime.configured() ? runtime.deployment : undefined
   return {
-    machine: machineView(runtime.machine), problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
-    accounts: resolved ? { repository: resolved.repository, agent: resolved.github.login, feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
+    machine: machineView(runtime.machine), machineApi: !!runtime.machineSettings, problem: runtime.setupProblem ?? null, feishuProblem: runtime.feishuProblem ?? null,
+    accounts: resolved ? { repository: resolved.repository, agent: resolved.github?.login ?? '', feishu: resolved.feishu ? { appId: resolved.feishu.appId, brand: resolved.feishu.brand, botId: resolved.feishu.botId, name: resolved.feishu.name } : null } : null,
   }
 }
 /** Build the `/orchestrator/api/state` response consumed by the management panel and `scripts/dsh-superagent status` (`docs/006-deployment.md`). */
@@ -177,6 +184,29 @@ function routes(runtime: HttpHost): Routes {
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
     'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
     'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
+    'GET configuration-migrations': () => ({ items: [] }),
+    'GET deployment': () => {
+      if (!runtime.machineSettings) throw new RouteError(404, 'Machine settings are managed by the DSH configuration page')
+      return runtime.machineSettings.view()
+    },
+    'PUT deployment': async ({ body }) => {
+      if (!runtime.machineSettings) throw new RouteError(404, 'Machine settings are managed by the DSH configuration page')
+      const request = z.object({ revision: z.number().int().nonnegative(), values: z.unknown() }).strict().parse(await body())
+      return runtime.machineSettings.save(request.values, request.revision)
+    },
+    'GET worker-capabilities': () => {
+      if (!runtime.workerCapabilities) throw new RouteError(404, 'Organization Worker capabilities are unavailable')
+      return runtime.workerCapabilities.read()
+    },
+    'PUT worker-capabilities': async ({ body }) => {
+      if (!runtime.workerCapabilities) throw new RouteError(404, 'Organization Worker capabilities are unavailable')
+      const input = z.object({ revision: z.number().int().nonnegative(), tools: z.array(z.string()), skills: z.array(z.string()) }).strict()
+        .parse(await body())
+      return runtime.workerCapabilities.save(input)
+    },
+    'POST worker-capabilities/application': () => {
+      throw new RouteError(404, 'Worker capability application is managed by the organization settings service')
+    },
     'GET github/connection': () => connection(() => github().read()),
     'POST github/connection': async ({ body }) => {
       const input = GithubConnectionRequest.parse(await body(20 * 1024))
@@ -253,6 +283,37 @@ function match(table: Routes, method: string, segments: string[]) {
     return { run: run as (input: Input<keyof Api>) => unknown, params }
   }
   return undefined
+}
+export interface ManagementRequest { method: string; path: string; body?: unknown }
+export interface ManagementResponse { status: number; body: unknown }
+/**
+ * Runs the same management operations over an authenticated internal transport.
+ * Authentication and organization ownership belong to the outer transport; validation, limits,
+ * revision conflicts and all business effects remain identical to the original HTTP routes.
+ */
+export function managementApi(runtime: HttpHost): (request: ManagementRequest) => Promise<ManagementResponse> {
+  const table = routes(runtime)
+  return async request => {
+    try {
+      if (!request || typeof request.path !== 'string' || typeof request.method !== 'string'
+        || request.path.startsWith('/') || request.path.includes('#') || request.path.includes('://')) {
+        throw new RouteError(400, 'Invalid management operation')
+      }
+      const separator = request.path.indexOf('?')
+      const path = separator < 0 ? request.path : request.path.slice(0, separator)
+      const query = Object.fromEntries(new URLSearchParams(separator < 0 ? '' : request.path.slice(separator + 1)))
+      const route = match(table, request.method, path.split('/'))
+      if (!route) throw new RouteError(404, 'Unknown operation')
+      await runtime.ready
+      const result = await route.run({ params: route.params as never, query, body: async (maxBytes = 128 * 1024) => {
+        const serialized = JSON.stringify(request.body)
+        if (serialized === undefined) throw new RouteError(400, 'The request body is not JSON')
+        if (Buffer.byteLength(serialized) > maxBytes) throw new RouteError(400, `Request exceeds ${maxBytes} bytes`)
+        return JSON.parse(serialized) as unknown
+      } })
+      return { status: 200, body: result }
+    } catch (error) { const [status, body] = failure(error); return { status, body } }
+  }
 }
 export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
   if (ctx.webServer.host !== '127.0.0.1') throw new Error('Orchestrator management requires a loopback Web server')

@@ -11,8 +11,9 @@ function trigger(id: string, overrides: Partial<Trigger> = {}): Trigger {
 interface Hooks {
   emit?: (event: { type: string; data: Record<string, unknown> }) => void
   prepareTicket?: EngineOptions['prepareTicket']
+  admission?: EngineOptions['admission']
 }
-function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }: Hooks = {}) {
+function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket, admission }: Hooks = {}) {
   const repo = new MemoryRepositories()
   const outbox: OutboundMessage[] = []
   const withdrawn: string[] = []
@@ -41,6 +42,7 @@ function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }:
     withdraw: id => { withdrawn.push(id) },
   }
   const engine = new Engine({ repo, scope, policy: () => policy, assessor, executor, outbox: queued,
+    ...admission ? { admission } : {},
     ...emit ? { emit } : {}, ...prepareTicket ? { prepareTicket } : {}, now: () => new Date(Date.UTC(2026, 8, 23, 0, 0, clock)).toISOString() })
   /** Simulate the executor starting queued assignments (unless `launch` is false) and delivering pending ticket inputs. */
   function settle({ launch = true } = {}) {
@@ -70,6 +72,71 @@ function accepted(h: ReturnType<typeof harness>, id = '1', thread = 't1') {
   h.settle()
   return decision
 }
+
+describe('maintenance admission', () => {
+  it('cancels only the exact queued input or current assessment and preserves other queued work', () => {
+    const h = harness()
+    h.engine.receive(trigger('1')); h.engine.receive(trigger('2'))
+    expect(h.engine.cancelAssessment('1', 'Confirmed capability maintenance')).toBe(true)
+    expect(h.repo.threads.active()[0]?.pending).toEqual(['2'])
+    h.pump()
+    const original = h.requests[0]!.evalId
+    h.engine.candidateDelivered(original); h.tick(61); h.pump()
+    expect(h.engine.cancelAssessment('2', 'Stale confirmation', original)).toBe(false)
+    expect(h.engine.candidate('2')?.evalId).toBe(h.requests[1]!.evalId)
+    expect(h.engine.cancelAssessment('2', 'Current confirmed assessment', h.requests[1]!.evalId)).toBe(true)
+    expect(h.engine.candidate('2')).toBeUndefined()
+    expect(h.repo.tickets.list()).toHaveLength(0)
+  })
+
+  it('keeps the active assessment identity and deadline through a forced-stop freeze', () => {
+    let frozen = false
+    const h = harness({}, { admission: { evaluate: () => !frozen, resume: () => !frozen, frozen: () => frozen } })
+    h.engine.receive(trigger('1')); h.pump()
+    const evaluation = h.requests[0]!.evalId
+    h.engine.candidateDelivered(evaluation)
+    frozen = true; h.pump(); h.tick(120); h.pump()
+    expect(h.engine.candidate('1')?.evalId).toBe(evaluation)
+    expect(h.requests).toHaveLength(1)
+    frozen = false; h.pump()
+    expect(h.engine.candidate('1')?.evalId).toBe(evaluation)
+    h.tick(61); h.pump()
+    expect(h.requests).toHaveLength(2)
+  })
+
+  it('retries an admitted assessment without mixing later held inputs from the same Thread', () => {
+    let held = false
+    const h = harness({}, { admission: { evaluate: item => !held || item.id === '1', resume: () => !held } })
+    h.engine.receive(trigger('1')); h.pump()
+    h.engine.candidateDelivered(h.requests[0]!.evalId)
+    held = true
+    h.engine.receive(trigger('2')); h.tick(61); h.pump()
+    expect(h.requests).toHaveLength(2)
+    expect(h.requests[1]!.triggers.map(item => item.id)).toEqual(['1'])
+    expect(h.repo.threads.active()[0]?.pending).toEqual(['2'])
+    expect(() => h.engine.decide('2', { kind: 'accept', title: 'Not admitted', scope: 'bounded', reason: 'requested' })).toThrow('admission is held')
+    expect(h.repo.tickets.list()).toHaveLength(0)
+    h.decide(h.requests[1]!, { kind: 'ignore', reason: 'Finished original assessment' })
+    h.pump(); expect(h.requests).toHaveLength(2)
+    held = false; h.pump()
+    expect(h.requests[2]!.triggers.map(item => item.id)).toEqual(['2'])
+  })
+
+  it('stores follow-up input for an ended Ticket and resumes it only after admission is released', () => {
+    let held = false
+    const h = harness({}, { admission: { evaluate: () => !held, resume: () => !held } })
+    const decision = accepted(h), id = decision.ticketId!
+    h.engine.report(id, { state: 'ready', summary: 'Finished original task' })
+    held = true; h.engine.receive(trigger('2')); h.pump()
+    expect(h.repo.tickets.get(id)?.ended?.outcome).toBe('completed')
+    expect(h.repo.tickets.get(id)?.assignments).toHaveLength(1)
+    expect(h.repo.tickets.get(id)?.undelivered).toHaveLength(1)
+    held = false; h.pump()
+    expect(h.repo.tickets.get(id)?.ended).toBeUndefined()
+    expect(h.repo.tickets.get(id)?.assignments).toHaveLength(2)
+    expect(h.repo.tickets.get(id)?.undelivered).toHaveLength(0)
+  })
+})
 
 describe('intake', () => {
   it('stores a trigger once and records source filtering', () => {

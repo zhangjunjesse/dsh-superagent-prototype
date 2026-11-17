@@ -2,11 +2,14 @@
  * Context-free UI primitives styled with `--dsw-alias-*` tokens.
  * Mirrors DSH ui-primitives markup and keyboard behavior without coupling to its internal package API.
  */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type KeyboardEvent,
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type KeyboardEvent,
   type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 
 const cx = (...names: (string | false | undefined)[]) => names.filter(Boolean).join(' ')
+/** Keep modal, tooltip and toast theme tokens inside a standalone organization mount. */
+export const PortalRoot = createContext<HTMLElement | undefined>(undefined)
+export const usePortalRoot = () => useContext(PortalRoot) ?? document.body
 
 const ICON_PATHS = {
   'chevron-left': 'M15 5l-7 7 7 7',
@@ -184,6 +187,7 @@ export function Modal({ open, onClose, title, closeLabel, description, footer, c
   open: boolean; onClose: () => void; title: string; closeLabel: string; description?: string; footer?: ReactNode; className?: string
   children?: ReactNode
 }) {
+  const portalRoot = usePortalRoot()
   const dialog = useRef<HTMLDivElement>(null)
   // Keep `onClose` in a ref so parent re-renders (e.g., background polls) do not re-run the effect and reset focus.
   const close = useRef(onClose)
@@ -211,11 +215,12 @@ export function Modal({ open, onClose, title, closeLabel, description, footer, c
       {children !== undefined && <div className="dt-modal-body">{children}</div>}
       {footer !== undefined && <div className="dt-modal-footer">{footer}</div>}
     </div>
-  </div>, document.body)
+  </div>, portalRoot)
 }
 
 /** Portaled tooltip trigger supporting hover, keyboard focus, and touch toggle. */
 export function InfoTip({ text, icon = 'question', warn }: { text: string; icon?: IconName; warn?: boolean }) {
+  const portalRoot = usePortalRoot()
   const anchor = useRef<HTMLButtonElement>(null)
   const bubble = useRef<HTMLSpanElement>(null)
   const [open, setOpen] = useState(false)
@@ -245,6 +250,6 @@ export function InfoTip({ text, icon = 'question', warn }: { text: string; icon?
       <Icon name={icon} size={14} />
     </button>
     {open && createPortal(<span ref={bubble} role="tooltip" className="dt-tooltip" style={{ visibility: 'hidden' }}>{text}</span>,
-      document.body)}
+      portalRoot)}
   </>
 }

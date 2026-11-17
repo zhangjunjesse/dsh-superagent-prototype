@@ -14,6 +14,8 @@ import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, Source
   TriggerRow } from '../../src/client/api.ts'
 import { SETUP_FIELDS } from '../../src/deployment.ts'
 import { absolutePathPattern } from '../../src/infra/host-paths.ts'
+import { MachineValuesSchema } from '../../src/app/machine-settings.ts'
+import { effectiveWorkerTools } from '../../src/process-runtime/worker-capabilities.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema } from '../../src/policy.ts'
 import { SetupError, type SetupCode } from '../../src/setup.ts'
 import { feishuChannel } from '../../src/sources/feishu-trigger.ts'
@@ -94,6 +96,9 @@ export interface PanelServer {
   joinError?: string
   settings: Settings; revisions: Record<string, number>
   prompts: PromptsView
+  promptVersions: Record<number, PromptsView['current']>
+  configurationMigrations: ApiResponse<'GET configuration-migrations'>['items']
+  migrationError?: string
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
@@ -104,6 +109,11 @@ export interface PanelServer {
   queued: Set<string>
   searching?: (query: string) => Promise<void>
   setup: SetupView
+  deployment: ApiResponse<'GET deployment'>
+  workerCapabilities: ApiResponse<'GET worker-capabilities'>
+  capabilitiesRunning?: boolean
+  capabilitiesSaveError?: string
+  capabilitiesActionError?: { status: 400 | 404 | 409 | 500; message: string }
   health: Record<string, Health>
   /** When true, all API requests return an empty 404 to simulate the host plugin being stopped. */
   down: boolean
@@ -262,10 +272,19 @@ function initial(): PanelServer {
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
     health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
-    setup: { machine: MACHINE, problem: null, feishuProblem: null,
+    setup: { machine: MACHINE, machineApi: false, problem: null, feishuProblem: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
     settings, revisions: { policy: 3, eval: 1, executor: 0 },
+    deployment: { revision: 0, values: {}, defaults: { promptMaxChars: 100000, admissionContextMaxPages: 10,
+      admissionContextTimeoutMs: 15000 }, effective: { promptMaxChars: 100000, admissionContextMaxPages: 10,
+      admissionContextTimeoutMs: 15000 }, writable: true, effect: 'next-use' },
+    workerCapabilities: { revision: 4, tools: ['read', 'glob', 'grep'], skills: ['review-code'],
+      applied: { tools: ['read', 'glob', 'grep'], skills: ['review-code'] }, effective: effectiveWorkerTools(['read', 'glob', 'grep']), catalog: { complete: true,
+      tools: [{ name: 'read', label: '读取文件', group: '文件', available: true }, { name: 'glob', label: '查找文件', group: '文件', available: true },
+        { name: 'grep', label: '搜索内容', group: '文件', available: true }, { name: 'write', label: '写入文件', group: '文件', available: true }],
+      skills: [{ name: 'review-code', description: 'Review code and report findings' }] } },
+    promptVersions: {}, configurationMigrations: [],
     prompts: { masterId: 'master', sections: TEAM_SECTIONS, skillName: SKILL_NAME.source, builtin: ['feishu', 'github'],
       skillPrefix: SKILL_PREFIX, revision: 0, current: { ...defaults, config: defaultPrompts() },
       defaults: defaultPrompts(), parts: Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) })),
@@ -314,6 +333,61 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   } },
   'GET sources': { answer: sourceStatuses },
   'GET settings': { answer: settingsView },
+  'GET configuration-migrations': { answer: () => server.migrationError ? refuse(500, server.migrationError)
+    : { items: server.configurationMigrations } },
+  'GET deployment': { answer: () => server.deployment },
+  'PUT deployment': { body: true, answer: ({ body }) => {
+    if (body.revision !== server.deployment.revision) return refuse(409, 'Machine settings changed. Reload before saving.')
+    if (!server.deployment.writable) return refuse(400, 'Machine settings are read-only')
+    const parsed = MachineValuesSchema.safeParse(body.values)
+    if (!parsed.success) return refuse(400, 'Invalid machine settings', { issues: parsed.error.issues.map(issue => ({
+      path: issue.path.join('.'), message: issue.message })) })
+    server.deployment = { ...server.deployment, values: parsed.data, revision: body.revision + 1,
+      effective: { ...server.deployment.defaults, ...parsed.data } }
+    return server.deployment
+  } },
+  'GET worker-capabilities': { answer: () => server.workerCapabilities },
+  'PUT worker-capabilities': { body: true, answer: ({ body }) => {
+    if (body.revision !== server.workerCapabilities.revision) return refuse(409, 'Organization settings changed. Reload before saving.')
+    if (['waiting', 'applying', 'failed'].includes(server.workerCapabilities.application?.state ?? '')) return refuse(409, 'Cancel the pending application before editing.')
+    if (server.capabilitiesSaveError) return refuse(400, server.capabilitiesSaveError)
+    const parsed = z.object({ tools: z.array(z.string()).max(40), skills: z.array(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)).max(40),
+    }).strict().safeParse({ tools: body.tools, skills: body.skills })
+    if (!parsed.success) return refuse(400, 'Invalid Worker capabilities')
+    const { tools, skills } = parsed.data, before = server.workerCapabilities
+    if (tools.some(name => !before.tools.includes(name) && !before.catalog.tools.some(tool => tool.name === name && tool.available))
+      || skills.some(name => !before.skills.includes(name) && !before.catalog.skills.some(skill => skill.name === name))) {
+      return refuse(400, 'Worker capability is unavailable')
+    }
+    const revision = before.revision + 1
+    server.workerCapabilities = { ...before, revision, tools: [...new Set(tools)], skills: [...new Set(skills)],
+      ...server.capabilitiesRunning ? {} : { applied: { tools, skills }, effective: effectiveWorkerTools(tools) },
+      application: { id: `capabilities-${revision}`, state: server.capabilitiesRunning ? 'waiting' : 'applied',
+        savedAt: '2026-11-17T01:00:00Z', canCancel: !!server.capabilitiesRunning, canRetry: false,
+        canApplyNow: !!server.capabilitiesRunning, confirmation: `confirmation-${revision}`,
+        affected: [{ instanceId: 'root', name: '产品组织', running: !!server.capabilitiesRunning, busy: !!server.capabilitiesRunning,
+          work: server.capabilitiesRunning ? [{ id: 't1', title: '修复回归', kind: 'ticket', status: 'working' }] : [] }] } }
+    return server.workerCapabilities
+  } },
+  'POST worker-capabilities/application': { body: true, answer: ({ body }) => {
+    const before = server.workerCapabilities, application = before.application
+    if (server.capabilitiesActionError) return refuse(server.capabilitiesActionError.status, server.capabilitiesActionError.message)
+    if (body.revision !== before.revision || body.applicationId !== application?.id) return refuse(409, 'Saved settings changed. Review again.')
+    const allowed = body.action === 'cancel' ? application.canCancel : body.action === 'retry' ? application.canRetry : application.canApplyNow
+    if (!allowed || body.action === 'apply-now' && body.confirmation !== application.confirmation) return refuse(409, 'Affected work changed. Review again.')
+    if (body.action === 'cancel') {
+      server.workerCapabilities = { ...before, ...before.applied, revision: before.revision + 1,
+        application: { ...application, state: 'cancelled', canCancel: false, canRetry: false, canApplyNow: false } }
+    } else {
+      const waiting = body.action === 'retry' && !!server.capabilitiesRunning
+      server.workerCapabilities = { ...before, revision: before.revision + 1,
+        ...waiting ? {} : { applied: { tools: before.tools, skills: before.skills }, effective: effectiveWorkerTools(before.tools) },
+        application: { ...application, state: waiting ? 'waiting' : 'applied', error: undefined,
+          canCancel: waiting, canRetry: false, canApplyNow: waiting,
+          ...waiting ? {} : { appliedAt: '2026-11-17T01:02:00Z' } } }
+    }
+    return server.workerCapabilities
+  } },
   'GET github/connection': { answer: githubConnectionView },
   'POST github/connection': { body: true, answer: ({ body }) => {
     if (server.githubConnect) return server.githubConnect(body)
@@ -400,7 +474,15 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
-  'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
+  'GET prompts': { query: ['revision', 'offset'], answer: ({ query }) => {
+    const revision = query.revision === undefined ? undefined : Number(query.revision)
+    if (revision !== undefined && revision !== server.prompts.current.revision) {
+      const current = server.promptVersions[revision]
+      if (!current) return refuse(404, 'Prompt revision not found')
+      return { ...server.prompts, current }
+    }
+    return server.prompts
+  } },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts
     if (body.baseRevision !== revision) return refuse(409,
@@ -412,8 +494,11 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
       const missing = (builtInPart(part)?.placeholders ?? []).filter(placeholder => !override.text.includes(placeholder))
       if (missing.length) return refuse(400, 'refused', { code: 'promptPlaceholders', values: { part, placeholders: missing.join(', ') } })
     }
+    server.promptVersions[revision] = structuredClone(server.prompts.current)
     server.prompts.revision++
     server.prompts.current = promptVersion(server.prompts.revision, Object.keys(overrides).length ? { ...config, overrides } : config)
+    server.promptVersions[server.prompts.revision] = structuredClone(server.prompts.current)
+    server.prompts.revisions.unshift({ ...server.prompts.current, changed: Object.keys(body.config) })
     return { revision: server.prompts.revision, context_delivery: 'injected' }
   } },
   'POST prompts/preview': { body: true, answer: ({ body }) => {
@@ -464,7 +549,7 @@ export function usePanelServer(cleanup: () => void) {
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
       if (server.down) return new Response(null, { status: 404 })
       const address = new URL(url, 'http://127.0.0.1:3082')
-      const path = address.pathname.replace('/orchestrator/api/', '')
+      const path = address.pathname.replace(/^(?:\/orchestrator\/api|\/jarvis\/api\/system\/instances\/[a-z][a-z0-9-]*\/superagent)\//, '')
       const method = init?.method ?? 'GET'
       const body: unknown = init?.body ? JSON.parse(String(init.body)) : undefined
       server.requests.push({ path: decodeURIComponent(`${path}${address.search}`), method, ...body === undefined ? {} : { body } })

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store } from '../store.mjs';
@@ -107,12 +107,52 @@ test('high-level tools use only the current persisted human turn and retain dura
   assert.equal((await submit.execute({ operation: 'new' }, {})).status, 'denied');
 });
 
+test('daily native conversation awaits organization task RPC and retains its authoritative receipt', async t => {
+  const h = await notificationHarness(t);
+  const calls = [];
+  h.runtime.gateway.connectOrganization({ async gateway(owner, input) {
+    calls.push({ owner, input });
+    if (input.operation === 'events') return { items: [], nextCursor: input.cursor, works: [], questionStates: [] };
+    if (input.operation === 'query') return { workRef: 'JW-root-task', status: 'completed', artifacts: [{ title: 'Verified task page',
+      url: '/jarvis/api/system/root/artifacts/task-1/index.html', downloadUrl: '/jarvis/api/system/root/artifacts/task-1/index.html?download=1' }] };
+    await Promise.resolve();
+    return { status: 'queued', commandId: 'real-root-command', workRef: 'JW-root-task', receivedAt: '2026-11-16T00:00:00Z' };
+  } }, join(h.directory, 'organization-gateway.sqlite'));
+  clearInterval(h.runtime.gateway.timer); h.runtime.gateway.timer = undefined;
+  h.setResponder(async ({ tools }) => {
+    const result = await tools.get('jarvis_work_submit').execute({ operation: 'new', request: { quote: 'Read marker only', summary: 'Read marker' } }, {});
+    assert.equal(result.status, 'queued'); return 'Task received';
+  });
+  await h.runtime.chat({ id: 'daily-rpc-user', text: 'Read marker only' }, () => {}, new AbortController().signal);
+  const turn = h.runtime.store.turn('daily-rpc-user');
+  assert.equal(turn.gatewayReceipts[0].commandId, 'real-root-command');
+  assert.equal(turn.assistant, 'Task received');
+  const submission = calls.find(call => call.input.operation === 'submit');
+  assert.equal(submission.owner, 'root'); assert.equal(submission.input.origin.userMessageId, 'daily-rpc-user');
+  assert.equal(submission.input.origin.conversationId, h.runtime.store.sessionBinding().conversationId);
+  await h.runtime.gateway.query({ operation: 'get', workRef: 'JW-root-task' });
+  assert.equal((await h.runtime.state()).turns.find(turn => turn.id === 'daily-rpc-user').artifacts[0].title, 'Verified task page');
+});
+
+test('an unreadable organization journal keeps native history and refuses an unsafe clear', async t => {
+  const h = await notificationHarness(t);
+  await h.runtime.chat({ id: 'history-before-unavailable-journal', text: 'Keep this actual native conversation.' }, () => {}, new AbortController().signal);
+  const binding = h.runtime.store.sessionBinding(), file = join(h.directory, 'unreadable-organization.sqlite');
+  writeFileSync(file, 'This is not a SQLite database');
+  h.runtime.gateway.connectOrganization(undefined, file);
+  assert.equal((await h.runtime.gateway.query({ operation: 'search' })).status, 'unavailable');
+  await assert.rejects(h.runtime.clear(), error => error.status === 409);
+  assert.equal(h.runtime.store.sessionBinding().dshSessionId, binding.dshSessionId);
+  assert.equal(h.runtime.store.sessionBinding().generation, binding.generation);
+  assert.equal(h.runtime.store.turn('history-before-unavailable-journal').assistant, '已收到');
+});
+
 test('without Gateway capability ordinary chat stays available and no task is claimed', async t => {
   const h = harness(t); await h.runtime.ready();
   await h.runtime.chat({ id: 'plain-user-1', text: '你好' }, () => {}, new AbortController().signal);
   assert.equal(h.runtime.store.turn('plain-user-1').assistant, '已收到');
   assert.equal((await h.runtime.state()).gateway, false);
-  assert.deepEqual([...h.registrations.get(h.runtime.agent.id).keys()], []);
+  assert.deepEqual([...h.registrations.get(h.runtime.agent.id).keys()], ['current_time', 'calculate']);
 });
 
 test('legacy Session setting imports once without deleting existing chat, binding remains authoritative', t => {
@@ -198,15 +238,15 @@ test('native input producer and RPC identity both bind human authorization', () 
 test('Gateway late mount and unload refresh local tools; disabling them never restricts a global tool', async t => {
   const h = harness(t, { dynamic: true }); await h.runtime.ready();
   const tools = h.registrations.get(h.runtime.agent.id);
-  assert.equal(tools.size, 0);
+  assert.deepEqual([...tools.keys()], ['current_time', 'calculate']);
   h.ctx.tools.get = name => tools.get(name);
-  h.runtime.agent.ctx.tools.restrict = () => { throw new Error('Own tools are not global tools'); };
+  h.runtime.agent.ctx.tools.restrict = filter => { assert.deepEqual(filter, { allow: [] }, 'own tools are never named in inherited restrictions'); return () => {}; };
   h.setService({ submit: () => ({ status: 'queued' }), query: () => ({}) });
-  assert.equal(tools.size, 2); assert.equal((await h.runtime.state()).gateway, true);
+  assert.equal(tools.size, 4); assert.equal((await h.runtime.state()).gateway, true);
   h.runtime.saveTool({ revision: h.runtime.policy.revision, name: 'jarvis_work_submit', allowed: false });
   assert.match(h.guards.at(-1)({ name: 'jarvis_work_submit' }), /关闭/);
   h.setService(undefined);
-  assert.equal(tools.size, 0); assert.equal((await h.runtime.state()).gateway, false);
+  assert.deepEqual([...tools.keys()], ['current_time', 'calculate']); assert.equal((await h.runtime.state()).gateway, false);
   await h.runtime.chat({ id: 'late-unmount-user', text: '继续聊天' }, () => {}, new AbortController().signal);
   assert.equal(h.runtime.store.turn('late-unmount-user').assistant, '已收到');
 });
@@ -408,7 +448,7 @@ test('unloading Gateway stops its proved native expression without writing the u
   const draining = h.runtime.gateway.kick(); await sent.promise;
   unloaded = true; h.setService(undefined); await draining;
   assert.equal(cancelled, true); assert.equal(agent.status, 'idle'); assert.equal(writesAfterUnload, 0);
-  assert.equal(h.registrations.get(agent.id).size, 0);
+  assert.deepEqual([...h.registrations.get(agent.id).keys()], ['current_time', 'calculate']);
   await h.runtime.chat({ id: 'after-live-gateway-unload', text: '继续对话' }, () => {}, new AbortController().signal);
   assert.equal(h.runtime.store.turn('after-live-gateway-unload').assistant, '已收到');
 });

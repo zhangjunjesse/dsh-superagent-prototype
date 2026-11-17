@@ -18,7 +18,9 @@ import type { Sessions } from './sessions.ts'
 import type { Settings } from './settings.ts'
 import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
+import type { SessionNativePort } from './runtime-ports.ts'
 import type { TextCache } from './cache.ts'
+import { delegationTaskContext } from '../sources/delegation-context.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
@@ -52,6 +54,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
+  { name: 'delegation/<trigger-id>/source', holds: 'the fixed parent task\'s complete original source text; material does not expand the parent accepted scope', executor: true },
+  { name: 'delegation/<trigger-id>/assignment', holds: 'the fixed parent task\'s original execution assignment and its authorization constraints', executor: true },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
@@ -63,6 +67,7 @@ export interface ResourceHost {
   readonly commands: Commands
   readonly masterId: string
   readonly context: Context
+  readonly native?: Pick<SessionNativePort, 'inspect' | 'modelCatalog'>
   promptVersion(sessionId: string): PromptVersion
   /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
   mayRead(sessionId: string, revision: number): boolean
@@ -112,6 +117,7 @@ const THREAD_DECISIONS = 5
 const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trigger.actor.id, human: trigger.human, at: trigger.at,
   preview: preview(trigger.text), chars: trigger.text.length, read: `trigger/${trigger.id}` })
 async function transcript(host: ResourceHost, ticketId: string) {
+  if (host.native) return host.native.inspect(workerSessionId(ticketId))
   return (await host.context.sessionController.inspect(workerSessionId(ticketId) as SessionId)).events
 }
 
@@ -189,13 +195,14 @@ const ROUTES: readonly Route[] = [
     return text(read, body)
   }],
   ['models', async read => {
-    const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
+    const host = main(read), catalog = await (host.native ? host.native.modelCatalog() : host.context.sessionController.modelCatalog()), settings = host.store.settings()
     const roles = { orchestrator: settings.eval.model, worker: settings.executor.model }
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })) }
   }],
   ['models/', async read => {
-    const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
+    const host = main(read)
+    const models = (await (host.native ? host.native.modelCatalog() : host.context.sessionController.modelCatalog())).groups.find(group => group.id === read.rest)?.models
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
   }],
@@ -207,6 +214,13 @@ const ROUTES: readonly Route[] = [
     return sourcePage(read, 'feishu', () => feishuRead(commands, ref, read.resource, read.host.feishuPageSize()))
   }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
+  ['delegation/', read => {
+    const [id, section, ...more] = read.rest.split('/')
+    if (!id || more.length || !['source', 'assignment'].includes(section ?? '')) throw new Error('Unknown delegation context resource')
+    const context = delegationTaskContext(trigger(read.host, id, read.ticketId))
+    if (!context) throw new Error('This trigger has no verified delegated parent context')
+    return { parent_scope: context.scope, parent_strength: context.strength, ...text(read, section === 'source' ? context.source.text : context.assignment) }
+  }],
   ['trigger/', async read => {
     const { host, rest, ticketId, offset, signal } = read
     if (!rest || rest.includes('/')) throw new Error('Unknown context resource')

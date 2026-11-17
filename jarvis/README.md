@@ -6,6 +6,95 @@ DSH 插件版支持真实设置、对话、工具管理，以及通过 `jarvis_w
 
 原 4317 独立服务及记录保留。下文的启动、模型协议和能力限制均针对该独立服务；DSH 插件的设置、会话持久化与 Gateway 语义见上述接入记录，不能将两套运行方式混用。
 
+## SuperJarvis 独立进程
+
+2026-11-15 最新发布：系统管理已连接真实运行服务，实例配置新增独立的“Worker 设置”，集中模型、工具、技能和并发；下级委派单独配置。Worker 工具由真实宿主能力目录提供，技能在执行前加载，旧配置不会自动获得新增工具。4318 已完成发布及浏览器验收，原聊天与记录保留；下文早期“尚未连接／只读”的阶段描述以 [Worker 设置实施记录](../docs/superjarvis-worker-settings-progress.md) 和 [系统管理实施记录](../docs/superjarvis-system-management-progress.md) 为准。
+
+新增可选入口 `dsh-superagent/process-runtime`：一个 DSH 宿主承载多个独立 SuperJarvis 业务进程，模型与原生工具仍由 DSH 执行，每实例独立保存用户轮次、Gateway 和 superagent 状态。模块默认不启用，不改变 4318 当前会话或运行路径。
+
+已接通新任务交办、查询、只读 Worker，以及共享宿主下的单跳父子委派、追加、回答、停止和回传。提供实例启停、重启及状态服务；系统管理页尚未连接这些接口，组合草稿也不会自动生效。正常重启保留已完成状态；未知执行会隔离相关 Session，当前尚无解除隔离的恢复 API／界面。架构与首阶段验收见 [进程边界](../docs/superjarvis-process-runtime.md)、[进程实施记录](../docs/superjarvis-process-runtime-progress.md)；新增委派的配置、权限边界和验证见 [单跳委派](../docs/superjarvis-delegation.md)、[委派实施记录](../docs/superjarvis-delegation-progress.md)。本轮未部署用户宿主。
+
+## SuperJarvis 组合管理界面
+
+2026-11-15 普通 Worker 模型纠正：撤销手工维护多个 Worker 组的设计。每实例自动显示一处普通 Worker 执行能力，容量直接读取该实例，配置按钮进入实例“任务与委派”。旧组记录保留但不再展示或参与并发；多个下级 SuperJarvis 虚拟入口继续保留。
+
+Node 24 组合/路由/设置 **43/43**、共享界面 **3/3** 通过；独立审查 6 组交互核查通过。最终仅将层间距由 44px 调为 40px，以容纳各实例自动出现的普通 Worker；真实 DSH 1920×919 下画布 1640×804，无画布或整页溢出，1280×720 仅画布内部滚动。浏览器验证了配置归属、质量保障实例并发修改和刷新恢复，其他实例容量不变；测试使用独立标签页，已关闭且视口已恢复，页面错误日志为空。真实运行服务未接入。
+
+最终静态发布：`.artifacts/composition-demo/frontend-in-place-20261115-114041-774/manifest.json`，四个资源 HTTP 内容一致，宿主 PID 47496 未变。证据在 `.artifacts/composition-demo/`：`worker-model-tests.log`、`worker-model-shared-tests.log`、`worker-model-review.md`、`worker-model-browser.json`、`worker-model-wide.png`。未运行后端全量检查，本轮不修改底座或独立进程模块。
+
+历史记录（已被本次普通 Worker 模型纠正取代）：2026-11-15 Worker 入口修正：各实例空态直接显示“添加 Worker 组”，大脑旁添加／进入按钮常显，不再要求悬停发现。点击空态按钮自动归属该实例，沿用现有编辑、取消和保存流程。三组组合测试 42/42 通过，独立审查定点 3/3 通过；真实浏览器 1280×720 验证从质量保障空态进入配置、所属实例正确、取消返回不增加节点、常显按钮与单实例页无整页溢出。仍只修改当前窗口配置草稿，不调用运行服务。已静态发布到 4318，宿主 PID 47496 未变；发布备份及 HTTP 对照在 `.artifacts/composition-demo/frontend-in-place-20261115-111838-974/manifest.json`，测试、审查和截图为同目录下 `worker-entry-tests.log`、`worker-entry-review.md`、`worker-entry.png`（均位于 `.artifacts/composition-demo/`）。
+
+组合管理集成在现有贾维斯的“设置 → 系统管理”（`#settings/system`），沿用同一个设置框架与视觉变量。`public/composition.js` 向已有设置路由提供局部组件，`composition.css` 的组件样式限于 `#composition-page`；外层设置导航的布局调整仅在该页面可见时生效。切换页面不重新挂载对话，未保存的配置沿用设置页的离开保护。旧 `composition.html` 仅跳转到此入口，不再提供独立产品壳。
+
+管理对象为 SuperJarvis 实例，顶部面包屑持续标识当前位置。概览以当前实例为根，自上而下展示递归组合：每个 SuperJarvis 有一个贾维斯大脑，其下的 Worker 同层横向分支，类型为 `Agent` 或 `SuperJarvis`。Agent 在本实例内执行；SuperJarvis 类型是上级中的虚拟 Worker，向下连到目标实例的贾维斯大脑，再展开其 Worker，逐层重复。图中使用紧凑节点，不再包裹大块实例卡片；实例名称标在各自大脑上，类型和 Worker 名称直接显示，详细职责保留在提示与配置中。虚拟 Worker 从现有直属实例关系派生，不复制保存第二份节点配置。当前位置、视图导航和添加入口合为紧凑命令栏，其下全部为画布，图例与缩放控件浮在边缘。
+
+可逐支或整体展开/收起、缩放。每个实例自动显示一个“普通 Worker”能力节点，代表由 DSH 按任务分配执行会话，不是固定的一个 Worker 或可命名执行组。节点读取实例总并发；展开显示运行状态未同步，不伪造 Worker 数量。设置按钮直接进入所属实例“任务与委派”。普通 Worker 的添加、组名及独立表单已移除，新实例天然具有此能力。代理 Worker 可有多个，继续支持下级展开/收起及目标实例配置。
+
+角色识别使用图标与轮廓共同表达：脑形对应贾维斯大脑，机器人对应 DSH Agent，穿过入口的箭头对应虚拟 SuperJarvis Worker。实体节点为中性色实线卡片，虚拟节点为无阴影的虚线胶囊，副标题为“SuperJarvis · 虚拟入口”；通往下级大脑的连线同样为虚线。图例复用相同图标，不依赖紫、绿、蓝色块区分类型。虚线只表达代理关系，不代表运行、断连或禁用状态。
+
+同一实例的大脑、普通 Worker 能力和直属虚拟 Worker 由轻量轮廓圈为一组；虚拟入口属于父组，目标大脑与其 Worker 属于子组。轮廓按直属成员位置绘制，不包住递归子树。没有下级的实例仍显示普通 Worker，不再出现“尚未配置 Worker”。边界仅为视图元素。
+
+组织名称 `name` 与可选大脑名称 `brainName` 独立设置；前者用于分组、面包屑、代理及列表，后者用于大脑。根实例回退当前助手名，下级回退贾维斯；保存只影响标签页草稿，不调用 `/api/basic`。普通 Worker 展开后仍根据同层最大高度调整下级间距。实例 `concurrency` 是唯一容量值；草稿范围 1–20 保留，真实底座当前为 1–16，后续接入须统一校验。
+
+“下级实例”只列直属 SuperJarvis，可逐层进入。“普通 Worker”页展示当前实例执行能力及总并发，配置进入同一实例“任务与委派”；保存/取消回到来源视图。实例表单只有“组织与大脑、任务与委派、部署与运行”三分区。上级选择防循环，跨层级导航保护未保存内容。展开和缩放不修改持久草稿。
+
+配置按职责组织：组织与大脑包括名称、归属、职责、标签和收起的固定 ID；任务与委派包括唯一总并发、只读模型来源、资源说明及委派层数；部署与运行包括目录、启动/恢复策略或外部地址/凭据引用。来源与环境信息不伪装成不可生效的下拉选项。
+
+并发表示本实例普通 Worker 同时执行任务的总量上限，其余任务排队；不是预创建数量，也不汇总子实例容量。界面尚未接真实运行管理。标签不自动安装技能或参与派单，资源说明不授予权限。关闭继续委派时层数禁用并保存为 0，重开从 1 层开始。维护操作集中到运行状态，未接入时禁用。恢复进程不承诺重放任务，外部实例由对方维护。
+
+配置保存在当前标签页 `sessionStorage` 的 `superjarvis.composition.draft.v1`，刷新可恢复。新草稿不创建 `kind: worker`；旧组原样保留，加载不自动写回，编辑实例不删除旧组。旧组不参与拓扑、列表、命名或并发计算。最多 60 个活动实例，另兼容旧格式允许的最多 59 条遗留 Worker 记录，新增后刷新仍可恢复。初始关系不来自真实部署；界面不发 API 请求、不接收真实 Token、不改模型配置或任务数据库。运行与授权策略尚未应用。
+
+针对性验证（仓库根目录，使用项目要求的 Node 版本）：
+
+```text
+node --test --test-timeout=30000 jarvis/composition.test.mjs jarvis/composition-routing.test.mjs jarvis/composition-settings.test.mjs
+node --test --test-timeout=30000 jarvis/ui.test.mjs jarvis/capabilities.test.mjs jarvis/model-picker.test.mjs
+```
+
+行为测试使用已声明的 jsdom；路由测试直接调用 DSH 注册的处理器，并启动临时端口的独立服务，不连接当前 4318。测试结果与浏览器检查记录存于 `.artifacts/composition-demo/`，其通过不等于真实实例连接或递归任务委派通过。
+
+2026-11-14 已对当前 4318 进行静态前端发布，宿主 PID 保持 47496。由于该宿主加载的旧静态白名单不含 `composition.*`，本次发布产物将组件 JS/CSS 分别拼接到原 capabilities 资源，仅原子替换 `index.html`、`settings.js`、`capabilities.js`、`capabilities.css`；源代码仍保持独立模块。层级管理最终发布的备份、生成脚本、逐文件哈希与 HTTP 校验见 `.artifacts/composition-demo/frontend-in-place-20261114-112729-210/manifest.json` 及 `publish-in-place.ps1`。现有已加载页面需重新加载才会取得新版静态资源。
+
+层级管理专项及现有设置集成共 17 项通过（`hierarchy-tests-second.log`），静态路由/对话/工具/模型选择回归 5 项通过（`hierarchy-regression.log`），合计 22 项、无跳过。独立只读审查的 5 项补充探针通过，另一个 quota 探针前置夹具错误未执行；正式专项已覆盖写入失败恢复，不把该探针失败计为通过。审查见 `hierarchy-review.md`。
+
+本轮真实浏览器验证 `http://127.0.0.1:4318/jarvis/#settings/system`：集团中枢进入研发、面包屑返回、实例配置归属/取消返回、本地 Worker 分区；1280×720 默认概览及其卡片完整显示，390×844 表单内部滚动且保存区可见，两种尺寸均无整页溢出。临时视口已恢复。截图为 `hierarchy-development.jpg`、`hierarchy-editor-narrow.jpg`、`hierarchy-workers.jpg`，完整进度见 `hierarchy-progress.md`，均位于 `.artifacts/composition-demo/`。先前轮次的浏览器加载超时仍保留为历史记录，不再代表本轮管理页未验收。
+
+2026-11-14 后续空间优化：系统管理将现有设置导航重排为顶部横栏；编辑时用一行实例层级与操作标题、横向配置分区替代概览大标题与两层内部侧栏，表单输入字号为 16px，直属实例改为全宽行。存储格式、事件及后台边界不变。当前静态发布见 `.artifacts/composition-demo/frontend-in-place-20261114-204308-831/manifest.json`，仍只更新四个前端文件、宿主 PID 47496 未变。
+
+本次以完整 DSH 页面（包含 280px 宿主侧栏）核对空间：1920×919 下表单由 1180×475.55 增至 1584×698.61，首个输入框纵坐标由 499.03 上移至 236.39；1280×720 下宿主和内嵌页面均无整页溢出，连接配置仅在表单内滚动，保存区底部为 702px。另核对逐层进入、返回其他设置恢复原布局，以及 390×844 窄屏含未保存提示时保存区仍可见。截图、几何读数及进度见 `space-layout-progress.md`、`space-*.jpg` 和 `space-*-geometry.json`。最终组合专项 19 项及共享界面回归 3 项通过；日志索引 `space-layout-tests.md`，只读审查 `space-layout-review.md`。这些检查不等于完整键盘或屏幕阅读器验收，也不代替后端组合能力验收。
+
+2026-11-14 后续拓扑优化：概览显示当前实例的完整下级树，每个实例容器内直接列出本地 Worker，类型与名称、职责分开；无 Worker 时保留明确空态。委派项可展开/收起子树，支持 60–140% 缩放，点击 Worker 配置或在选定实例下添加 Worker，保留所属实例和未保存保护。未新增持久化字段、执行器类型或后台功能。
+
+拓扑最终静态发布为 `.artifacts/composition-demo/frontend-in-place-20261114-210234-873/manifest.json`，四个文件 HTTP 内容与发布产物一致，宿主 PID 47496 未变。组合专项 24 项、共享 UI 回归 3 项通过，详见 `topology-tests-summary.md` 及两份原始日志。真实 DSH 浏览器验证 Worker 配置归属、返回、子树收起/展开和缩放；1920×919（含宿主侧栏）下初始三层拓扑完整显示，1280×720 下无整页溢出、画布可内部滚动、底部缩放操作保持可见。临时视口与缩放已恢复。截图为 `topology-wide.jpg`、`topology-1280.jpg`，进度为 `topology-progress.md`，均在 `.artifacts/composition-demo/`。本轮未重跑完整 `pnpm check`，也未接入真实运行拓扑或递归委派。
+
+2026-11-14 用户再次纠正后的最终拓扑：在每个实例内增加一个贾维斯大脑；将直属实例呈现为所属实例内的 SuperJarvis 虚拟 Worker，与 Agent Worker 并列。箭头分别连接大脑→Worker、虚拟 Worker→下一级大脑。SVG 跟随布局与缩放更新，收起保留虚拟 Worker 入口，不再画直接实例连线。只改变设计视图与配置入口表达，存储格式、已有草稿和后端执行未改。
+
+最新静态发布为 `.artifacts/composition-demo/frontend-in-place-20261114-212104-524/manifest.json`，宿主 PID 47496 未变，四个资源 HTTP 校验一致。组合专项 27 项、共享回归 3 项通过，无跳过，日志索引 `recursive-topology-tests.md`。真实 DSH 1920×919 下三层结构完整显示、画布无溢出；1280×720 下文档无整页溢出、画布内部滚动、缩放底栏可见。浏览器已验证代理折叠后仍在父实例、代理配置进入正确子实例、返回根视图及缩放连线；未保存测试数据，视口和缩放已恢复，页面错误日志为空。截图 `recursive-topology-wide.jpg`、`recursive-topology-1280.jpg` 和进度 `recursive-topology-progress.md` 位于 `.artifacts/composition-demo/`。未运行全量检查，未新增真实代理或递归执行功能。
+
+2026-11-14 按用户网络拓扑参考改为纵向树，移除横向实例卡片和重复标题。最新发布为 `.artifacts/composition-demo/frontend-in-place-20261114-214853-615/manifest.json`，四个静态资源 HTTP 校验一致，宿主 PID 47496 未变。组合专项 28 项、共享界面回归 3 项通过，无失败或跳过；证据为 `topdown-tests.md` 及两份日志。最终 CSS 独立解析通过，浏览器验收使用发布后的文件。
+
+真实 DSH 1920×919 下，画布为 1640×804（上一版高度约 520px），占满两条紧凑导航下的主区域；默认全部展开、100% 缩放时现有节点完整显示，画布无滚动。1280×720 下文档高度等于视口，仅画布内部滚动；缩放控件可见，80% 下现有全部节点可见。已验证逐支收起/展开保留虚拟 Worker、子实例大脑配置归属、取消和面包屑返回、缩放后箭头位置。视口与缩放恢复，页面错误日志为空。截图 `topdown-wide.jpg`、`topdown-1280.jpg`，几何证据 `topdown-geometry.json`，恢复记录 `topdown-progress.md` 均位于 `.artifacts/composition-demo/`。未运行全量检查，草稿格式及递归执行后端未改。
+
+2026-11-14 角色视觉更新：最终静态发布 `.artifacts/composition-demo/frontend-in-place-20261114-220149-149/manifest.json`，四个资源 HTTP 内容校验一致，宿主 PID 47496 未变。复用既有测试：组合 28 项、共享 UI 3 项通过，无失败/跳过；未为纯展示变更增加镜像测试，独立契约审查与日志见 `role-visual-verification.md`。CSS 215 条顶层规则解析零错误。
+
+实际浏览器：1920×919 下画布仍为 1640×804、100% 时现有三层全部显示，264×80 节点与五条连线保持纵向归属；代理副标题可见宽度/内容宽度均 155px，无截断。1280×720 下文档无整体溢出，画布内部滚动，底部控件可见，元信息仍无截断。验证代理收起/展开、配置进入研发、取消与面包屑返回，未保存测试数据；视口恢复，页面 error 日志为空。证据为 `role-visual-wide.jpg`、`role-visual-1280.jpg`、`role-visual-geometry.json` 与 `role-visual-progress.md`。没有改运行配置、后端或草稿格式，未运行全量检查。
+
+2026-11-15 实例分组：最终静态发布 `.artifacts/composition-demo/frontend-in-place-20261115-084637-792/manifest.json`，四个资源 HTTP 内容一致，宿主 PID 47496 不变。真实 DSH 1920×919 下画布仍为 1640×804、默认现有组合完整显示无滚动；各框只包含直属成员，不包含下一层大脑。110% 缩放时所有分组仍满足直属成员位于框内、外组节点不在框内、标签避开脑中心连接轴；收起研发只保留父组与研发虚拟入口，展开恢复子组。1280×720 下文档无整体溢出、仅画布内部滚动，组标签无截断。截图 `instance-group-wide.jpg`、`instance-group-1280.jpg` 和几何 `instance-group-geometry.json` 位于 `.artifacts/composition-demo/`；进度与独立审查见 `instance-group-progress.md`、`instance-group-review.md`。临时视口与缩放恢复，页面 error 日志为空；未改后端或用户配置。
+
+本次分组验证：Node 24.22.1 下组合专项 30/30、共享 UI 回归 3/3 通过，均无跳过；新增分组归属、空实例、名称转义、折叠和缩放行为验证。独立审查无未解决阻断，详细命令及初轮测试夹具修正记录见上述审查文件；未运行全量 `pnpm check`。
+
+2026-11-15 Worker 执行组与独立名称：静态发布 `.artifacts/composition-demo/frontend-in-place-20261115-093730-222/manifest.json`，四资源 HTTP 校验一致、宿主 PID 47496 不变。Node 24 语法检查通过，CSS 238 条规则解析零错误。1920×919 实际 DSH 下组节点折叠 264×80、展开 264×157，画布仍 1640×804；展开后父框下沿 438px、子框上沿 452px，互不重叠。并发元信息可见宽和内容宽均为 204px。1280×720 无整页溢出、无画布横向溢出，仅画布内部纵向滚动；配置入口正确归属当前实例。
+
+独立临时标签页保存组织名“研发中心”和大脑名“智研”，对应分组／代理与脑节点分别更新，刷新后保留，其他实例未改；测试标签关闭，用户当前标签未保存测试数据。根实例表单中两名称并列可编辑，真实基本设置未写入。视口恢复、页面 error 日志为空。截图 `pool-names-wide.jpg`、`pool-names-settings.jpg`、`pool-names-1280.jpg`，几何及进度 `pool-names-geometry.json`、`pool-names-progress.md`，独立审查与测试日志索引 `pool-names-review.md` 均位于 `.artifacts/composition-demo/`。未运行全量 `pnpm check`，未接入运行计数或真实多组调度。
+
+执行组与名称最终回归：Node 24 下组合专项 35/35、共享界面 3/3 通过，无失败、取消或跳过。覆盖旧草稿与并发值保留、两个名称互不串改、刷新恢复、输入转义、未知运行状态、展开组边界与缩放重绘。独立审查无剩余阻断；初轮测试夹具修正及最终日志见 `pool-names-review.md`。
+
+2026-11-15 后续设置梳理：实例配置统一为组织与大脑／任务与委派／部署与运行，Worker 组配置收敛为基本信息／执行配置。字段职责、草稿边界与维护入口见本节前文。最终静态发布为 `.artifacts/composition-demo/frontend-in-place-20261115-100521-383/manifest.json`，四个文件 HTTP 内容核对一致，宿主 PID 47496 未变。
+
+组合、静态路由与设置集成共 42 项通过，共享界面 3 项通过，无失败或跳过；布局调整后受影响的组合/设置 40 项再次通过。最后仅将运行页不可用原因改为“运行管理尚未接入，暂不可操作”，发布语法检查及真实浏览器文字核对通过。日志索引 `settings-tests.md`，追加布局验证 `settings-layout-regression.log`，独立审查及探针 `settings-audit.md`、`settings-review-probe.log`，均位于 `.artifacts/composition-demo/`。本次未运行全量 `pnpm check`，未修改后端、真实配置或任务。
+
+浏览器验证了 730×718 当前直接入口的三个分区、固定保存区及到所属实例运行页的跳转，整页尺寸仍为 730×718；长内容只在表单内滚动。1280×720 完整 DSH 中组织/大脑表单和实例标识完整显示，保存区可见。截图 `settings-organize-final-730.jpg`、`settings-tasks-730.jpg`、`settings-embedded-1280.jpg`，几何数据 `settings-geometry.json`；临时标签页和视口已清理，未保存测试数据。一次从外层读取 iframe 文档的几何探针未获支持，改用 frame 内可见元素读数；不将该失败记为通过。真实实例部署、访问权限和启停/恢复未验收。
+
 ## 原独立服务：启动
 
 需要 Windows、Node.js 22.19+（已在本机 Node 24.22.1 验证）。运行服务不需要安装第三方依赖。
@@ -75,3 +164,27 @@ node --test jarvis/capabilities.test.mjs
 2026-11-12 工具与技能设计：相关 DOM 集成测试通过，覆盖草稿保存与恢复、筛选、依赖范围提示、未保存保护及与真实配置的隔离。实际浏览器检查了宽窄屏列表和详情页，页面无整体溢出，窄屏保存操作保持可见。
 
 上述是独立服务及初期界面的验证记录，不代替 DSH/Gateway 验收。后续已完成 Windows 完整 superagent 宿主的受控联合验收和一次真实模型只读试用；完整检查的已核实失败、真实 GitHub 专项及生产部署限制见 Gateway 实施记录。jsdom 交互通过不等于画面验证通过，完整 `pnpm check` 尚未通过。
+
+## 2026-11-15 系统运行管理
+
+现有“设置 → 系统管理”连接服务器配置与独立业务进程。配置保存、实例启动及停止是不同操作；修改受影响实例前须先停止。运行状态显示真实 PID、代次、Worker／任务计数及维护记录，不把未知状态显示为零或运行成功。
+
+管理接口复用 DSH 登录并校验同源、CSRF 及配置版本。只配置本机根实例和直属下级，使用 DSH 已有模型、read/glob/grep 及每实例 1–16 的普通 Worker 并发；不支持远程、多层递归、写工具或自动恢复。旧标签页草稿原样保留，可显式核对，不自动应用或删减。
+
+真实 DSH + deepseek-flash/max 下，父级已通过能力目录向研发子实例委派只读文件任务并收回结果；重启根实例不影响子实例，宿主重启保留配置且不自动开机。**日常“返回对话”仍走原会话／Gateway，本次没有自动迁移聊天或切换交办入口。** 实际检查、发布证据及后续边界见 [系统运行管理接入记录](../docs/superjarvis-system-management-progress.md)。
+
+## 2026-11-15 独立实例会话传输
+
+根实例已增加独立的历史分页、流式回复、精确停止和后台反馈读取接口，复用 DSH 登录、同源和 CSRF。请求绑定宿主 `runtimeId` 与进程 `generation`，旧页面不能在宿主重建后继续操作新实例。重复请求不重新执行；用户轮次没有可见回复时明确失败，已提交任务保持原关联。
+
+本阶段只补齐传输基础，**尚未切换现有日常聊天，也未部署到 4318**。旧记录、任务归属、完整设置、后台表达以及重试／清空的接入条件仍需完成。接口、实际验证和剩余范围见 [独立实例会话记录](../docs/superjarvis-conversation-progress.md)。
+
+后续已将现有模型设置接入独立 root 的真实用户请求：每轮固定模型及参数，下一轮才使用新设置，不改变 Router／Worker 模型或重启后台进程。关闭流式显示仍保存部分回复，完整超时范围不会被默认两分钟 IPC 截断。这只是模型设置衔接；旧历史、助手名称、工具策略和任务归属尚未迁移，日常入口继续保持原绑定。验证证据见上方记录的后续实施章节。
+
+## 2026-11-16 按角色设置模型
+
+贾维斯、Router 和 Worker 的模型分别设置，取消共享默认／跟随选项。根贾维斯入口连接实际日常模型页，下级贾维斯、Router 及 Worker 各自保留模型；旧配置保留原有效值，读取不会改写磁盘。已发布到 4318，角色隔离、草稿保护与真实页面验证见 [Worker 设置实施记录](../docs/superjarvis-worker-settings-progress.md)。
+
+## 2026-11-16 组织架构管理
+
+当前 DSH 设置统一进入组织架构管理，按“组织信息 / 贾维斯 / 任务路由 / Worker / 部署与运行”明确归属。根贾维斯的身份、完整模型参数与自身能力留在组织上下文，原分散入口兼容跳转；名称不再重复编辑，模型保持各角色独立，草稿与保存范围明确。已发布六个静态文件，宿主未重启。贾维斯技能配置尚未接入，Worker 技能已支持；完整行为、实际检查和回退见 [组织管理整合记录](../docs/superjarvis-worker-settings-progress.md)。

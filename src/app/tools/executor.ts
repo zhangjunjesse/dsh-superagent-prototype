@@ -9,6 +9,7 @@ import type { Store } from '../store.ts'
 import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { ArtifactSchema } from '../../process-runtime/task-files.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
@@ -17,6 +18,7 @@ export interface ExecutorToolsHost {
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
+  reportArtifacts?(ticketId: string, artifacts: z.infer<typeof ArtifactSchema>[]): string
   sendReplies(): Promise<void>
 }
 
@@ -79,18 +81,24 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         summary: z.string().min(1),
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
-        pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+        pr_number: z.number().int().positive().nullish().describe(host.github.configured() && host.github.deployment.github
+          ? `The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`
+          : 'A pull request in this organization\'s verified GitHub repository; unavailable until the GitHub source and account are configured. Omit for local deliverables.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+        artifacts: z.array(ArtifactSchema).max(20).optional().describe('With ready: actual files relative to this ticket\'s execution directory. The owner verifies them and generates open/download links.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
+        if (args.artifacts?.length && (args.state !== 'ready' || !host.reportArtifacts)) throw new Error('Verified local artifacts require a ready report in a task-file-enabled organization')
+        if (args.pr_number != null && (!host.github.configured() || !host.github.deployment.github)) throw new Error('This organization has no verified GitHub repository and account; a local result cannot claim a pull request')
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
-          const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+          const artifactText = args.artifacts?.length ? host.reportArtifacts!(ticketId, args.artifacts) : ''
+          const report = { state: args.state, summary: args.summary + (artifactText ? `\n\n${artifactText}` : ''), ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)

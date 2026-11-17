@@ -4,6 +4,27 @@ import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { setTimeout as delay } from 'node:timers/promises';
 
+test('verified deliverables remain openable and downloadable even when the assistant omits their links', async t => {
+  const dom = new JSDOM(readFileSync(new URL('./public/index.html',import.meta.url),'utf8'), {
+    url:'http://127.0.0.1:4318/jarvis/', runScripts:'dangerously', pretendToBeVisual:true,
+  });
+  const w=dom.window; t.after(()=>w.close());
+  const url='/jarvis/api/system/root/artifacts/ticket1/index.html';
+  w.assistantIdentity={name:'贾维斯'};
+  w.jarvis={ready:Promise.resolve(),state:{runtime:'dsh',model:{value:{endpoint:'configured'}},active:null,
+    turns:[{id:'result',role:'assistant',source:'gateway',assistant:'小游戏已完成。',status:'complete',
+      artifacts:[{title:'小游戏',url,downloadUrl:url+'?download=1'},
+        {title:'invalid',url:'javascript:alert(1)',downloadUrl:'javascript:alert(1)'}]}]},url:path=>path};
+  const script=w.document.createElement('script');script.textContent=readFileSync(new URL('./public/chat.js',import.meta.url),'utf8');w.document.body.append(script);
+  await delay(20);
+  const artifacts=w.document.querySelectorAll('.task-artifact');
+  assert.equal(artifacts.length,1);
+  const links=[...artifacts[0].querySelectorAll('a')];
+  assert.deepEqual(links.map(link=>link.getAttribute('href')),[url,url+'?download=1']);
+  assert.equal(links.every(link=>link.rel.includes('noopener')),true);
+  assert.match(artifacts[0].textContent,/小游戏/);
+});
+
 test('Gateway notifications have no fake user bubble, recover by cursor, and bind a user-selected work reference', async t => {
   const dom = new JSDOM(readFileSync(new URL('./public/index.html',import.meta.url),'utf8'),{
     url:'http://127.0.0.1:4318/jarvis/',runScripts:'dangerously',pretendToBeVisual:true,

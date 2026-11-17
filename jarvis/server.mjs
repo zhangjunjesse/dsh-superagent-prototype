@@ -8,7 +8,9 @@ import { parseName, parseModel, UserError } from './config.mjs';
 import { generate, makeRequest } from './model.mjs';
 
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
-const assets = { '/model-picker.js': ['model-picker.js', 'text/javascript'], '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/ui.css': ['ui.css', 'text/css'], '/identity.js': ['identity.js', 'text/javascript'], '/layout.js': ['layout.js', 'text/javascript'], '/settings.js': ['settings.js', 'text/javascript'], '/chat.js': ['chat.js', 'text/javascript'], '/capabilities.js': ['capabilities.js', 'text/javascript'], '/capabilities.css': ['capabilities.css', 'text/css'] };
+const assets = { '/operation-logs.js': ['operation-logs.js', 'text/javascript'], '/operation-logs.css': ['operation-logs.css', 'text/css'], '/model-picker.js': ['model-picker.js', 'text/javascript'], '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/ui.css': ['ui.css', 'text/css'], '/identity.js': ['identity.js', 'text/javascript'], '/layout.js': ['layout.js', 'text/javascript'], '/settings.js': ['settings.js', 'text/javascript'], '/chat.js': ['chat.js', 'text/javascript'], '/capabilities.js': ['capabilities.js', 'text/javascript'], '/capabilities.css': ['capabilities.css', 'text/css'], '/composition.html': ['composition.html', 'text/html'], '/composition.css': ['composition.css', 'text/css'], '/composition.js': ['composition.js', 'text/javascript'] };
+assets['/prompts.js'] = ['prompts.js', 'text/javascript'];
+assets['/prompts.css'] = ['prompts.css', 'text/css'];
 function json(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
 async function readJson(req) {
   if (!req.headers['content-type']?.startsWith('application/json')) throw new UserError('请求格式不正确', 415);

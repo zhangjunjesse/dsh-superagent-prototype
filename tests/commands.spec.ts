@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { basename } from 'node:path'
+import { basename, join } from 'node:path'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
@@ -31,6 +33,54 @@ describe('account-isolated operations', () => {
       expect(output).not.toContain('GH_TOKEN=')
     } finally { vi.unstubAllEnvs() }
   })
+  it('keeps simultaneous source streams on their own account environment and preserves literal argv', async () => {
+    vi.stubEnv('GH_TOKEN', 'personal-secret')
+    const read = async (account: string) => {
+      const child = new Commands(() => deployment, { GH_TOKEN: undefined, SOURCE_ACCOUNT: account }, new AbortController().signal)
+        .stream(process.execPath, ['-e', 'process.stdout.write(JSON.stringify({account:process.env.SOURCE_ACCOUNT,token:process.env.GH_TOKEN,args:process.argv.slice(1),notify:process.env.LARKSUITE_CLI_NO_UPDATE_NOTIFIER}))', 'literal $(name) `x` & "quoted"'])
+      let output = ''
+      child.stdout.on('data', value => { output += String(value) })
+      await new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', code => code === 0 ? resolve() : reject(new Error(`source exited ${code}`))) })
+      return JSON.parse(output) as unknown
+    }
+    try {
+      expect(await Promise.all([read('organization-a'), read('organization-b')])).toEqual(['organization-a', 'organization-b'].map(account => ({
+        account, args: ['literal $(name) `x` & "quoted"'], notify: '1',
+      })))
+      expect(process.env.GH_TOKEN).toBe('personal-secret')
+      expect(process.env.SOURCE_ACCOUNT).toBeUndefined()
+    } finally { vi.unstubAllEnvs() }
+  })
+  it.runIf(process.platform === 'win32')('starts a configured PowerShell source CLI with its organization variables and literal arguments', async ({ onTestFinished }) => {
+    const directory = mkdtempSync(join(tmpdir(), 'source-stream-')), script = join(directory, 'source.ps1')
+    writeFileSync(script, "[Console]::Out.Write((@{account=$env:SOURCE_ACCOUNT;arguments=@($args)} | ConvertTo-Json -Compress))\n")
+    try {
+      const child = new Commands(() => deployment, { SOURCE_ACCOUNT: 'isolated-org' }, new AbortController().signal)
+        .stream(script, ['event', 'consume', 'literal $(Get-Date) & `text`'])
+      onTestFinished(() => child.terminate())
+      let output = ''
+      child.stdout.on('data', value => { output += String(value) })
+      await new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', code => code === 0 ? resolve() : reject(new Error(`source exited ${code}`))) })
+      expect(JSON.parse(output)).toEqual({ account: 'isolated-org', arguments: ['event', 'consume', 'literal $(Get-Date) & `text`'] })
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  }, 15000)
+  it.runIf(process.platform === 'win32')('stops the real CLI descendant of a PowerShell source wrapper when its owner closes', async ({ onTestFinished }) => {
+    const directory = mkdtempSync(join(tmpdir(), 'source-stream-stop-')), script = join(directory, 'source.ps1'), node = join(directory, 'source.mjs')
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+    writeFileSync(node, 'console.log(process.pid); setInterval(() => {}, 60000)\n')
+    writeFileSync(script, `& ${quote(process.execPath)} ${quote(node)}\nexit $LASTEXITCODE\n`)
+    const owner = new AbortController(), child = new Commands(() => deployment, {}, owner.signal).stream(script, ['event', 'consume'])
+    onTestFinished(() => child.terminate())
+    const closed = new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', () => resolve()) })
+    let pid: number | undefined
+    try {
+      pid = await new Promise<number>((resolve, reject) => { child.once('error', reject); child.stdout.once('data', value => resolve(Number(String(value).trim()))) })
+      expect(Number.isSafeInteger(pid)).toBe(true)
+      expect(() => process.kill(pid!, 0)).not.toThrow()
+      owner.abort(); await closed
+      expect(() => process.kill(pid!, 0)).toThrow()
+    } finally { await child.terminate(); rmSync(directory, { recursive: true, force: true }) }
+  }, 15000)
   it('refuses Feishu commands when the deployment has no Feishu bot', async () => {
     await expect(new Commands(() => testDeployment({ feishu: undefined }), {}, new AbortController().signal).lark(['im', '+chat-list'])).rejects.toThrow('The Feishu Source has no working bot CLI')
   })

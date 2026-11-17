@@ -1,5 +1,5 @@
 /** Subprocess wrapper for running gh, lark-cli, and git commands under the deployment's configured accounts. */
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
@@ -42,6 +42,8 @@ function ended(error: unknown): string {
   return typeof code === 'string' ? `could not run: ${code}` : 'failed'
 }
 export interface Tally { skipped: number }
+/** A live Source CLI, including its platform wrapper and descendants owned by this invocation. */
+export interface CommandStream extends ChildProcessWithoutNullStreams { terminate(): Promise<void> }
 /** Parses array elements against a schema, skipping invalid items and incrementing `tally.skipped`. */
 export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tally?: Tally): T[] {
   const items = list.flatMap(value => { const parsed = item.safeParse(value); return parsed.success ? [parsed.data] : [] })
@@ -66,17 +68,46 @@ export class Commands {
   constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
   get deployment(): Deployment { return this.resolved() }
   get repository(): string { return this.deployment.repository }
+  get github(): NonNullable<Deployment['github']> {
+    const account = this.deployment.github
+    if (!account) throw new CliError('The GitHub Source has no configured repository and account')
+    return account
+  }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
+  private invocation(program: string, args: string[], cwd?: string) {
+    const env = { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }
+    const [file = program, ...arguments_] = commandLine([program, ...args], cwd, env)
+    return { env, file, arguments_ }
+  }
+  /** Starts an unbuffered source stream under the same account and platform argv boundary as run(). */
+  stream(program: string, args: string[], cwd?: string): CommandStream {
+    const { env, file, arguments_ } = this.invocation(program, args, cwd)
+    const child = spawn(file, arguments_, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    let stopping: Promise<void> | undefined
+    const terminate = (): Promise<void> => stopping ??= (async () => {
+      if (child.exitCode !== null || child.signalCode !== null || !child.pid) return
+      if (process.platform === 'win32') {
+        // A configured .ps1 CLI may launch another executable. Killing only its
+        // PowerShell carrier would leave that Source consuming events forever.
+        await exec('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 10000 })
+          .catch(error => { if (child.exitCode === null && child.signalCode === null) throw commandError(error, 'taskkill.exe') })
+      } else child.kill('SIGTERM')
+    })()
+    const abort = () => { void terminate().catch(error => child.emit('error', error)) }
+    child.once('close', () => this.signal.removeEventListener('abort', abort))
+    this.signal.addEventListener('abort', abort, { once: true })
+    if (this.signal.aborted) queueMicrotask(abort)
+    return Object.assign(child, { terminate })
+  }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
-      const env = { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }
-      const [file = program, ...arguments_] = commandLine([program, ...args], cwd, env)
+      const { env, file, arguments_ } = this.invocation(program, args, cwd)
       const { stdout } = await exec(file, arguments_, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, env })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.github.cli, args)) as T }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -85,7 +116,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.github.cli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }

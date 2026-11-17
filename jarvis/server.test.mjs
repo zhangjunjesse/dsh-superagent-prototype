@@ -62,6 +62,9 @@ test('settings persist independently; secrets stay private; stale writes and cro
   assert.equal((await f.call('/api/basic', 'PUT', {}, { 'X-Jarvis-CSRF': '' })).status, 403);
   assert.equal(await f.rawHost(), 403);
   assert.equal((await f.call('/server.mjs')).status, 404);
+  for (const asset of ['/prompts.js', '/prompts.css']) assert.equal((await f.call(asset)).status, 200);
+  assert.notEqual(state.promptManagement, true, 'standalone server must not advertise unsupported prompt management');
+  assert.equal((await f.call('/api/prompts')).status, 404);
   const restarted = await f.restart(); assert.equal(restarted.basic.value.assistantName, '小维'); assert.equal(restarted.model.value.model, 'controlled-model');
   response = await f.call('/api/model', 'PUT', { revision: restarted.model.revision, value: restarted.model.value, apiKey: '' });
   assert.equal((await response.json()).hasKey, false);
