@@ -81,10 +81,12 @@ test('live DOM: separate settings, persistence, real message events, context, st
   await ui.nav('#settings/model'); assert.equal(ui.byId('setting-endpoint').value, 'bad-draft');
   ui.byId('settings-back').click(); ui.byId('settings-discard').click();
   await until(() => ui.byId('settings-page').hidden, 'discard');
-  ui.w.document.querySelector('[data-mission="east"]').click();
-  ui.w.document.querySelector('[data-action="ack"]').click();
-  assert.match(ui.byId('input').value, /我想讨论：华东增长计划/);
-  assert.equal(ui.byId('send-message').disabled, false, 'prefilled messages can be sent');
+  assert.equal(ui.byId('mission-modal'), null, 'the former sample-task modal is removed');
+  ui.byId('input').value = '保留聊天草稿';
+  ui.byId('input').dispatchEvent(new ui.w.Event('input', { bubbles: true }));
+  ui.byId('context-toggle').click(); ui.byId('context-close').click();
+  assert.equal(ui.byId('input').value, '保留聊天草稿');
+  assert.equal(ui.byId('send-message').disabled, false, 'the overview preserves the composer state');
   ui.byId('input').value = '你好';
   ui.byId('input').dispatchEvent(new ui.w.Event('input', { bubbles: true }));
   assert.equal(ui.byId('send-message').disabled, false, 'typing enables send');

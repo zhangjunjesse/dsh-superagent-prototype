@@ -554,7 +554,12 @@
     }
     return section;
   }
-  function taskReportView(summary, executionContext = {}) {
+  function registeredTaskFile(entry, context) {
+    const file = taskReportArtifactUrl(entry?.url, context);
+    if (!file || file.download || entry.downloadUrl !== file.downloadUrl || typeof entry.title !== 'string') return null;
+    return { ...file, title: entry.title.trim() || file.name };
+  }
+  function taskReportView(summary, executionContext = {}, registered = []) {
     const lines = (typeof summary === 'string' ? summary : '').replace(/\r\n?/g, '\n').split('\n');
     const remaining = [], artifacts = [], seen = new Set();
     let fence = null;
@@ -571,6 +576,11 @@
       if (!file || file.download || row[3] !== file.downloadUrl) { remaining.push(line); continue; }
       const title = row[1].trim() || file.name, identity = JSON.stringify([file.url, title]);
       if (!seen.has(identity)) { seen.add(identity); artifacts.push({ ...file, title }); }
+    }
+    const urls = new Set(artifacts.map(file => file.url));
+    for (const entry of registered || []) {
+      const file = registeredTaskFile(entry, executionContext);
+      if (file && !urls.has(file.url)) { urls.add(file.url); artifacts.push(file); }
     }
     const body = taskNode('div', 'chat-task-report-body');
     renderReply(body, remaining.join('\n'), executionContext);
@@ -739,6 +749,37 @@
     clear.addEventListener('click', clearSelection);
     replyContext.replaceChildren(label,clear); replyContext.hidden = false; input.focus();
   }
+  // The overview spans conversations. Only the current chat can supply a reply target.
+  jarvis.taskReportView = taskReportView;
+  jarvis.taskFilesFor = row => {
+    if (!row?.workRef || !taskBinding || row.conversationId !== taskBinding.conversationId) return [];
+    const files = new Map();
+    for (const turn of turns) {
+      if (!turn.artifacts?.length || !taskReferences(turn).some(ref => ref.workRef === row.workRef &&
+        (!ref.conversationId || ref.conversationId === row.conversationId))) continue;
+      for (const entry of turn.artifacts) {
+        const file = registeredTaskFile(entry, row.executionContext);
+        if (file) files.set(file.url, file);
+      }
+    }
+    return [...files.values()];
+  };
+  jarvis.taskFollowUp = (row, { select = false } = {}) => {
+    if (!row?.workRef || !taskBinding || taskBinding.conversationId !== row.conversationId || busy || !canChat() ||
+      row.availability !== 'live' || !['queued', 'routing', 'running', 'waiting', 'blocked', 'failed'].includes(row.status)) return null;
+    const current = taskItems.get(row.workRef)?.item;
+    if (current && ['completed', 'stopped', 'rejected'].includes(current.status)) return null;
+    const refs = turns.flatMap(taskReferences).filter(ref => ref.actionable && ref.workRef === row.workRef &&
+      (!ref.conversationId || ref.conversationId === row.conversationId));
+    const question = row.action === 'answer';
+    if ((question || row.stage?.action === 'answer') && !(question && row.actionEvidence?.human === true &&
+      row.actionEvidence.ticketId === row.ticketId && row.actionEvidence.organizationId === row.organization?.instanceId && row.questionId)) return null;
+    const target = question ? refs.findLast(ref => ref.questionId === row.questionId)
+      : refs.findLast(ref => !ref.questionId);
+    if (!target) return null;
+    if (select) selectWork(target);
+    return { label: question ? '回答问题' : '继续此任务' };
+  };
   function clearSelection() { selection = null; replyContext.hidden = true; replyContext.replaceChildren(); }
   function syncQuestions(states) {
     if (!Array.isArray(states)) return false;

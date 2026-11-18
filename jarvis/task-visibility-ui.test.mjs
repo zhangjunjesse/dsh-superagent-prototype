@@ -53,6 +53,50 @@ async function openPage(t, { state = {}, api = async () => ({}) } = {}) {
   return { w, byId: id => w.document.getElementById(id) };
 }
 
+test('the business overview can prepare only a live follow-up bound to this chat and its current question', async t => {
+  const turn = receiptTurn();
+  const notification = { id: 'ask', source: 'gateway', role: 'assistant', assistant: '请确认材料范围', status: 'complete',
+    workRefs: [{ workRef: 'JW-submitted', questionId: 'q1', inactive: true }, { workRef: 'JW-submitted', questionId: 'q2' }] };
+  const row = task({ organization: { instanceId: 'root', name: '集团中枢' }, stage: { stage: 'person', action: 'answer' }, action: 'answer', questionId: 'q2' });
+  row.actionEvidence = { human: true, ticketId: row.ticketId, organizationId: row.organization.instanceId };
+  const calls = [];
+  const { w, byId } = await openPage(t, { state: { ...visibleState, turns: [turn, notification] }, api: async (path, method = 'GET') => {
+    calls.push(method); return taskPage([row]);
+  } });
+  byId('input').value = '仍在编辑的回答';
+  for (const change of [{ conversationId: 'other' }, { workRef: 'JW-other' }, { questionId: 'q1' }, { questionId: null },
+    { action: null }, { actionEvidence: null }, { actionEvidence: { ...row.actionEvidence, organizationId: 'elsewhere' } },
+    { status: 'completed' }, { availability: 'stored' }]) {
+    assert.equal(w.jarvis.taskFollowUp({ ...row, ...change }, { select: true }), null);
+  }
+  assert.equal(w.document.querySelector('.reply-context').hidden, true);
+  assert.equal(w.jarvis.taskFollowUp(row).label, '回答问题');
+  assert.equal(w.document.querySelector('.reply-context').hidden, true, 'rendering the button never selects a task');
+  assert.equal(w.jarvis.taskFollowUp(row, { select: true }).label, '回答问题');
+  assert.match(w.document.querySelector('.reply-context').textContent, /JW-submitted/);
+  assert.equal(byId('input').value, '仍在编辑的回答');
+  assert.equal(w.document.activeElement, byId('input'));
+  assert.ok(calls.every(method => method === 'GET'));
+});
+
+test('overview files from a shared chat notification stay bound to their executing organization and ticket', async t => {
+  const url = '/jarvis/api/system/culture/artifacts/child-ticket/final.md';
+  const other = '/jarvis/api/system/culture/artifacts/unrelated/draft.md';
+  const turn = { ...receiptTurn(), workRefs: ['JW-unrelated'], artifacts: [url, other].map(path => ({
+    title: '交付说明', url: path, downloadUrl: path + '?download=1',
+  })) };
+  const { w } = await openPage(t, { state: { ...visibleState, turns: [turn] }, api: async () => taskPage([task()]) });
+  const context = { instanceId: 'culture', ticketId: 'child-ticket', workerId: 'worker-child-ticket' };
+  const row = { conversationId: binding.conversationId, workRef: 'JW-submitted', executionContext: context };
+  const files = w.jarvis.taskFilesFor(row);
+  assert.deepEqual(Array.from(files, file => file.url), [url]);
+  assert.equal(w.jarvis.taskFilesFor({ ...row, workRef: 'JW-missing' }).length, 0);
+  assert.equal(w.jarvis.taskFilesFor({ ...row, conversationId: 'previous' }).length, 0);
+  assert.equal(w.jarvis.taskReportView('', context, files).files.querySelector('.chat-task-file-open').getAttribute('href'), url);
+  const withReport = w.jarvis.taskReportView(artifactLine('同一个文件', url), context, files);
+  assert.equal(withReport.files.querySelectorAll('li').length, 1);
+});
+
 test('a submission receipt shows pending assignment evidence and preserves the existing follow-up action', async t => {
   const { w } = await openPage(t);
   const card = w.document.querySelector('.chat-task-card');
