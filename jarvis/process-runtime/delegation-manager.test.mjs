@@ -28,6 +28,8 @@ const peer = new ProcessPeer(process, {
       parentAssignmentId: envelope.request.parentAssignmentId, childInstanceId: config.instanceId,
       status: 'completed', summary: 'source:' + envelope.sourceInstanceId, receipts: { [envelope.request.commandId]: 'applied' } };
   },
+  async 'lifecycle.delegation'(envelope) { return peer.handlers.delegation(envelope); },
+  'lifecycle.drain'() { return { stopped: true }; },
   state() { return { config, received }; },
   close() { release?.(); return { stopped: true }; },
 });

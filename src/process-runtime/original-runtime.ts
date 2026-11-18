@@ -84,6 +84,8 @@ export class OriginalProcess {
   private unregister?: () => void
   private sourceScopes: { dispose(): Promise<void> }[] = []
   private closing?: Promise<void>
+  private draining = false
+  private quiescing?: Promise<void>
 
   constructor(readonly config: ProcessRuntimeConfig, host: ProcessHost, readonly options: ProcessRuntimeOptions, preparation: Preparation) {
     if (!options?.native) throw new Error('The original complete task runtime requires its shared DSH native ports')
@@ -115,11 +117,11 @@ export class OriginalProcess {
         workerTools: ticket => effectiveWorkerTools(this.inbound?.toolsFor(ticket) ?? config.workerTools).names,
         workerSkills: () => config.workerSkills ?? [],
         localTicket: ticket => !this.delegated.remote(ticket),
-        executionHeld: () => this.capabilityDrain?.frozen ?? false,
+        executionHeld: () => this.draining || (this.capabilityDrain?.frozen ?? false),
         authorizeCapabilityStop: operationId => this.capabilityDrain.authorizeStop(operationId),
         engine: { resumeCompletedCommands: true,
-          admission: { evaluate: trigger => this.capabilityDrain.evaluate(trigger), resume: ticket => this.capabilityDrain.resume(ticket),
-            frozen: () => this.capabilityDrain.frozen },
+          admission: { evaluate: trigger => !this.draining && this.capabilityDrain.evaluate(trigger), resume: ticket => !this.draining && this.capabilityDrain.resume(ticket),
+            frozen: () => this.draining || this.capabilityDrain.frozen },
           delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false } },
         scope: { scope: input => input.source === 'delegation'
           ? this.inbound?.listens(input.meta) ? { listened: true, observed: false } : { listened: false, reason: 'delegation_not_allowed' }
@@ -128,7 +130,12 @@ export class OriginalProcess {
         executor: local => ({
           start: (ticket, assignment) => this.delegated.remote(ticket) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
-          stop: (ticket, assignment, reason) => this.delegated.remote(ticket) ? this.delegated.stop(ticket, assignment) : local.stop(ticket, assignment, reason),
+          stop: (ticket, assignment, reason) => {
+            if (this.delegated.remote(ticket)) this.delegated.stop(ticket, assignment)
+            // A locked management owner has no loaded native execution. Its
+            // guarded domain stop is durable; only the live business owner can cancel Sessions.
+            else if (!options.managementOnly) local.stop(ticket, assignment, reason)
+          },
         }),
         reportArtifacts: (ticketId, artifacts) => artifactLinks(config.instanceId, ticketId, this.taskFiles.register(ticketId, artifacts)),
         initialize: original => {
@@ -166,10 +173,18 @@ export class OriginalProcess {
     }
   }
   close(): Promise<void> { return this.closing ??= this.shutdown() }
+  /** Fence original admission and drain the original pass/source owners without closing their Store. */
+  beginShutdown(): Promise<void> {
+    this.draining = true
+    return this.quiescing ??= (async () => {
+      await Promise.allSettled(this.sourceScopes.reverse().map(scope => scope.dispose()))
+      await this.runtime.passes.stop()
+    })()
+  }
   private async shutdown(): Promise<void> {
     try {
       // Source loops release before their Core owner, retaining the original poll cursors and cancellation behavior.
-      await Promise.allSettled(this.sourceScopes.reverse().map(scope => scope.dispose()))
+      await this.beginShutdown()
       await this.runtime.stop()
     } finally { this.unregister?.(); this.ledger.close() }
   }

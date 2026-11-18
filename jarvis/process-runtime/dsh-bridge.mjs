@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { processToolDefinitions, WORKER_TOOL_NAMES, WorkerSkillsSchema } from '../../lib/process-runtime.js';
+import { processToolDefinitions, WORKER_TOOL_NAMES, WorkerSkillsSchema, localExecutorNative } from '../../lib/process-runtime.js';
 import { observeReply } from './reply-progress.mjs';
 import { loadWorkerSkills, executeWorkerTool } from './worker-execution.mjs';
 
 const roles = new Set(['jarvis', 'router', 'worker']);
 const nativeNames = new Set(WORKER_TOOL_NAMES);
 const claims = new Set();
+const agentOwners = new WeakMap();
+const lifecycleGuards = new WeakMap();
 const CLOSE_TIMEOUT_MS = 10000;
 const RUN_TIMEOUT_MS = 90000;
 const deadlineError = 'DSH request deadline exceeded; tools are closed and this Session is quarantined';
@@ -25,6 +27,96 @@ const failed = error => ({ text: '', status: 'failed', error });
 const tools = Object.fromEntries(processToolDefinitions.map(({ name, description, parameters }) => [name, { description, parameters }]));
 const roleTools = Object.fromEntries([...roles].map(role => [role, processToolDefinitions.filter(tool => tool.roles.includes(role) && tool.name !== 'delegation_prepare').map(tool => tool.name)]));
 const businessTools = binding => binding.role === 'jarvis' && binding.sessionKey.startsWith('delegation:') ? ['delegation_prepare', 'delegation_context_read'] : roleTools[binding.role];
+
+function bridgeIdentity(config) {
+  string(config?.instanceId, 'instanceId');
+  for (const name of ['stateDir', 'workspace']) if (!isAbsolute(config[name] || '')) throw new Error(`${name} must be absolute`);
+  const stateDir = realpathSync.native(config.stateDir), workspace = realpathSync.native(config.workspace);
+  if (within(stateDir, workspace) || within(workspace, stateDir)) throw new Error('State and workspace directories must be separate');
+  return { instanceId: config.instanceId, stateDir, workspace, file: join(stateDir, 'dsh-bridge-state.json'),
+    namespace: identity(config.instanceId, process.platform === 'win32' ? stateDir.toLowerCase() : stateDir, process.platform === 'win32' ? workspace.toLowerCase() : workspace) };
+}
+
+function validateBridgeState(state, owner) {
+  if (state.version !== 1 || state.instanceId !== owner.instanceId || state.namespace !== owner.namespace || state.workspace !== owner.workspace || !object(state.sessions) || !object(state.requests)) throw new Error('Bridge state identity or format mismatch');
+  for (const [key, row] of Object.entries(state.sessions)) {
+    if (key !== hash(row.sessionKey) || !roles.has(row.role) || row.sessionId !== sessionId(owner.namespace, row.sessionKey)) throw new Error('Invalid persisted Session binding');
+  }
+  for (const [key, row] of Object.entries(state.requests)) {
+    if (key !== identity(row.sessionKey, row.requestId) || !roles.has(row.role) || !['pending', 'settled'].includes(row.state) ||
+      row.messageId !== messageId(owner.namespace, row.sessionKey, row.requestId) || state.sessions[hash(row.sessionKey)]?.role !== row.role ||
+      !/^[a-f0-9]{64}$/.test(row.fingerprint || '') || row.tools !== undefined && (row.role !== 'worker' || !Array.isArray(row.tools) || row.tools.some(name => !nativeNames.has(name))) || row.state === 'settled' && (!object(row.result) ||
+        !['complete', 'failed', 'cancelled'].includes(row.result.status) || typeof row.result.text !== 'string')) throw new Error('Invalid persisted request binding');
+    if (row.conversationModel !== undefined) {
+      if (owner.instanceId !== 'root' || row.role !== 'jarvis' || row.sessionKey !== 'jarvis') throw new Error('Invalid conversation model snapshot binding');
+      row.conversationModel = conversationModelSnapshot(row.conversationModel);
+    }
+  }
+  return state;
+}
+
+/** Persisted bridge Session ownership survives Agent disposal and business-host replacement. */
+export function installBridgeLifecycleGuard(ctx, instances) {
+  if (typeof ctx.on !== 'function' || !ctx.agents) return;
+  let guard = lifecycleGuards.get(ctx);
+  if (!guard) {
+    const configurations = new Map(), owners = new Map(), guarded = new WeakSet();
+    const refresh = () => {
+      for (const config of configurations.values()) {
+        const owner = bridgeIdentity(config);
+        let state;
+        try { state = validateBridgeState(JSON.parse(readFileSync(owner.file, 'utf8')), owner); }
+        catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        for (const row of Object.values(state.sessions)) {
+          const previous = owners.get(row.sessionId);
+          if (previous && previous !== owner.namespace) throw new Error('Bridge Session has conflicting persistent owners');
+          owners.set(row.sessionId, owner.namespace);
+        }
+      }
+    };
+    const bind = agent => {
+      if (guarded.has(agent) || !owners.has(agent.id)) return;
+      guarded.add(agent);
+      const current = () => {
+        const claim = agentOwners.get(agent);
+        if (!claim || claim.bridge.namespace !== owners.get(agent.id)) throw new Error('The owning organization bridge is inactive');
+        return { ...claim, active: claim.bridge.currentRequest(claim.binding, agent) };
+      };
+      const unchanged = witness => {
+        const fresh = current();
+        if (fresh.bridge !== witness.bridge || fresh.active !== witness.active) throw new Error('Bridge invocation belongs to an obsolete request');
+      };
+      agent.ctx.tools.guard(() => { try { current(); } catch (error) { return error.message; } });
+      for (const event of ['agent/request', 'tools/pre-execute']) agent.ctx.on(event, async (input, next) => {
+        const witness = current();
+        input.signal = AbortSignal.any([input.signal, witness.active.controller.signal].filter(Boolean));
+        try { const result = await next(); unchanged(witness); input.signal.throwIfAborted(); return result; }
+        catch (error) { if (event === 'tools/pre-execute') witness.bridge.invocations.get(input)?.finish(); throw error; }
+      }, { prepend: true });
+      agent.ctx.on('agent/pre-step', async (input, next) => {
+        let witness;
+        try {
+          witness = current();
+          if (!witness.bridge.ownedInputs(witness.active, input.messages) || witness.active.admittedTurn !== input.turn &&
+            !input.messages.some(message => message.id === witness.active.row.messageId)) return { kind: 'reject' };
+        } catch { return { kind: 'reject' }; }
+        const result = await next();
+        try {
+          unchanged(witness);
+          if (result.kind === 'enter') {
+            if (!witness.bridge.ownedInputs(witness.active, result.messages)) return { kind: 'reject' };
+            witness.active.admittedTurn = input.turn;
+          }
+          return result;
+        } catch { return { kind: 'reject' }; }
+      }, { prepend: true });
+    };
+    guard = { configurations, refresh, bind }; lifecycleGuards.set(ctx, guard);
+    ctx.on('agent/created', ({ agent }) => { refresh(); bind(agent); });
+  }
+  for (const config of instances) guard.configurations.set(bridgeIdentity(config).namespace, config);
+  guard.refresh(); for (const agent of ctx.agents.list()) guard.bind(agent);
+}
 
 function conversationModelSnapshot(value) {
   const invalid = () => { throw new Error('Invalid conversation model snapshot'); };
@@ -134,29 +226,17 @@ export class DshBridge {
     const maxWorkers = config.maxWorkers ?? 3;
     if (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 16) throw new Error('maxWorkers must be 1–16');
     this.ctx = ctx; this.config = { ...config, stateDir, workspace, model: { ...config.model }, roleModels: structuredClone(roleModels), workerSkills: [...new Set(workerSkills)], workerTools: [...new Set(workerTools)], maxWorkers };
-    this.namespace = identity(config.instanceId, process.platform === 'win32' ? stateDir.toLowerCase() : stateDir,
-      process.platform === 'win32' ? workspace.toLowerCase() : workspace);
+    const owner = bridgeIdentity(this.config); this.namespace = owner.namespace;
     this.onTool = onTool; this.conversationModel = conversationModel; this.preset = preset; this.sessions = new Map(); this.active = new Map(); this.closed = false;
+    this.invocations = new Map(); this.executionTasks = new Set(); this.invocationSequence = 0;
+    this.jobRegistries = new Set(); this.rememberJobs(ctx);
     this.file = join(stateDir, 'dsh-bridge-state.json');
     this.claim = resolve(this.file).toLowerCase();
     if (claims.has(this.claim)) throw new Error('An active bridge already owns this instance state');
     try { this.state = JSON.parse(readFileSync(this.file, 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; this.state = { version: 1, instanceId: config.instanceId, namespace: this.namespace, workspace, sessions: {}, requests: {} }; }
-    if (this.state.version !== 1 || this.state.instanceId !== config.instanceId || this.state.namespace !== this.namespace || this.state.workspace !== workspace || !object(this.state.sessions) || !object(this.state.requests)) throw new Error('Bridge state identity or format mismatch');
-    for (const [key, row] of Object.entries(this.state.sessions)) {
-      if (key !== hash(row.sessionKey) || !roles.has(row.role) || row.sessionId !== sessionId(this.namespace, row.sessionKey)) throw new Error('Invalid persisted Session binding');
-    }
-    for (const [key, row] of Object.entries(this.state.requests)) {
-      if (key !== identity(row.sessionKey, row.requestId) || !roles.has(row.role) || !['pending', 'settled'].includes(row.state) ||
-        row.messageId !== messageId(this.namespace, row.sessionKey, row.requestId) || this.state.sessions[hash(row.sessionKey)]?.role !== row.role ||
-        !/^[a-f0-9]{64}$/.test(row.fingerprint || '') || row.tools !== undefined && (row.role !== 'worker' || !Array.isArray(row.tools) || row.tools.some(name => !nativeNames.has(name))) || row.state === 'settled' && (!object(row.result) ||
-          !['complete', 'failed', 'cancelled'].includes(row.result.status) || typeof row.result.text !== 'string')) throw new Error('Invalid persisted request binding');
-      if (row.conversationModel !== undefined) {
-        if (config.instanceId !== 'root' || row.role !== 'jarvis' || row.sessionKey !== 'jarvis') throw new Error('Invalid conversation model snapshot binding');
-        row.conversationModel = conversationModelSnapshot(row.conversationModel);
-      }
-    }
-    this.save(); claims.add(this.claim);
+    validateBridgeState(this.state, owner);
+    this.save(); installBridgeLifecycleGuard(ctx, [this.config]); claims.add(this.claim);
   }
 
   save() {
@@ -170,6 +250,15 @@ export class DshBridge {
     const work = [...this.active.values()].map(active => ({ id: `bridge:${active.input.sessionKey}:${active.input.requestId}`,
       title: active.input.text.slice(0, 200), kind: active.input.role === 'jarvis' ? 'conversation' : 'bridge-request',
       sessionKey: active.input.sessionKey, requestId: active.input.requestId, status: active.cancelled ? 'stopping' : 'running' }));
+    work.push(...[...this.invocations.values()].map(item => ({ id: `bridge-tool:${item.active.input.sessionKey}:${item.active.input.requestId}:${item.id}`,
+      title: item.name, kind: 'native-tool', sessionKey: item.active.input.sessionKey, requestId: item.active.input.requestId, status: 'running' })));
+    this.rememberJobs(this.ctx);
+    for (const registry of this.jobRegistries) for (const binding of Object.values(this.state.sessions)) for (const job of registry.list(binding.sessionId)) {
+      const id = `bridge-job:${binding.sessionId}:${job.id}`;
+      if (job.owner === binding.sessionId && ['running', 'stopping'].includes(job.status) && !work.some(item => item.kind === 'background-job' && item.id === id)) {
+        work.push({ id, title: job.label ?? job.id, kind: 'background-job', sessionKey: binding.sessionKey, status: job.status });
+      }
+    }
     const activity = { busy: work.length > 0, work, fingerprint: identity(...work.map(item => [item.kind, item.id]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))) };
     this.capabilitySnapshots ??= new Map(); this.capabilitySnapshots.set(activity.fingerprint, activity);
     if (this.capabilitySnapshots.size > 32) this.capabilitySnapshots.delete(this.capabilitySnapshots.keys().next().value);
@@ -179,9 +268,10 @@ export class DshBridge {
     if (this.capabilityHold?.operationId !== operationId || !this.capabilityHold.frozen) throw new Error('Bridge capability stop requires its frozen maintenance owner');
     const confirmed = typeof expected === 'string' ? this.capabilitySnapshots?.get(expected) : expected;
     if (!confirmed || this.capabilityActivity().work.some(item => !confirmed.work.some(work => work.id === item.id && work.kind === item.kind))) throw Object.assign(new Error('Bridge capability work changed; confirmation is required'), { status: 409 });
-    const active = [...this.active.values()];
-    for (const item of active) { item.cancelled = true; item.agent?.cancel({ kind: 'user' }); }
-    await Promise.all(active.map(item => item.done));
+    const active = [...new Set([...this.active.values(), ...[...this.invocations.values()].map(item => item.active)])];
+    for (const item of active) { item.cancelled = true; item.controller.abort(); item.agent?.cancel({ kind: 'user' }); }
+    await Promise.all([...active.map(item => item.done), ...this.executionTasks]);
+    await this.drainJobs();
     return this.capabilityActivity();
   }
 
@@ -216,7 +306,7 @@ export class DshBridge {
     const binding = recorded ?? { sessionKey, role, sessionId: sessionId(this.namespace, sessionKey) };
     this.state.sessions[hash(sessionKey)] = binding;
     const done = Promise.withResolvers(), active = { input: Object.freeze({ ...input, ...(requestTools === undefined ? {} : { tools: requestTools }) }), binding,
-      ...(conversationModel === undefined ? {} : { conversationModel }), cancelled: false, admitted: false, done: done.promise };
+      ...(conversationModel === undefined ? {} : { conversationModel }), controller: new AbortController(), cancelled: false, admitted: false, done: done.promise };
     this.active.set(sessionKey, active);
     const work = this.perform(active, key, fingerprint, previous, onProgress).finally(() => {
       if (this.active.get(sessionKey) === active) this.active.delete(sessionKey);
@@ -229,7 +319,7 @@ export class DshBridge {
     const expired = Symbol('deadline'); let timer, drainTimer;
     const deadline = new Promise(resolveDeadline => {
       timer = setTimeout(() => {
-        active.expired = true; active.cancelled = true; active.binding.blocked = true;
+        active.expired = true; active.cancelled = true; active.controller.abort(); active.binding.blocked = true;
         try { this.save(); } catch { /* In-memory gates stay closed even if persistence is unavailable. */ }
         try { active.agent?.cancel({ kind: 'user' }); } catch { /* The immutable tool gate is already closed. */ }
         resolveDeadline(expired);
@@ -275,8 +365,14 @@ export class DshBridge {
       await this.ctx.sessionPersistence.flush();
       await agent.whenIdle(); await this.ctx.sessionPersistence.flush();
       if (active.expired) return this.settle(row, failed(deadlineError));
-      const outcome = result(agent.session.snapshotEvents(), row.messageId, row.tools);
-      if (!outcome) { binding.blocked = true; return this.settle(row, failed('DSH request settlement is unknown; it will not replay')); }
+      const events = agent.session.snapshotEvents(), outcome = result(events, row.messageId, row.tools);
+      if (!outcome) {
+        // DSH can be cancelled in model middleware before committing the user
+        // message. No bridge tool can execute before that exact turn input is
+        // committed, so this attempt has a known cancelled outcome.
+        if (active.cancelled && !events.some(event => event.type === 'user/message' && event.data.id === row.messageId)) return this.settle(row, { text: '', status: 'cancelled' });
+        binding.blocked = true; return this.settle(row, failed('DSH request settlement is unknown; it will not replay'));
+      }
       if (active.cancelled && outcome.status !== 'complete') outcome.status = 'cancelled';
       return this.settle(row, outcome);
     } catch (error) {
@@ -318,22 +414,73 @@ export class DshBridge {
   }
   modelFor(role) { return { ...(this.config.roleModels[role] ?? this.config.model) }; }
 
-  denial(binding, agent, execution) {
+  currentRequest(binding, agent, expected) {
     const active = this.active.get(binding.sessionKey);
-    if (this.closed || !active?.admitted || active.cancelled || active.agent !== agent || execution.agent !== agent) return 'Instance request is not active';
-    if (this.capabilityHold?.frozen) return 'Worker capability application has frozen tool invocations';
+    if (this.closed || !active?.admitted || active.row?.state !== 'pending' || active.cancelled || active.controller.signal.aborted || active.agent !== agent ||
+      this.sessions.get(binding.sessionKey)?.agent !== agent || active.binding.sessionId !== binding.sessionId ||
+      this.state.sessions[hash(binding.sessionKey)]?.sessionId !== binding.sessionId || expected && active !== expected) throw new Error('Instance request is not active');
+    if (this.capabilityHold?.frozen) throw new Error('Worker capability application has frozen invocations');
+    return active;
+  }
+
+  ownedInputs(active, messages) {
+    return Array.isArray(messages) && messages.every(message => {
+      const data = message.type === 'user/message' ? message.data : message;
+      if (['runtime-context', 'time-context'].includes(data.source?.kind)) return true;
+      return data.id === active.row.messageId && data.source?.kind === 'superjarvis-process' && data.source.instanceId === this.config.instanceId &&
+        data.source.sessionKey === active.binding.sessionKey && data.source.role === active.binding.role && data.source.requestId === active.input.requestId &&
+        (active.input.tools === undefined || JSON.stringify(data.source.tools) === JSON.stringify(active.input.tools));
+    });
+  }
+
+  turnMatches(active, agent) {
+    const events = agent.session.snapshotEvents(), start = events.findLastIndex(event => event.type === 'turn/start');
+    const inputs = events.slice(start + 1).filter(event => event.type === 'user/message' && !['runtime-context', 'time-context'].includes(event.data.source?.kind));
+    return start >= 0 && inputs.length > 0 && this.ownedInputs(active, inputs);
+  }
+
+  beginInvocation(execution, active) {
+    this.rememberJobs(execution.agent.ctx);
+    const previous = this.invocations.get(execution);
+    if (previous) {
+      if (previous.active !== active) throw new Error('Bridge invocation belongs to an obsolete request');
+      return previous;
+    }
+    const done = Promise.withResolvers(); this.executionTasks.add(done.promise);
+    const item = { id: ++this.invocationSequence, name: execution.name, active, finish: () => {
+      if (this.invocations.get(execution) === item) this.invocations.delete(execution);
+      this.executionTasks.delete(done.promise); done.resolve();
+    } };
+    this.invocations.set(execution, item);
+    execution.signal = AbortSignal.any([execution.signal, active.controller.signal].filter(Boolean));
+    return item;
+  }
+
+  async executeInvocation(binding, agent, execution, work) {
+    const denied = this.denial(binding, agent, execution); if (denied) throw new Error(denied);
+    const active = this.currentRequest(binding, agent), inherited = this.invocations.has(execution), invocation = this.beginInvocation(execution, active);
+    try {
+      execution.signal.throwIfAborted();
+      const result = await work(active);
+      this.currentRequest(binding, agent, active); execution.signal.throwIfAborted();
+      return result;
+    } finally { if (!inherited) invocation.finish(); }
+  }
+
+  denial(binding, agent, execution) {
+    let active;
+    try { active = this.currentRequest(binding, agent, this.invocations.get(execution)?.active); }
+    catch (error) { return error.message; }
+    if (execution.agent !== agent) return 'Instance request is not active';
     if (active.terminal) return 'Worker assignment is already completed';
     const allowed = [...businessTools(binding), ...(binding.role === 'worker' ? active.input.tools ?? this.config.workerTools : [])];
     if (!allowed.includes(execution.name)) return 'Tool is outside this Session role';
-    const events = agent.session.snapshotEvents(), start = events.findLastIndex(event => event.type === 'turn/start');
-    // DSH adds environment and clock snapshots as user messages; neither is an incoming request.
-    const inputs = events.slice(start + 1).filter(event => event.type === 'user/message' && !['runtime-context', 'time-context'].includes(event.data.source?.kind));
-    if (start < 0 || !inputs.length || inputs.some(({ data }) => data.id !== active.row.messageId || data.source?.kind !== 'superjarvis-process' ||
-      data.source.instanceId !== this.config.instanceId || data.source.sessionKey !== binding.sessionKey || data.source.role !== binding.role || data.source.requestId !== active.input.requestId ||
-      active.input.tools !== undefined && JSON.stringify(data.source.tools) !== JSON.stringify(active.input.tools))) return 'Tool request identity does not match the active turn';
+    if (!this.turnMatches(active, agent)) return 'Tool request identity does not match the active turn';
   }
 
   decorate(scope, agent, binding) {
+    agentOwners.set(agent, { bridge: this, binding });
+    this.rememberJobs(scope);
     const native = binding.role === 'worker' ? this.config.workerTools.map(name => {
       const definition = scope.tools.get(name, agent);
       if (!definition) throw new Error(`DSH native tool ${name} is unavailable`);
@@ -342,9 +489,28 @@ export class DshBridge {
     scope.tools.restrict({ allow: [] });
     scope.tools.presentAs('native');
     scope.tools.guard(execution => this.denial(binding, agent, execution));
-    scope.on('agent/request', async (_payload, next) => {
-      if (this.capabilityHold?.frozen) throw new Error('Worker capability application has frozen model requests');
-      await next(); return this.modelFor(binding.role);
+    scope.on('tools/pre-execute', async (execution, next) => {
+      const denied = this.denial(binding, agent, execution); if (denied) throw new Error(denied);
+      const active = this.currentRequest(binding, agent), invocation = this.beginInvocation(execution, active);
+      try {
+        const result = await next(); this.currentRequest(binding, agent, active); execution.signal.throwIfAborted(); return result;
+      } catch (error) { invocation.finish(); throw error; }
+    }, { prepend: true });
+    scope.on('tools/execute', async (execution, next) => {
+      const invocation = this.invocations.get(execution);
+      if (!invocation) throw new Error('Bridge tool has no admitted invocation');
+      this.currentRequest(binding, agent, invocation.active); execution.signal.throwIfAborted();
+      return next();
+    }, { prepend: true });
+    scope.on('tools/result', execution => this.invocations.get(execution)?.finish());
+    scope.on('agent/request', async (payload, next) => {
+      const active = this.currentRequest(binding, agent);
+      // DSH prepares the first model config before appending that step's user
+      // messages. Its validated pre-step claim supplies the same turn witness.
+      if (active.admittedTurn !== payload.turn && !this.turnMatches(active, agent)) throw new Error('Model request identity does not match the active turn');
+      payload.signal = AbortSignal.any([payload.signal, active.controller.signal].filter(Boolean));
+      await next(); this.currentRequest(binding, agent, active); payload.signal.throwIfAborted();
+      return this.modelFor(binding.role);
     }, { prepend: true });
     if (this.conversationModel && this.config.instanceId === 'root' && binding.role === 'jarvis' && binding.sessionKey === 'jarvis') {
       scope.on('agent/request', async (_payload, next) => {
@@ -365,24 +531,21 @@ export class DshBridge {
     for (const name of businessTools(binding)) scope.tools.register({ name, ...tools[name],
       output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
       execute: async (args, execution) => {
-        const denied = this.denial(binding, agent, execution); if (denied) throw new Error(denied);
-        validate(tools[name].parameters, args); execution.signal.throwIfAborted();
-        const active = this.active.get(binding.sessionKey);
-        const value = json(await this.onTool({ sessionKey: binding.sessionKey, role: binding.role, requestId: active.input.requestId, name, args: json(args) }));
-        if (name === 'orchestrator_report' && value?.reported === true && value.outcome === 'completed') active.terminal = true;
-        execution.signal.throwIfAborted();
-        return object(value) ? value : { value };
+        return this.executeInvocation(binding, agent, execution, async active => {
+          validate(tools[name].parameters, args);
+          const value = json(await this.onTool({ sessionKey: binding.sessionKey, role: binding.role, requestId: active.input.requestId, name, args: json(args) }));
+          this.currentRequest(binding, agent, active); execution.signal.throwIfAborted();
+          if (name === 'orchestrator_report' && value?.reported === true && value.outcome === 'completed') active.terminal = true;
+          return object(value) ? value : { value };
+        });
       } });
     for (const [name, definition] of native) scope.tools.register({ ...definition, name,
       execute: async (args, execution) => {
-        const denied = this.denial(binding, agent, execution); if (denied) throw new Error(denied);
-        execution.signal.throwIfAborted();
-        return executeWorkerTool({ scope, definition, name, args, execution, workspace: this.active.get(binding.sessionKey)?.input.workspace ?? this.config.workspace,
-          readRoots: [this.config.workspace],
-          skills: this.active.get(binding.sessionKey)?.skills ?? [], check: () => {
-            execution.signal.throwIfAborted();
+        return this.executeInvocation(binding, agent, execution, active => executeWorkerTool({ scope, definition, name, args, execution,
+          workspace: active.input.workspace ?? this.config.workspace, readRoots: [this.config.workspace], skills: active.skills ?? [], check: () => {
+            execution.signal.throwIfAborted(); this.currentRequest(binding, agent, active);
             if (this.denial(binding, agent, execution)) throw new Error('Instance request is no longer active');
-          } });
+          } }));
       } });
   }
 
@@ -393,32 +556,64 @@ export class DshBridge {
     if (requestId !== undefined) string(requestId, 'requestId');
     const active = this.active.get(sessionKey);
     if (!active || requestId !== undefined && active.input.requestId !== requestId || active.cancelled) return { cancelled: false };
-    active.cancelled = true; active.agent?.cancel({ kind: 'user' });
+    active.cancelled = true; active.controller.abort(); active.agent?.cancel({ kind: 'user' });
     return { cancelled: true };
+  }
+
+  setLifecycleStopping(stopping = true) {
+    if (!stopping) return;
+    this.closed = true;
+    for (const active of new Set([...this.active.values(), ...[...this.invocations.values()].map(item => item.active)])) {
+      active.cancelled = true; active.controller.abort(); active.agent?.cancel({ kind: 'user' });
+    }
+  }
+
+  rememberJobs(scope) {
+    const jobs = typeof scope.get === 'function' ? scope.get('jobs') : scope.jobs;
+    if (jobs) this.jobRegistries.add(jobs);
+  }
+
+  async drainJobs() {
+    this.rememberJobs(this.ctx);
+    const ids = Object.values(this.state.sessions).map(binding => binding.sessionId), failures = [];
+    // Worker shells may be promoted by DSH even though detached commands are
+    // forbidden here. Verify their registered owner before disposing a Session;
+    // disposal must not turn a failed kill into apparent cleanup success.
+    for (const jobs of this.jobRegistries) {
+      const native = localExecutorNative({ agents: this.ctx.agents, get: name => name === 'jobs' ? jobs : undefined });
+      const killed = await Promise.allSettled(ids.map(id => native.killJobs(id, 'Owning organization bridge stopped', new Set())));
+      for (const item of killed) if (item.status === 'rejected') failures.push(item.reason);
+      for (const id of ids) try {
+        if (jobs.list(id).some(job => job.owner === id && ['running', 'stopping'].includes(job.status))) failures.push(new Error(`Bridge Session ${id} still owns background jobs`));
+      } catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw new AggregateError(failures, 'DSH bridge background cleanup has not completed');
   }
 
   close() {
     if (this.cleanupComplete) return this.drained;
     if (this.closeTask) return this.closeTask;
-    this.closed = true;
-    for (const active of this.active.values()) { active.cancelled = true; active.agent?.cancel({ kind: 'user' }); }
-    this.cleanupTask = (async () => {
+    this.setLifecycleStopping();
+    this.cleanupTask ??= (async () => {
       await Promise.all([...this.active.values()].map(active => active.done));
+      await Promise.all([...this.executionTasks]);
+      await this.drainJobs();
       await this.ctx.sessionPersistence.flush();
-      const disposed = await Promise.allSettled([...this.sessions.values()].map(async ({ handle, agent }) => {
+      const disposed = await Promise.allSettled([...this.sessions.entries()].map(async ([key, { handle, agent }]) => {
         agent.cancel({ kind: 'user' }); await agent.whenIdle(); await handle.dispose();
+        this.sessions.delete(key);
       }));
       if (disposed.some(item => item.status === 'rejected')) throw new Error('DSH Session cleanup failed; instance remains closed');
       claims.delete(this.claim);
       this.cleanupComplete = true;
-    })();
+    })().catch(error => { this.cleanupTask = undefined; throw error; });
     this.drained = this.cleanupTask;
     // A non-cooperative model/tool must not hide lifecycle failure indefinitely.
     // The actual cleanup continues with guards closed; only successful disposal releases ownership.
     let timer;
     this.closeTask = Promise.race([this.cleanupTask, new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('DSH Session cleanup timed out; instance remains closed and owned')), CLOSE_TIMEOUT_MS);
-    })]).finally(() => clearTimeout(timer));
+    })]).finally(() => { clearTimeout(timer); this.closeTask = undefined; });
     return this.closeTask;
   }
 }

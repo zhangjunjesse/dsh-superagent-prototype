@@ -409,8 +409,41 @@ export class ProcessRuntime {
     await this.ready
     this.available()
     const snapshot = await this.inbound.receive(envelope)
+    return this.delegationResult(snapshot)
+  }
+  private delegationResult(snapshot: DelegationSnapshot): DelegationSnapshot {
     return { ...snapshot, artifacts: snapshot.ticketId ? this.taskFiles.links(this.config.instanceId, snapshot.ticketId)
       .map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: snapshot.ticketId! })) : [] }
+  }
+  /** Private lifecycle-only control; it cannot submit, append, answer or resume work. */
+  async lifecycleDelegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
+    await this.ready
+    if (!['query', 'stop'].includes(envelope.request.operation) || this.closed) throw new Error('Lifecycle delegation permits bound query and stop only')
+    const snapshot = await this.inbound.receiveLifecycle(envelope)
+    if (envelope.request.operation !== 'stop' || !['stopped', 'completed', 'missing'].includes(snapshot.status)) return this.delegationResult(snapshot)
+    await this.inbound.idle(envelope.request.delegationId)
+    if (snapshot.ticketId && !this.options.managementOnly) {
+      const sessionId = `worker-${snapshot.ticketId}`
+      const loaded = this.options.native.executor.current(sessionId)
+      if (loaded) await this.options.native.executor.cancel(sessionId, false)
+      // Persisted Session ownership outlives an in-memory Agent. Its background
+      // jobs must still be stopped and verified by the native owner port.
+      await this.options.native.executor.stopBackground(sessionId, 'Owning parent organization stopped', false)
+      if (loaded) {
+        await this.options.native.executor.whenIdle(sessionId)
+        const quiet = await this.options.native.executor.untilQuiet(sessionId, AbortSignal.timeout(1000))
+        const remaining = await this.options.native.executor.runningJobs(sessionId)
+        if (!quiet || remaining.length || this.options.native.executor.current(sessionId)?.status !== 'idle') throw new Error('Bound child native execution cleanup has not completed')
+      }
+    }
+    await this.options.native.sessions.flush()
+    return { ...this.delegationResult(snapshot), executionStopped: true }
+  }
+  /** A stopped management owner can finish persisted controls without starting Sources, Router or Workers. */
+  async drainDelegations(): Promise<void> {
+    await this.ready
+    await this.original.beginShutdown()
+    await this.delegated.shutdown()
   }
   /** Installs or releases the durable owner admission fence before reporting activity. */
   async capabilitiesHold(raw: unknown) {
@@ -486,13 +519,16 @@ export class ProcessRuntime {
     await this.tick()
     return this.capabilitySnapshot()
   }
-  close(): Promise<void> { return this.closing ??= this.shutdown() }
+  close(): Promise<void> {
+    return this.closing ??= this.shutdown().catch(error => { this.closing = undefined; throw error })
+  }
   private async shutdown(): Promise<void> {
     this.stopping = true; clearInterval(this.timer)
     await Promise.allSettled([...this.active.values()].map(request => this.host.cancel({ sessionKey: request.sessionKey })))
     await this.inbound.close()
     await this.ticking
-    try { await this.original.close() } finally { this.closed = true }
+    if (!this.options.managementOnly) await this.drainDelegations()
+    await this.original.close(); this.closed = true
   }
 
 }

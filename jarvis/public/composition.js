@@ -98,7 +98,9 @@
     if (!connected()) return '运行状态未同步';
     if (service.error) return '状态未同步';
     if (!service.snapshot.configured) return '尚未注册';
-    return phaseName(runtimeOf(id)?.phase);
+    const runtime=runtimeOf(id);
+    if (runtime?.cleanupPending && !['starting','stopping'].includes(runtime.phase)) return '停止未完成';
+    return phaseName(runtime?.phase);
   }
   function workerStatus(id) {
     if (!connected()) return '运行状态未同步';
@@ -374,7 +376,7 @@
     main.innerHTML = `${heading()}<div class="page-content runtime-layout" data-runtime-instance="${escape(n.id)}"><section class="runtime-panel"><div class="section-title"><div><h2>${escape(n.name)} · 运行状态</h2><p>运行数据尚未获取</p></div>${button('运行配置','runtime-config',n.id,'secondary','settings')}</div><dl class="runtime-facts"><div><dt>健康状态</dt><dd><span class="status-pill neutral">未获取</span></dd></div><div><dt>运行版本</dt><dd>—</dd></div><div><dt>任务执行中</dt><dd>—</dd></div><div><dt>维护方</dt><dd>${n.mode === 'connect' ? '外部实例维护方' : '当前计算机'}</dd></div></dl><div class="maintenance-actions"><button class="btn secondary" type="button" disabled>暂停接单</button><button class="btn secondary" type="button" disabled>重启实例</button><button class="btn danger" type="button" disabled>停止实例</button><span>运行管理尚未接入，暂不可操作</span></div></section><section class="runtime-records" id="runtime-records"><div class="section-title"><h2>维护记录</h2><span class="muted">${escape(n.name)}</span></div><div class="empty-state compact">${icon('clock')}<p>暂无运行维护记录</p></div></section></div>`;
   }
   function renderConnectedRuntime(n) {
-    main.innerHTML = `${heading()}<div class="page-content runtime-layout" data-runtime-instance="${escape(n.id)}"><section class="runtime-panel"><div class="section-title"><div><h2>${escape(n.name)} · 运行状态</h2><p data-runtime-summary></p></div>${button('运行配置','runtime-config',n.id,'secondary','settings')}</div><dl class="runtime-facts"><div><dt>进程状态</dt><dd data-runtime-phase></dd></div><div><dt>实例 PID</dt><dd data-runtime-pid></dd></div><div><dt>进程代次</dt><dd data-runtime-generation></dd></div><div><dt>DSH 宿主 PID</dt><dd data-runtime-host></dd></div><div><dt>执行中的 Worker</dt><dd data-runtime-workers>—</dd></div><div><dt>未结束任务</dt><dd data-runtime-tickets>—</dd></div></dl><p class="runtime-error field-error" data-runtime-error role="alert" hidden></p><p class="runtime-query-note" data-runtime-query hidden></p><div class="maintenance-actions">${button('启动实例','runtime-start',n.id,'primary')}${button('重启实例','runtime-restart',n.id,'secondary','refresh')}${button('停止实例','runtime-stop',n.id,'danger')}<span data-runtime-action-note></span></div><p class="runtime-operation-note">停止进程后可重新启动；重启不会重放结果不明的任务。</p></section><section class="runtime-records" id="runtime-records"><div class="section-title"><h2>维护记录</h2><span class="muted">${escape(n.name)}</span></div><div data-runtime-lifecycle></div></section></div>`;
+    main.innerHTML = `${heading()}<div class="page-content runtime-layout" data-runtime-instance="${escape(n.id)}"><section class="runtime-panel"><div class="section-title"><div><h2>${escape(n.name)} · 运行状态</h2><p data-runtime-summary></p></div>${button('运行配置','runtime-config',n.id,'secondary','settings')}</div><dl class="runtime-facts"><div><dt>实例状态</dt><dd data-runtime-phase></dd></div><div><dt>实例 PID</dt><dd data-runtime-pid></dd></div><div><dt>进程代次</dt><dd data-runtime-generation></dd></div><div><dt>DSH 宿主 PID</dt><dd data-runtime-host></dd></div><div><dt>执行中的 Worker</dt><dd data-runtime-workers>—</dd></div><div><dt>未结束任务</dt><dd data-runtime-tickets>—</dd></div></dl><p class="runtime-error field-error" data-runtime-error role="alert" hidden></p><p class="runtime-query-note" data-runtime-query hidden></p><div class="maintenance-actions">${button('启动实例','runtime-start',n.id,'primary')}${button('重启实例','runtime-restart',n.id,'secondary','refresh')}${button('停止实例','runtime-stop',n.id,'danger')}<span data-runtime-action-note></span></div><p class="runtime-operation-note">启停统一控制此实例的贾维斯对话、任务路由和 Worker；历史记录与设置仍可查看。下级实例按任务绑定接收停止请求，其独立进程在各自的运行状态中管理。停止后可重新启动；重启不会重放结果不明的任务。</p></section><section class="runtime-records" id="runtime-records"><div class="section-title"><h2>维护记录</h2><span class="muted">${escape(n.name)}</span></div><div data-runtime-lifecycle></div></section></div>`;
   }
   function updateRuntimeStatus() {
     if (!connected()) return;
@@ -399,7 +401,7 @@
     const id = panel.dataset.runtimeInstance, runtime = runtimeOf(id), detail = service.details.get(id);
     const set = (key,value) => { const element=panel.querySelector('[data-runtime-'+key+']'); if (element) element.textContent=value; };
     const unavailable = !!service.error;
-    set('summary',!service.snapshot.configured?'尚未注册实例，先保存配置。':unavailable?'暂时无法读取运行服务。':'由当前 DSH 宿主承载的独立业务进程。');
+    set('summary',!service.snapshot.configured?'尚未注册实例，先保存配置。':unavailable?'暂时无法读取运行服务。':'当前实例包含贾维斯对话、任务路由和 Worker，启停统一生效。');
     set('phase',runtimeLabel(id)); set('pid',unavailable?'—':runtime?.pid??'—');
     set('generation',unavailable?'—':runtime?.generation??'—'); set('host',unavailable?'—':service.snapshot.runtime?.hostPid??'—');
     const liveCounts=!unavailable && ['ready','running'].includes(runtime?.phase) && detail?.stateAvailable;
@@ -428,12 +430,14 @@
     try {
       const snapshot=await apiClient().api('/api/system/'+encodeURIComponent(id)+'/'+action,'POST',{revision:service.snapshot.revision});
       installSnapshot(snapshot); service.details.delete(id); await refreshDetail();
-      announce({start:'实例已启动',stop:'实例已停止',restart:'实例已重启'}[action]);
+      const runtime=runtimeOf(id);
+      const complete=action==='stop'?runtime?.phase==='stopped'&&!runtime?.cleanupPending:['ready','running'].includes(runtime?.phase)&&!runtime?.cleanupPending;
+      announce(complete?{start:'实例已启动',stop:'实例已停止',restart:'实例已重启'}[action]:'实例状态：'+runtimeLabel(id));
     } catch (error) {
       service.controlError=error.message||'操作失败，请重试。';
       if (service.request) await service.request;
       await refreshService();
-    } finally { service.busy=false; updateRuntimeStatus(); schedulePoll(); }
+    } finally { service.busy=false; updateRuntimeStatus(); schedulePoll(); document.dispatchEvent(new Event('jarvis:instance-updated')); }
   }
   function draftProblems(draft) {
     if (!draft || !Array.isArray(draft.nodes)) return ['此窗口草稿无法读取，原内容已保留。'];

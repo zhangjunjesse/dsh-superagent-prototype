@@ -301,3 +301,22 @@ test('failed session cleanup can be retried through stop even after the child pr
   ui.action('runtime-stop','root').click();await until(()=>ui.query('[data-runtime-phase]').textContent==='已停止'&&!ui.action('runtime-start','root').disabled,'cleanup retry');
   assert.equal(ui.query('[data-runtime-error]').hidden,true);
 });
+
+test('runtime describes the whole instance and never announces stop completion while shutdown is pending',async t=>{
+  const initial=snapshot();initial.runtime.instances.push({instanceId:'root',pid:500,phase:'ready',generation:2});
+  const ui=await open(t,{initial});ui.nav('runtime');
+  assert.match(ui.query('[data-runtime-summary]').textContent,/贾维斯对话、任务路由和 Worker/);
+  assert.match(ui.query('.runtime-operation-note').textContent,/下级实例按任务绑定接收停止请求，其独立进程在各自的运行状态中管理/);
+  let changes=0;ui.d.addEventListener('jarvis:instance-updated',()=>{changes++;});
+  ui.backend.hook=request=>{if(request.path==='/api/system/root/stop'){
+    Object.assign(ui.backend.snapshot.runtime.instances[0],{phase:'stopping'});return ui.backend.snapshot;
+  }};
+  ui.action('runtime-stop','root').click();
+  await until(()=>ui.query('[data-runtime-phase]').textContent==='停止中'&&changes===1,'stop still in progress');
+  assert.match(ui.query('#composition-toast').textContent,/停止中/);
+  assert.doesNotMatch(ui.query('#composition-toast').textContent,/实例已停止/);
+  Object.assign(ui.backend.snapshot.runtime.instances[0],{pid:null,phase:'stopped',cleanupPending:true});await ui.poll();
+  assert.equal(ui.query('[data-runtime-phase]').textContent,'停止未完成');
+  assert.equal(ui.action('runtime-start','root').disabled,true);
+  assert.equal(ui.action('runtime-stop','root').disabled,false);
+});

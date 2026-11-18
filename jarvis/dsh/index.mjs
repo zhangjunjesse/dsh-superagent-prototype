@@ -34,7 +34,8 @@ export async function apply(ctx, config) {
   const rootStateDir = join(config.systemManagement?.rootDir ?? join(config.stateDir, 'superjarvis'), 'instances', 'root', 'state');
   const adoption = config.systemManagement !== false ? readOriginalAdoption(rootStateDir) : undefined;
   const gatewayOptions = adoption ? { adoptedRoot: { stateDir: rootStateDir, identity: adoption.identity } } : {};
-  const runtime = new JarvisRuntime(ctx, { ...config, dataFile: join(config.stateDir, 'jarvis-dsh.sqlite') });
+  const runtime = new JarvisRuntime(ctx, { ...config, lifecycleManaged: config.systemManagement !== false,
+    dataFile: join(config.stateDir, 'jarvis-dsh.sqlite') });
   const csrf = randomBytes(32).toString('hex');
   // Session-switch recovery needs its durable notification ledgers before optional engine management initializes.
   try {
@@ -47,7 +48,8 @@ export async function apply(ctx, config) {
       rootDir: config.systemManagement?.rootDir ?? join(config.stateDir, 'superjarvis'),
       capabilityCatalog: workspace => workerCatalog(ctx, workspace, config.workspace, config.preset || 'jarvis'),
       // Daily conversation settings are captured per user turn, independently of instance execution models.
-      managerOptions: { preset: config.preset || 'jarvis', conversationModel: () => captureConversationModel(runtime.store) },
+      managerOptions: { preset: config.preset || 'jarvis', conversationModel: () => captureConversationModel(runtime.store),
+        lifecycleParticipants: { root: runtime } },
       defaultModel: () => {
         const value = runtime.model().value;
         return value.endpoint && value.model ? { provider: value.endpoint, model: value.model,
@@ -59,7 +61,7 @@ export async function apply(ctx, config) {
       },
     });
   } catch (error) {
-    // Optional instance management must not take the existing conversation offline.
+    // History/settings remain available; execution stays closed without an instance owner.
     systemError = '实例管理暂不可用，请检查已保存的系统配置与服务日志';
     ctx.logger.warn(error instanceof SystemControlError ? error.message : 'SuperJarvis 实例管理初始化失败');
   }

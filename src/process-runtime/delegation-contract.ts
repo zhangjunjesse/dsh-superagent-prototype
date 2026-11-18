@@ -34,6 +34,8 @@ export interface DelegationSnapshot {
   receipts: Record<string, 'pending' | 'applied' | 'denied' | 'conflict' | 'unavailable' | 'ignored'>;
   /** Produced by the child's actual TaskFiles index, never inferred from a model summary. */
   artifacts?: VerifiedArtifact[];
+  /** Lifecycle controls acknowledge the bound native turn and background work have drained. */
+  executionStopped?: boolean;
 }
 export function verifiedDelegationArtifacts(snapshot: DelegationSnapshot): VerifiedArtifact[] {
   const items = z.array(VerifiedArtifactSchema).max(20).parse(snapshot.artifacts ?? [])

@@ -200,11 +200,18 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
   };
   if (!managementOnly) transport.sessions.install(callbacks);
   let host = new hostModule.NativeHost(ctx, config, hostPeer, { managementOnly, isCurrent: () => current });
-  let closed = false; const beforeClose = [];
+  let closed = false, expectedCloseFailure; const beforeClose = [];
   async function close() {
     if (closed) return; closed = true;
     for (const stop of beforeClose.reverse()) await stop();
-    await host.close(); transport.close(); hostPeer.close(); ownerPeer.close(); store.close();
+    if (expectedCloseFailure) {
+      // An uncertain upstream producer must remain a failed stop. Release only
+      // the isolated fixture resources after asserting that production result.
+      await assert.rejects(host.close(), expectedCloseFailure);
+      for (const dispose of host.disposers.splice(0)) await dispose();
+      host.wire.close(); await host.pumping; host.journal.close();
+    } else await host.close();
+    transport.close(); hostPeer.close(); ownerPeer.close(); store.close();
     for (const handle of controllerHandles.reverse()) await handle.dispose();
     for (const scope of nativeScopes.reverse()) await scope.dispose(); await ctx.fiber.dispose();
     const part = relative(resolve(tmpdir()), resolve(directory)); assert.ok(part.startsWith('original-native-host-') && !isAbsolute(part) && !part.includes('..'));
@@ -212,7 +219,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
   }
   cleanup = close;
   return { ctx, directory, modules, config, get host() { return host; }, get transport() { return transport; }, store, coreModule, scopeModule, promptModule, toolsModule, tool, toolCalls, modelCalls, authorizations, observed, errors, controllerCalls, workspaceAccounts,
-    close, beforeClose: stop => beforeClose.push(stop), setPolicy: value => { policy = { ...policy, ...value }; }, policy: () => policy, end: () => { ended = true; }, obsolete: () => { current = false; },
+    close, beforeClose: stop => beforeClose.push(stop), expectCloseFailure: error => { expectedCloseFailure = error; }, setPolicy: value => { policy = { ...policy, ...value }; }, policy: () => policy, end: () => { ended = true; }, obsolete: () => { current = false; },
     setResponder: value => { responder = value; },
     ensure: () => transport.sessions.ensure({ sessionId: policy.sessionId, role: policy.role, cwd: policy.cwd, title: 'Isolated original native fixture', model: config.model }),
     execute: (name, args = {}, agent = ctx.agents.get(policy.sessionId)) => ctx.tools.execute({ callId: `fixture-${name}-${Date.now()}`, name, arguments: args, agent, signal: new AbortController().signal }),

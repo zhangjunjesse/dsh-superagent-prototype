@@ -7,9 +7,11 @@ import { NativeWire } from './native-wire.mjs';
 import { NativeJournal, nativeHash } from './native-journal.mjs';
 import { decodeEnvironment, scopedSubprocessEnvironment } from './native-environment.mjs';
 import { executeWorkerTool } from './worker-execution.mjs';
+import { readOriginalAdoption } from './original-adoption.mjs';
 
 const deliveries = new WeakMap();
 const nativeOwners = new WeakMap();
+const lifecycleGuards = new WeakMap();
 const preparedAssembly = Symbol('dsh-superagent-native-assembly');
 const fileTools = new Set(['read', 'read_image', 'glob', 'grep', 'write', 'edit']);
 const samePath = (a, b) => {
@@ -25,11 +27,114 @@ const acknowledgedContext = (message, rows) => rows.some(row => row.state === 'a
   message.source.summary === row.input.mode.inject && Object.keys(message.source).length === 3 &&
   message.content?.length === 1 && message.content[0].type === 'text' && message.content[0].text === row.input.text);
 
+/** Keep persisted organization Sessions fenced even without a running business host. */
+export function installNativeLifecycleGuard(ctx, instances) {
+  if (typeof ctx.on !== 'function' || !ctx.agents) return;
+  let guard = lifecycleGuards.get(ctx);
+  if (!guard) {
+    const configurations = new Map(), owners = new Map(), guarded = new WeakSet();
+    const refresh = () => {
+      for (const config of configurations.values()) {
+        const identity = { instanceId: config.instanceId, stateDir: realpathSync.native(config.stateDir), workspace: realpathSync.native(config.workspace) };
+        const file = join(config.stateDir, 'native-host.sqlite');
+        let rows = [];
+        if (existsSync(file)) {
+          const journal = new NativeJournal(file, identity, { readOnly: true });
+          try { rows = journal.sessions(); } finally { journal.close(); }
+        }
+        const adopted = readOriginalAdoption(config.stateDir, config.instanceId)?.sessions ?? [];
+        for (const id of [...rows.map(row => row.id), ...adopted.map(row => row.sessionId)]) {
+          const previous = owners.get(id);
+          if (previous && previous !== identity.stateDir) throw new Error('Native Session has conflicting persistent organization owners');
+          owners.set(id, identity.stateDir);
+        }
+      }
+    };
+    const ancestryOwner = async agent => {
+      const path = [agent.id], seen = new Set(path);
+      let header = agent.session.header;
+      // Legacy subagents can predate native journal registration. Their DSH
+      // Session headers retain the original parent chain even when no ancestor
+      // Agent is loaded in this Context. Only a validated persistent owner at
+      // the end of that chain establishes organization ownership.
+      for (let depth = 0; depth < 64; depth++) {
+        const parent = header.parentSession;
+        if (parent === undefined) return undefined;
+        if (typeof parent !== 'string' || !parent || parent.includes('\0') || seen.has(parent)) throw new Error('Native Session ancestry is invalid');
+        const owner = owners.get(parent);
+        if (owner) {
+          for (const id of path) {
+            const previous = owners.get(id);
+            if (previous && previous !== owner) throw new Error('Native Session has conflicting ancestry owners');
+            owners.set(id, owner);
+          }
+          return owner;
+        }
+        seen.add(parent); path.push(parent);
+        const live = ctx.agents.get(parent), stored = await ctx.sessionPersistence?.stat(parent);
+        const inherited = stored?.header ?? live?.session.header;
+        if (!inherited) throw new Error('Native Session ancestry source is unavailable');
+        if (inherited.id !== parent || stored?.header && live && stored.header.parentSession !== live.session.header.parentSession) throw new Error('Native Session ancestry identity changed');
+        header = inherited;
+      }
+      throw new Error('Native Session ancestry exceeds the verification limit');
+    };
+    const bind = agent => {
+      if (guarded.has(agent) || !owners.has(agent.id) && agent.session.header.parentSession === undefined) return;
+      guarded.add(agent);
+      const activeOwner = () => {
+        if (!owners.has(agent.id)) return undefined;
+        const host = nativeOwners.get(agent)?.host;
+        if (!host || host.managementOnly || host.closed || host.closing || host.lifecycleStopping || !host.isCurrent()
+          || realpathSync.native(host.config.stateDir) !== owners.get(agent.id) || host.bindings.get(agent.id)?.agent !== agent) {
+          throw new Error('The owning organization instance is stopped; native execution is unavailable');
+        }
+        host.capabilityAdmission(); return host;
+      };
+      let checking;
+      const ownerFor = () => {
+        if (owners.has(agent.id)) return activeOwner();
+        const previous = nativeOwners.get(agent)?.host;
+        checking ??= ancestryOwner(agent).finally(() => { checking = undefined; });
+        return checking.then(() => {
+          // An initially unowned Session can be claimed while persistence yields.
+          if (nativeOwners.get(agent)?.host !== previous) throw new Error('Native ancestry verification belongs to an obsolete organization owner');
+          return activeOwner();
+        });
+      };
+      agent.ctx.tools.guard(() => { try { activeOwner(); } catch (error) { return error.message; } });
+      for (const event of ['agent/request', 'tools/pre-execute']) agent.ctx.on(event, async (input, next) => {
+        const proposed = ownerFor(), owner = proposed instanceof Promise ? await proposed : proposed;
+        if (owner && event === 'tools/pre-execute') input.signal = AbortSignal.any([input.signal, owner.lifetime.signal].filter(Boolean));
+        const result = await next();
+        const fresh = ownerFor();
+        if ((fresh instanceof Promise ? await fresh : fresh) !== owner) throw new Error('Native invocation belongs to an obsolete organization owner');
+        input.signal?.throwIfAborted(); return result;
+      }, { prepend: true });
+      agent.ctx.on('agent/pre-step', async (_input, next) => {
+        let owner;
+        try { const proposed = ownerFor(); owner = proposed instanceof Promise ? await proposed : proposed; } catch { return { kind: 'reject' }; }
+        const result = await next();
+        try { const fresh = ownerFor(); return (fresh instanceof Promise ? await fresh : fresh) === owner ? result : { kind: 'reject' }; } catch { return { kind: 'reject' }; }
+      }, { prepend: true });
+    };
+    guard = { configurations, refresh, bind }; lifecycleGuards.set(ctx, guard);
+    ctx.on('agent/created', ({ agent }) => { refresh(); bind(agent); });
+  }
+  for (const config of instances) guard.configurations.set(realpathSync.native(config.stateDir), config);
+  guard.refresh();
+  for (const agent of ctx.agents.list()) guard.bind(agent);
+}
+
 export class NativeHost {
   constructor(ctx, config, peer, { managementOnly = false, isCurrent = () => true, adoption, capabilityHold } = {}) {
     this.ctx = ctx; this.config = config; this.managementOnly = managementOnly; this.isCurrent = isCurrent;
     this.bindings = new Map(); this.closed = false; this.closing = false; this.attached = false; this.cursor = 0;
     this.ensuring = new Map();
+    this.executionTasks = new Set();
+    this.nativeInvocations = new Map();
+    this.backgroundServices = new Map([['jobs', new Set()], ['subagents', new Set()]]);
+    this.drainTimeoutMs = 15000;
     this.capabilityHold = capabilityHold ? { ...capabilityHold } : undefined; this.capabilitySnapshots = new Map(); this.invocationSequence = 0;
     this.lifetime = new AbortController(); this.disposers = []; this.retry = undefined; this.pumping = undefined;
     this.trusted = new Map((adoption?.sessions ?? []).map(session => [session.sessionId, session]));
@@ -38,8 +143,13 @@ export class NativeHost {
     this.executor = original.localExecutorNative(ctx, id => Boolean(this.journal?.session(id)));
     this.wire = new NativeWire(peer, 'native.host', 'native.owner', (method, input, signal) => this.dispatch(method, input, signal));
     const identity = { instanceId: config.instanceId, stateDir: realpathSync.native(config.stateDir), workspace: realpathSync.native(config.workspace) };
+    installNativeLifecycleGuard(ctx, [config]);
     if (managementOnly && existsSync(join(config.stateDir, 'native-host.sqlite'))) this.journal = new NativeJournal(join(config.stateDir, 'native-host.sqlite'), identity, { readOnly: true });
     if (!managementOnly) {
+      for (const [name, services] of this.backgroundServices) {
+        const observer = ctx.inject([name], scope => { services.add(scope.get(name)); });
+        this.disposers.push(() => observer.dispose());
+      }
       this.journal = new NativeJournal(join(config.stateDir, 'native-host.sqlite'), identity);
       let delivery = deliveries.get(ctx);
       if (!delivery) { delivery = new original.AgentDelivery(ctx); deliveries.set(ctx, delivery); }
@@ -61,8 +171,28 @@ export class NativeHost {
   active() {
     if (this.closed || this.closing || !this.isCurrent()) throw new Error('Native instance generation is no longer active');
   }
+  setLifecycleStopping(stopping = true) {
+    if (!stopping || this.lifecycleStopping) return;
+    this.lifecycleStopping = true;
+    this.lifetime.abort(new Error('Native instance is stopping'));
+    for (const binding of this.bindings.values()) {
+      if (!binding.parent) binding.agent.cancel({ kind: 'user' }, { keepInbox: true });
+      this.release(binding);
+    }
+  }
+  lifecycleAdmission() {
+    this.active();
+    if (this.lifecycleStopping) throw new Error('Native instance is stopping; new execution is closed');
+    if (this.uncertainBackground().length) throw new Error('Native background producer termination is unconfirmed; execution remains closed');
+  }
+  async trackExecution(work) {
+    const done = Promise.withResolvers(); this.executionTasks.add(done.promise);
+    try { return await work(); }
+    finally { this.executionTasks.delete(done.promise); done.resolve(); }
+  }
   setCapabilityHold(hold) { this.capabilityHold = hold ? { ...hold } : undefined; }
   capabilityAdmission() {
+    this.lifecycleAdmission();
     if (this.capabilityHold?.frozen) throw new Error('Worker capability application has frozen new native work');
   }
   adoptedContext(binding, message, rows) {
@@ -92,9 +222,33 @@ export class NativeHost {
     }
     return work;
   }
+  uncertainBackground(ids) {
+    this.backgroundEvidence ??= { cursor: 0, jobs: new Map() };
+    const evidence = this.backgroundEvidence;
+    for (;;) {
+      const page = this.journal?.events(evidence.cursor) ?? [];
+      if (!page.length) break;
+      for (const row of page) {
+        const { event } = row;
+        for (const item of event.kind === 'restored' ? event.events : event.kind === 'event' ? [event.event] : []) {
+          if (item.type !== 'job/settled') continue;
+          const value = item.data, key = `${event.sessionId}:${value.jobId}`;
+          // DSH's first-wins teardown record can say "failed" and drop the job
+          // without its producer reporting an end. Keep that original durable
+          // uncertainty across retries/hosts instead of treating absence as idle.
+          if (value.cause === 'teardown' && value.producerReported === false) evidence.jobs.set(key, { sessionId: event.sessionId, jobId: value.jobId });
+          else if (value.producerReported === true) evidence.jobs.delete(key);
+        }
+        evidence.cursor = row.seq;
+      }
+    }
+    return [...evidence.jobs.values()].filter(job => !ids || ids.has(job.sessionId));
+  }
   async capabilityActivity() {
     const work = [];
     for (const [id] of this.ensuring) work.push({ id: `native-ensure:${id}`, title: '正在建立执行会话', kind: 'native-admission' });
+    for (const invocation of this.nativeInvocations.values()) work.push({ id: `native-invocation:${invocation.id}`, title: invocation.name,
+      kind: 'native-tool', sessionId: invocation.sessionId, status: 'running' });
     for (const binding of this.bindings.values()) {
       const agent = binding.agent;
       if (agent.status !== 'idle') work.push({ id: `native-session:${binding.id}`, kind: binding.parent ? 'subagent' : 'native-session',
@@ -102,11 +256,21 @@ export class NativeHost {
         sessionId: binding.id, ...(binding.assignmentId ? { assignmentId: binding.assignmentId } : {}) });
       work.push(...this.capabilityInboxWork(binding));
       const jobs = await this.executor.runningJobs(binding.id, new Set());
-      work.push(...jobs.map(job => ({ id: `native-job:${job.id}`, title: job.name, kind: 'job', sessionId: binding.id, jobId: job.id, status: 'running' })));
+      work.push(...jobs.map(job => ({ id: `native-job:${binding.id}:${job.id}`, title: job.name, kind: 'job', sessionId: binding.id, jobId: job.id, status: 'running' })));
       for (const [id, name] of binding.toolInvocations ?? []) work.push({ id: `native-tool:${binding.id}:${id}`, title: name, kind: 'native-tool', sessionId: binding.id, status: 'running' });
       for (const row of this.journal.deliveries(binding.id)) if (!['acknowledged', 'revoked'].includes(row.state)) {
         work.push({ id: `native-delivery:${row.id}`, deliveryId: row.id, deliveryHash: row.hash, title: '等待组织确认的会话输入', kind: 'native-admission', sessionId: binding.id, status: row.state });
       }
+    }
+    const seen = new Set(work.map(item => item.id)), registries = new Set([...this.backgroundServices.get('jobs'), this.ctx.get('jobs')].filter(Boolean));
+    for (const session of this.journal?.sessions() ?? []) for (const registry of registries) for (const job of registry.list(session.id)) {
+      const id = `native-job:${session.id}:${job.id}`;
+      if (job.owner !== session.id || !['running', 'stopping'].includes(job.status) || seen.has(id)) continue;
+      seen.add(id); work.push({ id, title: job.label?.split('\n')[0]?.trim() || job.id, kind: 'job', sessionId: session.id, jobId: job.id, status: job.status });
+    }
+    for (const job of this.uncertainBackground()) {
+      const id = `native-job:${job.sessionId}:${job.jobId}`;
+      if (!seen.has(id)) work.push({ id, title: '后台任务停止结果未确认', kind: 'job', ...job, status: 'unknown' });
     }
     const activity = { busy: work.length > 0, work, fingerprint: activityFingerprint(work) };
     this.capabilitySnapshots.set(activity.fingerprint, activity);
@@ -139,9 +303,11 @@ export class NativeHost {
     await Promise.all(removals);
     // Admission and invocation guards are already frozen. Cancel only this
     // organization's actual bindings; another organization's Sessions stay live.
-    for (const binding of this.bindings.values()) binding.agent.cancel({ kind: 'user' }, { keepInbox: true });
-    for (const binding of this.bindings.values()) if (!binding.parent) await this.executor.stopBackground(binding.id, 'Worker capabilities are being applied', true);
+    for (const binding of this.bindings.values()) if (!binding.parent) binding.agent.cancel({ kind: 'user' }, { keepInbox: true });
+    for (const session of this.journal.sessions()) if (!session.parent) await this.drainBackground(session.id, 'Worker capabilities are being applied', true);
     await Promise.all([...this.bindings.values()].map(binding => binding.agent.whenIdle()));
+    await Promise.allSettled([...this.executionTasks]);
+    for (const session of this.journal.sessions()) if (!session.parent) await this.drainBackground(session.id, 'Worker capabilities are being applied', true);
     await this.ctx.sessionPersistence.flush();
     return this.capabilityActivity();
   }
@@ -160,7 +326,7 @@ export class NativeHost {
   }
   gated(sessionId) { return this.journal.deliveries(sessionId).some(row => !['acknowledged', 'revoked'].includes(row.state)); }
   async admitted(binding, signal) {
-    this.active();
+    this.lifecycleAdmission();
     while (this.gated(binding.id)) {
       await new Promise((resolve, reject) => {
         const aborted = () => { binding.waiters.delete(done); reject(signal?.reason ?? new Error('Native owner stopped before admission')); };
@@ -170,11 +336,12 @@ export class NativeHost {
         this.lifetime.signal.addEventListener('abort', aborted, { once: true });
         if (signal?.aborted || this.lifetime.signal.aborted) aborted();
       });
-      this.active();
+      this.lifecycleAdmission();
     }
   }
   release(binding) { for (const resolve of binding.waiters) resolve(); binding.waiters.clear(); }
   ensure(input) {
+    this.lifecycleAdmission();
     if (!this.journal?.session(input.sessionId) && !this.trusted.has(input.sessionId)) this.capabilityAdmission();
     const pending = this.ensuring.get(input.sessionId);
     if (pending) return pending;
@@ -185,6 +352,7 @@ export class NativeHost {
     this.active();
     const policy = await this.policy(input.sessionId);
     await this.owner('authorize', { sessionId: input.sessionId, operation: 'request' });
+    this.lifecycleAdmission();
     if (input.role !== policy.role || !samePath(input.cwd, policy.cwd)) throw new Error('Native Session directory or role does not match its actual owner');
     const live = this.ctx.agents.get(input.sessionId);
     const persisted = await this.ctx.sessionPersistence.stat(input.sessionId);
@@ -198,12 +366,15 @@ export class NativeHost {
     // Sessions.ensure. Direct agents.create omits the durable workspace account
     // and controller-owned model selection used by DSH's ordinary Session UI.
     const workspace = await this.ctx.workspaceRegistry.create(input.cwd);
+    this.lifecycleAdmission();
     let result = await this.ctx.sessionController.resolveAgent(input.sessionId);
+    this.lifecycleAdmission();
     if ('error' in result && result.error.code === 'session/not-found') {
       const created = await this.ctx.sessionController.create({ sessionId: input.sessionId, workspaceId: workspace.id, agentPreset: preset });
       if (created.sessionId !== input.sessionId) throw new Error('DSH created a different Session identity');
       result = await this.ctx.sessionController.resolveAgent(input.sessionId);
     }
+    this.lifecycleAdmission();
     if ('error' in result) throw result.error;
     if (result.agent.id !== input.sessionId || !samePath(result.agent.session.header.cwd, policy.cwd)) throw new Error('Resolved native Session has a different identity or workspace');
     const claim = nativeOwners.get(result.agent);
@@ -230,23 +401,41 @@ export class NativeHost {
   }
   async decorate(binding, descendant = false) {
     const { scope, agent } = binding;
+    // Capture ownership before any native permission or pre-execution await.
+    // A delayed call must never borrow a later host's guards for the same Session.
+    binding.disposers.push(scope.on('tools/pre-execute', async (execution, next) => {
+      this.capabilityAdmission();
+      const done = Promise.withResolvers(); this.executionTasks.add(done.promise);
+      const finish = () => { this.nativeInvocations.delete(execution); this.executionTasks.delete(done.promise); done.resolve(); };
+      this.nativeInvocations.set(execution, { id: ++this.invocationSequence, name: execution.name, sessionId: binding.id, finish });
+      execution.signal = AbortSignal.any([execution.signal, this.lifetime.signal].filter(Boolean));
+      try { const result = await next(); this.capabilityAdmission(); execution.signal.throwIfAborted(); return result; }
+      catch (error) { finish(); throw error; }
+    }, { prepend: true }));
+    binding.disposers.push(scope.on('tools/result', execution => this.nativeInvocations.get(execution)?.finish()));
     binding.disposers.push(scope.tools.guard(execution => {
-      if (this.closed || this.closing || !this.isCurrent() || execution.agent !== agent || this.bindings.get(binding.id) !== binding) return 'Native instance request is no longer active';
+      if (this.lifecycleStopping || this.closed || this.closing || !this.isCurrent() || execution.agent !== agent || this.bindings.get(binding.id) !== binding) return 'Native instance request is no longer active';
       if (!binding.effective?.has(execution.name)) return 'Tool is outside this Session role or organization capability';
       if (this.capabilityHold?.frozen) return 'Worker capability application has frozen native tool invocations';
       return binding.role === 'orchestrator' ? original.noWait(execution, () => this.routed(agent)) : undefined;
     }));
     binding.disposers.push(scope.on('tools/execute', async (execution, next) => {
-      await this.verifyInvocation(binding, 'tool', execution.name, execution.signal);
-      this.capabilityAdmission();
-      const id = execution.callId ?? ++this.invocationSequence;
-      binding.toolInvocations ??= new Map(); binding.toolInvocations.set(id, execution.name);
-      try { return await this.environment.run(binding.policy.environment, next); }
-      finally { binding.toolInvocations.delete(id); }
+      this.lifecycleAdmission();
+      execution.signal = AbortSignal.any([execution.signal, this.lifetime.signal].filter(Boolean));
+      return this.trackExecution(async () => {
+        await this.verifyInvocation(binding, 'tool', execution.name, execution.signal);
+        this.capabilityAdmission();
+        const id = execution.callId ?? ++this.invocationSequence;
+        binding.toolInvocations ??= new Map(); binding.toolInvocations.set(id, execution.name);
+        try { return await this.environment.run(binding.policy.environment, next); }
+        finally { binding.toolInvocations.delete(id); }
+      });
     }, { prepend: true }));
     binding.disposers.push(scope.on('agent/inbox/claimed', ({ message }) => binding.inFlightInputs.add(message.id)));
     binding.disposers.push(scope.on('agent/pre-step', async (payload, next) => {
+      if (this.lifecycleStopping) return { kind: 'reject' };
       const result = await next();
+      if (this.lifecycleStopping) return { kind: 'reject' };
       if (result.kind !== 'enter') return result;
       const revoked = new Set(this.journal.deliveries(binding.id).filter(row => row.state === 'revoked').map(row => original.messageId(row.input.requestId)));
       if (payload.messages.length && payload.messages.every(message => revoked.has(message.id))) return { kind: 'reject' };
@@ -291,7 +480,10 @@ export class NativeHost {
       this.capabilityAdmission();
       await this.admitted(binding, _payload.signal);
       await this.verifyInvocation(binding, 'request', undefined, _payload.signal);
-      return next();
+      this.capabilityAdmission();
+      const result = await next();
+      this.capabilityAdmission();
+      return result;
     }, { prepend: true }));
     if (!descendant) {
       const skills = scope.inject(['skills'], child => { binding.skillScope = child; binding.skillRevision = undefined; this.refreshSkills(binding); });
@@ -357,14 +549,16 @@ export class NativeHost {
         for (const definition of business) binding.toolDisposers.push(scope.tools.register({ ...definition,
           output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => {
             const text = { type: 'text', text: JSON.stringify(value) }; return value?.image ? [text, { type: 'image', attachment: value.image }] : [text];
-          } }, execute: (args, execution) => this.owner('tool', { sessionId: binding.id, name: definition.name, args }, execution.signal) }));
+          } }, execute: (args, execution) => { this.capabilityAdmission(); execution.signal?.throwIfAborted();
+            return this.owner('tool', { sessionId: binding.id, name: definition.name, args }, execution.signal); } }));
         for (const [name, definition] of nativeFiles) binding.fileDisposers.push(scope.tools.register({ ...definition,
           execute: async (args, execution) => {
             await this.owner('authorize', { sessionId: binding.parent ?? binding.id, operation: 'tool', toolName: name }, execution.signal);
+            this.capabilityAdmission(); execution.signal?.throwIfAborted();
             if (!scope.tools.get(name, scopeParentOf(agent))) throw new Error('Native tool is restricted outside this instance');
             return executeWorkerTool({ scope, definition, name, args, execution, workspace: binding.cwd,
               readRoots: [binding.policy.skillDirectory, ...binding.policy.skills.flatMap(skill => skill.resourceDirectory ? [skill.resourceDirectory] : [])],
-              skills: binding.externalSkills, check: () => this.active() });
+              skills: binding.externalSkills, check: () => { this.capabilityAdmission(); execution.signal?.throwIfAborted(); } });
           } }));
         binding.toolSignature = signature;
       }
@@ -563,6 +757,7 @@ export class NativeHost {
     const binding = this.binding(sessionId);
     await this.owner('authorize', { sessionId, operation: 'tool', toolName: 'orchestrator_eval_read' }, signal);
     const source = await this.owner('sourceContext', { sessionId, triggerId: input.trigger.id }, signal);
+    this.capabilityAdmission(); signal?.throwIfAborted();
     if (nativeHash(source.trigger) !== nativeHash(input.trigger) || !samePath(source.deployment.stateDir, input.stateDir)) throw new Error('Source image context does not match its actual owner');
     const registry = new original.SourceRegistry(() => source.settings), releases = [];
     try {
@@ -575,9 +770,15 @@ export class NativeHost {
   }
   async dispatch(method, input, signal) {
     this.active();
+    // Keep receipts, cancellation and persistence callable while the business
+    // owner drains; a stopping generation cannot start another execution.
+    if (['ensure', 'deliver', 'probe', 'runPrepare', 'readSourceImage'].includes(method)) {
+      this.lifecycleAdmission(); signal = AbortSignal.any([signal, this.lifetime.signal].filter(Boolean));
+    }
+    if (this.lifecycleStopping && method === 'delegate' && !['query', 'stop'].includes(input?.operation)) this.lifecycleAdmission();
     if (method === 'modelCatalog') return this.ctx.sessionController.modelCatalog();
     if (method === 'resolveModel') return original.resolveRoleModel(this.ctx, input.model);
-    if (method === 'probe') return original.runAsWorker(this.ctx.subprocess, input.argv, input.cwd, signal, decodeEnvironment(input.environment));
+    if (method === 'probe') return this.trackExecution(() => original.runAsWorker(this.ctx.subprocess, input.argv, input.cwd, signal, decodeEnvironment(input.environment)));
     if (method === 'flush') return this.ctx.sessionPersistence.flush();
     if (method === 'inspect') {
       if (!this.journal?.session(input.sessionId) && !this.trusted.has(input.sessionId)) throw new Error('Session history does not belong to this organization');
@@ -600,22 +801,73 @@ export class NativeHost {
     if (method === 'deliver') return this.stageDelivery(input);
     if (method === 'commitDelivery') return this.commitDelivery(input);
     if (method === 'revokeDelivery') return this.revokeDelivery(input);
-    if (method === 'readSourceImage') return this.sourceImage(input, signal);
-    if (method === 'runPrepare') return this.executor.runPrepare(input.command, input.cwd, decodeEnvironment(input.environment), signal);
+    if (method === 'readSourceImage') return this.trackExecution(() => this.sourceImage(input, signal));
+    if (method === 'runPrepare') return this.trackExecution(() => this.executor.runPrepare(input.command, input.cwd, decodeEnvironment(input.environment), signal));
     if (method === 'verifyDirectory') return this.executor.verifyDirectory(input.directory, signal);
+    if (method === 'stopBackground') {
+      if (!this.journal.session(input.sessionId) && !this.trusted.has(input.sessionId)) return;
+      return this.drainBackground(input.sessionId, input.reason, input.keepInbox);
+    }
     const binding = this.binding(input.sessionId);
     if (method === 'holds') return this.delivery.holds(binding.agent, input.requestId);
     if (method === 'inspect') return this.executor.events(binding.id);
     if (method === 'cancel') return this.executor.cancel(binding.id, input.keepInbox);
     if (method === 'whenIdle') return this.executor.whenIdle(binding.id);
     if (method === 'removePending') return this.executor.removePending(binding.id, input.messageIds);
-    if (method === 'stopBackground') return this.executor.stopBackground(binding.id, input.reason, input.keepInbox);
     if (method === 'stopSubagents') return this.executor.stopSubagents(binding.id, input.keepInbox);
     if (method === 'runningJobs') return this.executor.runningJobs(binding.id, new Set(input.except));
     if (method === 'collectJob') return this.executor.collectJob(binding.id, input.job, signal);
     if (method === 'untilQuiet') return this.executor.untilQuiet(binding.id, signal, new Set(input.except));
     if (method === 'killJobs') return this.executor.killJobs(binding.id, input.reason, new Set(input.except));
     throw new Error('Unsupported native host operation');
+  }
+  async drainBackground(sessionId, reason, keepInbox) {
+    // The persistent native ownership catalog includes descendants disposed by
+    // drainChildren. Their shell jobs still require their exact owner's cleanup.
+    const ids = new Set([sessionId, ...this.journal.sessions().filter(row => row.parent === sessionId).map(row => row.id)]);
+    const agents = [...ids].map(id => this.ctx.agents.get(id)).filter(Boolean), failures = [];
+    const registries = new Set([...this.backgroundServices.get('jobs'), this.ctx.get('jobs')].filter(Boolean));
+    // A native child disposal also releases its jobs registry. If cancellation
+    // fails there, DSH can drop an uncertain producer's row. Finish every owned
+    // job first, before any parent is allowed to dispose a child, so retries
+    // retain the original registration and cannot mistake absence for success.
+    for (const registry of registries) {
+      const executor = original.localExecutorNative({ agents: this.ctx.agents, get: name => name === 'jobs' ? registry : undefined });
+      const kills = await Promise.allSettled([...ids].map(id => executor.killJobs(id, reason, new Set())));
+      for (const result of kills) if (result.status === 'rejected') failures.push(result.reason);
+      for (const id of ids) try {
+        if (registry.list(id).some(job => job.owner === id && ['running', 'stopping'].includes(job.status))) {
+          failures.push(new Error(`Native Session ${id} still owns running background jobs`));
+        }
+      } catch (error) { failures.push(error); }
+    }
+    if (this.uncertainBackground(ids).length) failures.push(new Error('Native background producer termination is unconfirmed after provider teardown'));
+    if (failures.length) throw new AggregateError(failures, 'Native background cleanup has not completed');
+    for (const agent of agents) if (agent.id !== sessionId) agent.cancel({ kind: 'user' }, { keepInbox });
+    await Promise.all(agents.filter(agent => agent.id !== sessionId).map(agent => agent.whenIdle()));
+    for (const registry of registries) for (const id of ids) if (registry.list(id).some(job => job.owner === id && ['running', 'stopping'].includes(job.status))) {
+      failures.push(new Error(`Native Session ${id} still owns running background jobs`));
+    }
+    if (this.uncertainBackground(ids).length) failures.push(new Error('Native background producer termination is unconfirmed after provider teardown'));
+    if ([...this.nativeInvocations.values()].some(invocation => ids.has(invocation.sessionId))) failures.push(new Error('Native tool execution has not settled'));
+    if (failures.length) throw new AggregateError(failures, 'Native background cleanup has not completed');
+    const results = await Promise.allSettled([...ids].map(id => this.executor.stopBackground(id, reason, keepInbox)));
+    for (const result of results) if (result.status === 'rejected') failures.push(result.reason);
+    for (const [name, services] of this.backgroundServices) for (const service of services) if (service !== this.ctx.get(name)) {
+      const previous = original.localExecutorNative({ agents: this.ctx.agents, get: requested => requested === name ? service : undefined });
+      for (const id of ids) try { await previous.stopBackground(id, reason, keepInbox); } catch (error) { failures.push(error); }
+    }
+    for (const id of ids) {
+      try {
+        for (const registry of new Set([...registries, ...this.backgroundServices.get('jobs'), this.ctx.get('jobs')].filter(Boolean))) if (registry.list(id).some(job => job.owner === id && ['running', 'stopping'].includes(job.status))) {
+          failures.push(new Error(`Native Session ${id} still owns running background jobs`));
+        }
+      } catch (error) { failures.push(error); }
+    }
+    for (const agent of agents) if (agent.id !== sessionId && agent.status !== 'idle') failures.push(new Error(`Native descendant ${agent.id} is still executing`));
+    if ([...this.nativeInvocations.values()].some(invocation => ids.has(invocation.sessionId))) failures.push(new Error('Native tool execution has not settled'));
+    if (this.uncertainBackground(ids).length) failures.push(new Error('Native background producer termination is unconfirmed after provider teardown'));
+    if (failures.length) throw new AggregateError(failures, 'Native background cleanup has not completed');
   }
   async disposeBinding(binding, markStopped = true) {
     if (this.bindings.get(binding.id) === binding) this.bindings.delete(binding.id);
@@ -630,15 +882,33 @@ export class NativeHost {
   }
   async close() {
     if (this.closePromise) return this.closePromise;
-    this.closePromise = this.shutdown(); return this.closePromise;
+    // A timeout closes no ownership records. Retrying waits on the same real
+    // shutdown; an actual cleanup failure may be retried from retained bindings.
+    this.shutdownWork ??= this.shutdown().catch(error => { this.shutdownWork = undefined; throw error; });
+    let timer;
+    const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Native instance cleanup timed out; ownership is retained')), this.drainTimeoutMs); });
+    this.closePromise = Promise.race([this.shutdownWork, deadline]).finally(() => clearTimeout(timer)).catch(error => { this.closePromise = undefined; throw error; });
+    return this.closePromise;
   }
   async shutdown() {
     if (this.closed) return;
     this.closing = true; this.lifetime.abort(new Error('Native instance stopped')); clearTimeout(this.retry);
-    for (const binding of this.bindings.values()) binding.agent.cancel({ kind: 'user' }, { keepInbox: true });
-    await Promise.allSettled([...this.bindings.values()].filter(binding => !binding.parent).map(async binding => {
-      await this.executor.stopBackground(binding.id, 'Organization runtime stopped', true); await binding.agent.whenIdle();
+    for (const binding of this.bindings.values()) if (!binding.parent) binding.agent.cancel({ kind: 'user' }, { keepInbox: true });
+    await Promise.allSettled([...this.ensuring.values()]);
+    await Promise.allSettled([...this.executionTasks]);
+    this.cleanupBindings ??= new Map();
+    for (const binding of this.bindings.values()) this.cleanupBindings.set(binding.id, binding);
+    const owned = [...this.cleanupBindings.values()];
+    const results = await Promise.allSettled(owned.map(async binding => {
+      await this.drainBackground(binding.id, 'Organization runtime stopped', true); await binding.agent.whenIdle();
     }));
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    // The original stop bounds its waits and may return with a job still running.
+    // Retain pre-drain child identities: disposal must not hide surviving work.
+    for (const binding of new Set([...owned, ...this.bindings.values()])) {
+      if (binding.agent.status !== 'idle') failures.push(new Error(`Native Session ${binding.id} is still executing`));
+    }
+    if (failures.length) throw new AggregateError(failures, 'Native instance execution cleanup has not completed');
     for (const binding of [...this.bindings.values()]) await this.disposeBinding(binding);
     await this.ctx.sessionPersistence.flush();
     for (const dispose of this.disposers.splice(0)) dispose();

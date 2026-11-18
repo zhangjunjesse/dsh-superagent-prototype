@@ -29,6 +29,14 @@ export function controlledNativeFactory(onTurn) {
       if (method === 'probe') return '';
       if (method === 'flush') return;
       if (method === 'inspect') return state.sessions.get(input.sessionId)?.events ?? [];
+      if (method === 'revokeDelivery') {
+        const row = state.deliveries.get(input.id);
+        if (!row) return { revoked: true };
+        assert.equal(row.hash, input.hash);
+        const decision = await owner('revokeDelivery', { id: input.id, hash: input.hash, sessionId: row.input.sessionId });
+        if (!decision.revoked) throw new Error('Controlled native delivery already has an accepted owner receipt');
+        row.state = 'revoked'; return { revoked: true };
+      }
       if (managementOnly) throw new Error('Management-only test cannot start native work');
       if (method === 'delegate') return peer.handlers['delegation.send'](input);
       if (method === 'attach') {

@@ -21,7 +21,7 @@ type Preparation = { status: 'complete' | 'failed' | 'cancelled'; text: string; 
 
 /** Owns durable machine commands and task-specific preparation before core admission. */
 export class InboundDelegations {
-  private readonly jobs = new Set<Promise<void>>()
+  private readonly jobs = new Map<string, Promise<void>>()
   private closing = false
   constructor(private config: Config, private store: Store, private engine: Engine,
     private callbacks: { prepare(id: string, text: string): Promise<Preparation>; cancel(sessionKey: string): Promise<unknown>;
@@ -112,6 +112,22 @@ export class InboundDelegations {
     }
     return this.snapshot(this.store.get(incoming(request.delegationId))!)
   }
+  /** Execute an authenticated fixed parent stop through the original Engine's guarded command consumption. */
+  async receiveLifecycle(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
+    const request = DelegationRequestSchema.parse(envelope.request)
+    if (!['query', 'stop'].includes(request.operation)) throw new Error('Lifecycle delegation permits query and stop only')
+    const snapshot = await this.receive({ ...envelope, request })
+    if (request.operation !== 'stop') return snapshot
+    const row = this.store.get(incoming(request.delegationId))!, command = row.commands[request.commandId]
+    const trigger = command?.trigger
+    if (trigger && !this.engine.commandReceipt(trigger.id)?.consumption) {
+      try { this.engine.decide(trigger.id, { kind: 'stop', ticketId: trigger.dispatch!.targetTicketId!, reason: 'Owning parent organization stopped.' }) }
+      catch (error) {
+        if (this.engine.commandReceipt(trigger.id)?.consumption?.outcome !== 'ignored') throw error
+      }
+    }
+    return this.snapshot(this.store.get(incoming(request.delegationId))!)
+  }
   private submit(row: Incoming, command: Command, ticket?: Ticket): void {
     const r = command.request, id = key('delegation', row.source, r.delegationId, r.commandId)
     const trigger: Trigger = { id, source: 'delegation', threads: [{ source: 'delegation', id }],
@@ -165,8 +181,8 @@ export class InboundDelegations {
       }).catch(error => {
         const current = this.store.get(name)
         if (current?.phase === 'preparing') this.store.set(name, { ...current, phase: 'failed', error: String(error) })
-      }).finally(() => { this.jobs.delete(job) })
-      this.jobs.add(job)
+      }).finally(() => { if (this.jobs.get(row.request.delegationId) === job) this.jobs.delete(row.request.delegationId) })
+      this.jobs.set(row.request.delegationId, job)
     }
   }
   recover(): void {
@@ -193,5 +209,7 @@ export class InboundDelegations {
         commandId: key(id, 'capability-stop', operationId), text: 'Stopped to apply the confirmed Worker capability change.' } })
     }
   }
-  async close(): Promise<void> { this.closing = true; await Promise.allSettled([...this.jobs]) }
+  /** Wait for only this fixed delegation's preparation turn to settle after cancellation. */
+  async idle(id: string): Promise<void> { await this.jobs.get(id) }
+  async close(): Promise<void> { this.closing = true; await Promise.allSettled([...this.jobs.values()]) }
 }

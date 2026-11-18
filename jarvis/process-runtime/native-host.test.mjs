@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, realpathSync } from 'node:fs';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { available, nativeFixture } from './native-host-fixture.mjs';
 
@@ -14,6 +14,227 @@ async function persistedInbox(f, id) {
   }
   return inbox;
 }
+
+test('stopping a native lifecycle fences execution immediately while cancellation, history and flush remain usable', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t); await f.ensure();
+  const sessionId = f.policy().sessionId, agent = f.ctx.agents.get(sessionId);
+  const before = f.toolCalls.length;
+  f.host.setLifecycleStopping(true);
+  assert.equal((await f.execute('read')).isError, true);
+  assert.equal((await f.execute('subagent')).isError, true);
+  await assert.rejects(f.ensure(), /stopping/);
+  await assert.rejects(f.transport.sessions.deliver({ sessionId, requestId: 'stopped-native-input', text: 'must not run', mode: 'queue' }), /stopping/);
+  await assert.rejects(f.transport.executor.runPrepare('must not spawn', f.config.workspace, {}, new AbortController().signal), /stopping/);
+  const delivery = new f.coreModule.AgentDelivery(f.ctx);
+  await delivery.send(agent, 'direct-stopped-input', 'Direct native producer must not bypass stop', 'queue', new AbortController().signal);
+  await agent.whenIdle();
+  assert.equal(f.modelCalls.length, 0); assert.equal(f.toolCalls.length, before);
+  await f.host.dispatch('cancel', { sessionId, keepInbox: true });
+  await f.host.dispatch('whenIdle', { sessionId });
+  await f.host.dispatch('stopBackground', { sessionId, reason: 'test lifecycle', keepInbox: true });
+  await f.host.dispatch('flush', {});
+  assert.ok(Array.isArray(await f.host.dispatch('inspect', { sessionId })));
+});
+
+test('native delivery cannot cross a lifecycle stop while awaiting its original policy', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t, { inherited: [], local: [], allowedTools: [] }); await f.ensure();
+  const entered = Promise.withResolvers(), release = Promise.withResolvers(), original = f.host.policy;
+  let first = true;
+  f.host.policy = async function (...args) { const value = await original.apply(this, args); if (first) { first = false; entered.resolve(); await release.promise; } return value; };
+  t.after(() => { release.resolve(); f.host.policy = original; });
+  const sessionId = f.policy().sessionId;
+  const delivering = f.transport.sessions.deliver({ sessionId, requestId: 'lifecycle-policy-race', text: 'must not be admitted', mode: { inject: 'Notice' } });
+  const rejected = assert.rejects(delivering, /stopping/); await entered.promise;
+  f.host.setLifecycleStopping(true); release.resolve(); await rejected;
+  assert.equal(f.host.journal.deliveries(sessionId).length, 0);
+  assert.equal(f.modelCalls.length, 0);
+});
+
+test('failed native background drain retains ownership and can be retried instead of reporting closed', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t); await f.ensure();
+  const stopBackground = f.host.executor.stopBackground;
+  f.host.executor.stopBackground = async () => { throw new Error('Background cleanup not acknowledged'); };
+  await assert.rejects(f.host.close(), /cleanup has not completed/);
+  assert.equal(f.host.closed, false); assert.ok(f.host.bindings.size > 0);
+  assert.equal((await f.execute('read')).isError, true);
+  f.host.executor.stopBackground = stopBackground;
+  await f.host.close(); assert.equal(f.host.closed, true); assert.equal(f.host.bindings.size, 0);
+});
+
+test('native drain timeout retains the same unfinished cleanup for a later confirmed retry', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t); await f.ensure();
+  const release = Promise.withResolvers(), stopBackground = f.host.executor.stopBackground;
+  let cancellations = 0;
+  f.host.drainTimeoutMs = 25;
+  f.host.executor.stopBackground = async (...args) => { cancellations++; await release.promise; return stopBackground(...args); };
+  t.after(() => release.resolve());
+  await assert.rejects(f.host.close(), /cleanup timed out/);
+  assert.equal(f.host.closed, false); assert.ok(f.host.bindings.size > 0);
+  release.resolve(); await f.host.close();
+  assert.equal(f.host.closed, true); assert.equal(cancellations, 1);
+});
+
+test('native file definition does not execute after lifecycle stop during its final authorization await', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t, { allowedTools: ['read'], local: [], inherited: ['read'] });
+  await f.ensure(); writeFileSync(join(f.config.workspace, 'probe.txt'), 'controlled fixture');
+  const originalOwner = f.host.owner.bind(f.host), entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let authorizations = 0;
+  f.host.owner = async (method, input, signal) => {
+    const value = await originalOwner(method, input, signal);
+    if (method === 'authorize' && input.operation === 'tool' && input.toolName === 'read' && ++authorizations === 2) { entered.resolve(); await release.promise; }
+    return value;
+  };
+  t.after(() => release.resolve());
+  const pending = f.execute('read', { file_path: 'probe.txt' }); await entered.promise;
+  f.host.setLifecycleStopping(); release.resolve();
+  assert.equal((await pending).isError, true);
+  assert.equal(f.toolCalls.length, 0, 'Returning an error must not conceal a native tool execution after stop');
+});
+
+test('native pre-execution retains its original owner until cancellation settles and cannot borrow a replacement host', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t, { allowedTools: ['read'], local: [], inherited: ['read'] }); await f.ensure();
+  writeFileSync(join(f.config.workspace, 'probe.txt'), 'controlled fixture');
+  const agent = f.ctx.agents.get(f.policy().sessionId), entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const pause = agent.ctx.on('tools/pre-execute', async (_execution, next) => { entered.resolve(); await release.promise; return next(); });
+  f.beforeClose(() => { release.resolve(); pause(); });
+  const pending = f.execute('read', { file_path: 'probe.txt' }); await entered.promise;
+  f.host.drainTimeoutMs = 25; f.host.setLifecycleStopping();
+  await assert.rejects(f.host.close(), /cleanup timed out/); assert.equal(f.host.closed, false);
+  release.resolve(); assert.equal((await pending).isError, true); pause();
+  await f.host.close(); await f.restartNative(); await f.ensure();
+  assert.equal(f.toolCalls.length, 0);
+  assert.equal((await f.execute('read', { file_path: 'probe.txt' })).isError, false);
+});
+
+test('native cleanup verifies surviving jobs even when the original bounded stop returns successfully', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t); await f.ensure();
+  const { Service } = await f.load('@deepseek-ai/cordis'); let live = true;
+  class Jobs extends Service {
+    constructor() { super(f.ctx, 'jobs'); }
+    list(owner) { return live ? [{ id: 'slow-kill', owner, status: 'running' }] : []; }
+    async wait() { return { status: 'running' }; }
+    kill() {}
+  }
+  new Jobs(); f.beforeClose(() => { live = false; });
+  await assert.rejects(f.host.close(), /cleanup has not completed/);
+  assert.equal(f.host.closed, false); assert.ok(f.host.bindings.size > 0);
+  live = false; await f.host.close(); assert.equal(f.host.closed, true);
+});
+
+test('native cleanup waits for a manually invoked tool body that ignores cancellation', { skip: !available, timeout: 12000 }, async t => {
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const f = await nativeFixture(t, { allowedTools: ['todo_write'], inherited: [], local: [],
+    nativeTools: async (scope, _preset, { toolsModule }) => scope.tools.register(toolsModule.defineTool({ name: 'todo_write', description: 'Controlled long native tool', parameters: {},
+      output: { schema: { type: 'object', additionalProperties: true }, render: () => [] },
+      execute: async () => { entered.resolve(); await release.promise; return { completed: true }; } })) });
+  f.beforeClose(() => release.resolve()); await f.ensure();
+  const pending = f.execute('todo_write'); await entered.promise;
+  f.host.drainTimeoutMs = 25; f.host.setLifecycleStopping();
+  await assert.rejects(f.host.close(), /cleanup timed out/); assert.equal(f.host.closed, false);
+  release.resolve(); await pending; await f.host.close(); assert.equal(f.host.closed, true);
+});
+
+for (const mode of ['throws', 'pending']) test(`native child job cancellation that ${mode} retains its owner until the real producer settles`, { skip: !available, timeout: 18000 }, async t => {
+  const f = await nativeFixture(t, { realCapabilities: true, inherited: [], local: [], allowedTools: ['subagent'] }); await f.ensure();
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  f.setResponder(async function* (request) {
+    entered.resolve();
+    if (!request.signal.aborted) await Promise.race([release.promise, new Promise(resolve => request.signal.addEventListener('abort', resolve, { once: true }))]);
+    yield { type: 'finish', reason: { kind: 'aborted' } };
+  });
+  const parent = f.ctx.agents.get(f.policy().sessionId);
+  const spawned = await f.execute('subagent', { description: 'Retain original job ownership during stop', prompt: 'Return fixture reply' }, parent);
+  assert.equal(spawned.isError, false, JSON.stringify(spawned));
+  const child = f.ctx.agents.get(spawned.value.subagentId); await entered.promise;
+  const done = Promise.withResolvers(); let cancellations = 0;
+  const jobId = f.ctx.jobs.start({ owner: child.id, kind: 'native-cancel-postcondition', label: 'Actual unconfirmed producer', run: () => ({ done: done.promise,
+    cancel() { cancellations++; if (mode === 'throws') throw new Error('Controlled native producer cancel failure'); } }) });
+  const wait = f.ctx.jobs.wait.bind(f.ctx.jobs);
+  // Exercise the original bounded-stop timeout with the real registry and
+  // producer, using a short observation interval rather than waiting 10s each.
+  f.ctx.jobs.wait = (id, timeout, ...rest) => wait(id, Math.min(timeout, 25), ...rest);
+  f.beforeClose(() => { done.resolve({ status: 'killed' }); release.resolve(); });
+  f.host.setCapabilityHold({ operationId: `cancel-${mode}`, frozen: true });
+  const confirmed = await f.host.capabilityActivity();
+  assert.ok(confirmed.work.some(work => work.jobId === jobId));
+  await assert.rejects(f.host.cancelCapabilityWork(`cancel-${mode}`, confirmed), /cleanup has not completed/);
+  assert.equal(f.ctx.agents.get(child.id), child, 'failed capability cleanup must not dispose the actual job owner');
+  assert.ok(f.ctx.jobs.list(child.id).some(job => job.id === jobId && ['running', 'stopping'].includes(job.status)));
+  await assert.rejects(f.host.dispatch('stopBackground', { sessionId: parent.id, reason: 'Exact delegation cleanup', keepInbox: true }), /cleanup has not completed/);
+  await assert.rejects(f.host.dispatch('stopBackground', { sessionId: parent.id, reason: 'Exact delegation cleanup retry', keepInbox: true }), /cleanup has not completed/);
+  assert.equal(f.host.closed, false); assert.equal(f.ctx.agents.get(child.id), child);
+  assert.ok(f.ctx.jobs.list(child.id).some(job => job.id === jobId)); assert.ok(cancellations > 0);
+  done.resolve({ status: 'killed' });
+  await f.ctx.jobs.wait(jobId, 1000, child.id);
+  await f.host.close(); assert.equal(f.host.closed, true);
+  assert.equal(f.ctx.agents.get(child.id), undefined, 'normal original subagent disposal completes after the producer actually ends');
+});
+
+test('native provider teardown without a producer receipt remains uncertain across cleanup retries and journal reopening', { skip: !available, timeout: 18000 }, async t => {
+  const f = await nativeFixture(t, { realCapabilities: true, inherited: [], local: [], allowedTools: ['subagent'] }); await f.ensure();
+  const parent = f.ctx.agents.get(f.policy().sessionId);
+  const spawned = await f.execute('subagent', { description: 'Naturally completing child with uncertain job', prompt: 'Return fixture reply' }, parent);
+  assert.equal(spawned.isError, false, JSON.stringify(spawned));
+  const child = f.ctx.agents.get(spawned.value.subagentId); await child.whenIdle();
+  const done = Promise.withResolvers();
+  const jobId = f.ctx.jobs.start({ owner: child.id, kind: 'unconfirmed-native-producer', label: 'Original uncertain native job', run: () => ({ done: done.promise,
+    cancel() { throw new Error('Controlled cancellation failure during native natural disposal'); } }) });
+  f.beforeClose(() => done.resolve({ status: 'killed' })); f.expectCloseFailure(/cleanup has not completed/);
+  await assert.rejects(f.host.close(), /cleanup has not completed/);
+  assert.ok(child.session.snapshotEvents().some(event => event.type === 'job/settled' && event.data.jobId === jobId && event.data.producerReported === false));
+  assert.equal(f.ctx.jobs.list(child.id).some(job => job.id === jobId), false, 'the actual native provider discarded its registration');
+  await assert.rejects(f.host.close(), /cleanup has not completed/); assert.equal(f.host.closed, false);
+  assert.ok((await f.host.capabilityActivity()).work.some(work => work.jobId === jobId && work.status === 'unknown'));
+  // Native first-wins teardown publishes no later producer receipt. Even the
+  // controlled producer's completion cannot justify silently clearing unknown.
+  done.resolve({ status: 'killed' }); await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(f.host.close(), /cleanup has not completed/);
+  await f.ctx.subagents.waitForChildren(parent);
+  const reopened = new f.host.constructor(f.ctx, f.config, { handlers: {} }, { managementOnly: true });
+  try { assert.ok((await reopened.capabilityActivity()).work.some(work => work.jobId === jobId && work.status === 'unknown')); }
+  finally { await reopened.close(); }
+});
+
+test('exact Worker background stop verifies disposed descendant jobs and leaves unrelated work alone', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t); await f.ensure();
+  const sessionId = f.policy().sessionId, childId = 'disposed-owned-child', { Service } = await f.load('@deepseek-ai/cordis');
+  f.host.journal.bind({ id: childId, parent: sessionId, role: 'worker', cwd: f.config.workspace, assignmentId: 'assignment-one' });
+  let live = true, allowKill = false; const killed = [];
+  class Jobs extends Service {
+    constructor() { super(f.ctx, 'jobs'); }
+    list() { return [...(live ? [{ id: 'owned-job', owner: childId, status: 'running' }] : []), { id: 'unrelated-job', owner: 'different-worker', status: 'running' }]; }
+    async wait() { return { status: allowKill ? 'completed' : 'running' }; }
+    kill(id) { killed.push(id); if (allowKill) live = false; }
+  }
+  new Jobs(); f.beforeClose(() => { live = false; });
+  const activity = await f.host.capabilityActivity();
+  assert.ok(activity.work.some(work => work.kind === 'job' && work.sessionId === childId && work.jobId === 'owned-job'));
+  assert.equal(activity.work.some(work => work.jobId === 'unrelated-job'), false);
+  await assert.rejects(f.host.dispatch('stopBackground', { sessionId, reason: 'parent delegation stop', keepInbox: false }), /cleanup has not completed/);
+  assert.equal(f.host.closed, false); assert.equal(live, true);
+  f.host.setCapabilityHold({ operationId: 'owned-background-cleanup', frozen: true });
+  await assert.rejects(f.host.cancelCapabilityWork('owned-background-cleanup', activity), /cleanup has not completed/);
+  assert.equal(live, true);
+  allowKill = true; assert.equal((await f.host.cancelCapabilityWork('owned-background-cleanup', activity)).busy, false);
+  await f.host.dispatch('stopBackground', { sessionId, reason: 'retry exact stop', keepInbox: false });
+  assert.equal(live, false); assert.ok(killed.length > 0); assert.ok(killed.every(id => id === 'owned-job'));
+  assert.ok(f.ctx.get('jobs').list().some(job => job.id === 'unrelated-job' && job.status === 'running'));
+});
+
+test('a stopped persisted Worker reopened by the native UI remains fenced until its organization resumes', { skip: !available, timeout: 12000 }, async t => {
+  const f = await nativeFixture(t, { allowedTools: ['read'], inherited: ['read'], local: [] }); await f.ensure();
+  const id = f.policy().sessionId; writeFileSync(join(f.config.workspace, 'probe.txt'), 'existing history remains readable');
+  await f.host.close(); await f.closeControllerSession(id);
+  const reopened = await f.ctx.sessionController.resolveAgent(id); assert.ok(reopened.agent);
+  assert.ok(Array.isArray((await f.ctx.sessionController.inspect(id)).events));
+  assert.equal((await f.execute('read', { file_path: 'probe.txt' }, reopened.agent)).isError, true);
+  const delivery = new f.coreModule.AgentDelivery(f.ctx);
+  await delivery.send(reopened.agent, 'stopped-reopened-worker', 'Native UI must not bypass the instance lifecycle', 'queue', new AbortController().signal);
+  await reopened.agent.whenIdle();
+  assert.equal(f.modelCalls.length, 0); assert.equal(f.toolCalls.length, 0);
+  await f.restartNative(); await f.ensure();
+  assert.equal((await f.execute('read', { file_path: 'probe.txt' })).isError, false);
+});
 
 test('real DSH local capabilities survive inherited-only restriction and unknown local tools remain denied', { skip: !available, timeout: 12000 }, async t => {
   const f = await nativeFixture(t); await f.ensure();

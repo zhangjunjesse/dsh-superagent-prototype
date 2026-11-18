@@ -135,7 +135,7 @@ test('unavailable service and unexpected failures are honest and do not leak int
   assert.deepEqual(await failing(), { status: 500, value: { error: '服务暂时无法处理请求' } });
 });
 
-test('invalid instance configuration leaves the existing Jarvis session and settings available', async t => {
+test('invalid instance configuration keeps history/settings readable but rejects managed conversation admission', async t => {
   const directory = mkdtempSync(join(tmpdir(), 'jarvis-system-api-'));
   const rootDir = join(directory, 'system'); mkdirSync(rootDir);
   writeFileSync(join(rootDir, 'system-config.json'), '{broken');
@@ -173,6 +173,13 @@ test('invalid instance configuration leaves the existing Jarvis session and sett
   const origin = `http://127.0.0.1:${ctx.webServer.port}/jarvis/api`;
   const state = await (await fetch(origin + '/state')).json();
   assert.equal(state.runtime, 'dsh'); assert.equal(agents.size, 1);
+  assert.equal(state.instance?.canChat, false);
+  const rejectedChat = await fetch(origin + '/chat', { method: 'POST', headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf },
+    body: JSON.stringify({ id: 'stopped-chat-request', text: 'must not reach a model' }) });
+  assert.equal(rejectedChat.status, 503);
+  assert.match((await rejectedChat.json()).error, /实例|运行/);
+  const rejectedRetry = await fetch(origin + '/notifications/retry', { method: 'POST', headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf }, body: '{}' });
+  assert.equal(rejectedRetry.status, 503);
   const failed = await fetch(origin + '/system'); assert.equal(failed.status, 503);
   assert.match((await failed.json()).error, /实例管理暂不可用/);
   const saved = await fetch(origin + '/basic', { method: 'PUT', headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf },

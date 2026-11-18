@@ -22,7 +22,9 @@ async function initialize(config, managementOnly = false) {
           config.instanceId === 'root' && input.role === 'jarvis' && input.sessionKey === 'jarvis'
             ? CONVERSATION_RPC_TIMEOUT_MS : undefined),
         cancel: input => peer.call('session.cancel', input, 15000),
-        delegate: input => native.wire.call('delegate', input),
+        // Lifecycle cleanup must remain available after ordinary native
+        // admission is revoked, including a management-only recovery owner.
+        delegate: input => managementOnly || closing ? peer.call('delegation.send', input) : native.wire.call('delegate', input),
       }, { native, managementOnly, adoption, capabilityHold,
         restart: () => { void peer.call('runtime.restart').catch(error => { process.stderr.write(`Organization restart request failed: ${error.message}\n`); }); } });
       native.managementHandler = input => requireRuntime().management(input);
@@ -48,6 +50,8 @@ const peer = new ProcessPeer(process, {
   state: () => requireRuntime().state(),
   tool: input => requireRuntime().tool(input),
   delegation: input => requireRuntime().delegation(input),
+  'lifecycle.delegation': input => runtime.lifecycleDelegation(input),
+  'lifecycle.drain': () => runtime.drainDelegations(),
   management: input => requireRuntime().management(input),
   'capabilities.hold': input => requireRuntime().capabilitiesHold(input),
   'capabilities.activity': input => requireRuntime().capabilitiesActivity(input),

@@ -4,8 +4,8 @@ import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, 
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ProcessPeer, CONVERSATION_RPC_TIMEOUT_MS } from './ipc.mjs';
-import { DshBridge } from './dsh-bridge.mjs';
-import { NativeHost } from './native-host.mjs';
+import { DshBridge, installBridgeLifecycleGuard } from './dsh-bridge.mjs';
+import { NativeHost, installNativeLifecycleGuard } from './native-host.mjs';
 import { nativeHash } from './native-journal.mjs';
 import { readOriginalAdoption } from './original-adoption.mjs';
 import { lockSync } from 'proper-lockfile';
@@ -13,6 +13,18 @@ import { DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normali
 
 const childEntry = fileURLToPath(new URL('./child.mjs', import.meta.url));
 const roles = new Set(['jarvis', 'router', 'worker']);
+const renameWait = new Int32Array(new SharedArrayBuffer(4));
+function replaceAtomic(source, destination) {
+  // Windows readers and indexing software can briefly deny replacing an
+  // existing file. Keep the atomic rename and bound the synchronous retry.
+  for (let attempt = 0; ; attempt++) {
+    try { renameSync(source, destination); return; }
+    catch (error) {
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || attempt >= 5) throw error;
+      Atomics.wait(renameWait, 0, 0, (attempt + 1) * 10);
+    }
+  }
+}
 const within = (root, path) => { const rel = relative(root, path); return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)); };
 function directory(path) {
   if (typeof path !== 'string' || !isAbsolute(path)) throw new Error('Runtime directories must be absolute');
@@ -86,7 +98,7 @@ function configuration(rawInstances, rootDir) {
         if (within(first, second) || within(second, first)) throw new Error('Instances cannot share or nest state/workspace directories');
       }
     }
-    instances.set(instance.instanceId, { config: instance, phase: 'stopped', generation: 0, child: null, peer: null, bridge: null, native: null, operation: null });
+    instances.set(instance.instanceId, { config: instance, phase: 'stopped', generation: 0, stopEpoch: 0, child: null, peer: null, bridge: null, native: null, operation: null });
   }
   delegationGraph(instances, rawInstances);
   return instances;
@@ -107,18 +119,56 @@ export class ProcessManager {
   constructor(ctx, config, { conversationModel, preset,
     bridgeFactory = (instance, tool) => new DshBridge(ctx, instance, tool,
       { preset, ...(instance.instanceId === 'root' ? { conversationModel } : {}) }),
-    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, options), entry = childEntry, initialCapabilityHolds = [] } = {}) {
+    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, options), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {} } = {}) {
     this.ctx = ctx; this.rootDir = directory(config.rootDir); this.bridgeFactory = bridgeFactory; this.nativeFactory = nativeFactory; this.entry = entry;
     this.instances = configuration(config.instances ?? [], this.rootDir); this.closing = false; this.reconfiguring = false;
     this.capabilityHolds = new Map(); this.foregroundRequests = new Map(); this.capabilitySnapshots = new Map(); this.capabilityOwnerId = randomUUID(); this.capabilityStopsStarted = new Set();
+    this.lifecycleParticipants = new Map(Object.entries(lifecycleParticipants)); this.lifecycleOwnerId = randomUUID();
     const holds = Array.isArray(initialCapabilityHolds) ? initialCapabilityHolds : Object.entries(initialCapabilityHolds).map(([instanceId, operationId]) => ({ instanceId, operationId }));
     for (const hold of holds) {
       this.instance(hold.instanceId); this.validateCapabilityOperation(hold.operationId);
       this.capabilityHolds.set(hold.instanceId, { operationId: hold.operationId, frozen: hold.frozen === true });
     }
     this.releaseLock = lockSync(this.rootDir, { stale: 30000, onCompromised: () => { void this.close(); } });
-    try { this.record(); } catch (error) { this.releaseLock(); throw error; }
-    this.initialization = Promise.resolve().then(() => this.recoverRestarts());
+    try {
+      installNativeLifecycleGuard(ctx, [...this.instances.values()].map(item => item.config));
+      installBridgeLifecycleGuard(ctx, [...this.instances.values()].map(item => item.config));
+      for (const [id, participant] of this.lifecycleParticipants) {
+        if (!participant || !['bindLifecycle', 'resumeInstance', 'suspendInstance'].every(method => typeof participant[method] === 'function')) throw new Error('Invalid instance lifecycle participant');
+        participant.bindLifecycle({ runtimeId: this.lifecycleOwnerId, state: () => this.lifecycleState(id) });
+        participant.setCapabilityHold?.(this.capabilityHolds.get(id));
+      }
+      for (const item of this.instances.values()) if (this.cleanupIntent(item)?.pending) { item.cleanupPending = true; item.phase = 'failed'; }
+      this.record();
+    } catch (error) { this.releaseLock(); throw error; }
+    this.initialization = Promise.resolve().then(async () => { await this.recoverCleanup(); await this.recoverRestarts(); });
+  }
+  lifecycleState(id) {
+    const item = this.instances.get(id);
+    return { instanceId: id, configured: Boolean(item), phase: item?.phase ?? 'stopped', generation: item?.generation ?? 0,
+      cleanupPending: item?.cleanupPending === true, capabilityHold: this.capabilityHolds.get(id), closing: this.closing };
+  }
+  suspendParticipant(item, reason) {
+    const previous = item.participantSuspension;
+    if (previous && !previous.settled) return previous.promise;
+    const participant = this.lifecycleParticipants.get(item.config.instanceId);
+    if (!participant) return Promise.resolve();
+    const suspension = { settled: false, promise: undefined };
+    // Calling suspend is deliberately synchronous: the participant revokes its
+    // lease before any management request or lifecycle operation can be awaited.
+    try { suspension.promise = Promise.resolve(participant.suspendInstance(reason)); }
+    catch (error) { suspension.promise = Promise.reject(error); }
+    suspension.promise = suspension.promise.finally(() => { suspension.settled = true; });
+    void suspension.promise.catch(() => {});
+    item.participantSuspension = suspension;
+    return suspension.promise;
+  }
+  beginStop(item, reason) {
+    item.phase = 'stopping'; item.cleanupPending = true;
+    this.suspendParticipant(item, reason);
+    item.native?.setLifecycleStopping?.(true);
+    item.bridge?.setLifecycleStopping?.(true);
+    this.record();
   }
   instance(id) {
     const instance = this.instances.get(id);
@@ -155,6 +205,10 @@ export class ProcessManager {
     }
     this.instances = next;
     try {
+      // Preparing guards can fail before either durable configuration commit.
+      // Registered historical ownership remains fail-closed on a caller rollback.
+      installNativeLifecycleGuard(this.ctx, [...next.values()].map(item => item.config));
+      installBridgeLifecycleGuard(this.ctx, [...next.values()].map(item => item.config));
       this.record();
       // The caller atomically commits its durable configuration in this same synchronous turn.
       persist();
@@ -163,6 +217,7 @@ export class ProcessManager {
       try { this.record(); } catch { /* The previous in-memory configuration remains authoritative until restart. */ }
       throw error;
     }
+    for (const [id, participant] of this.lifecycleParticipants) participant.setCapabilityHold?.(this.capabilityHolds.get(id));
     return this.status();
   }
   async reconfigureManaged(rawInstances, options = {}) {
@@ -199,7 +254,7 @@ export class ProcessManager {
   }
   async sendCapabilityHold(item) {
     const hold = this.capabilityHolds.get(item.config.instanceId);
-    item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold);
+    item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold); this.lifecycleParticipants.get(item.config.instanceId)?.setCapabilityHold?.(hold);
     if (item.operation) await item.operation.catch(() => {});
     if (item.phase === 'running' && item.peer) {
       const peer = item.peer, generation = item.generation;
@@ -224,7 +279,7 @@ export class ProcessManager {
     const items = this.capabilityOwner(ids, operationId);
     for (const item of items) {
       const hold = this.capabilityHolds.get(item.config.instanceId); hold.frozen = true;
-      item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold);
+      item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold); this.lifecycleParticipants.get(item.config.instanceId)?.setCapabilityHold?.(hold);
     }
     this.record();
     for (const item of items) await this.sendCapabilityHold(item);
@@ -234,7 +289,7 @@ export class ProcessManager {
     const items = this.capabilityOwner(ids, operationId);
     for (const item of items) {
       const hold = this.capabilityHolds.get(item.config.instanceId);
-      hold.frozen = false; item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold);
+      hold.frozen = false; item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold); this.lifecycleParticipants.get(item.config.instanceId)?.setCapabilityHold?.(hold);
       if (item.phase === 'running' && item.peer) await item.peer.call('capabilities.hold', { operationId, held: true, frozen: false });
     }
     this.record();
@@ -258,6 +313,13 @@ export class ProcessManager {
     try {
       if (item.bridge) { row.bridge = await item.bridge.capabilityActivity(); row.work.push(...row.bridge.work); }
       if (item.native) { row.native = await item.native.capabilityActivity(); row.work.push(...row.native.work); }
+      const participant = this.lifecycleParticipants.get(id);
+      if (participant?.capabilityActivity) {
+        row.participant = await participant.capabilityActivity();
+        if (!row.participant || !Array.isArray(row.participant.work) || typeof row.participant.busy !== 'boolean') throw new Error('Invalid lifecycle participant capability activity response');
+        row.work.push(...row.participant.work);
+        if (row.participant.busy && !row.participant.work.length) row.work.push({ id: `participant-unknown:${generation}`, kind: 'unknown', title: '无法确认日常会话工作状态' });
+      }
       if (item.phase === 'running' && peer) {
         row.runtime = await peer.call('capabilities.activity', { operationId: row.capabilityHold?.operationId });
         if (!row.runtime || !Array.isArray(row.runtime.tasks) || typeof row.runtime.busy !== 'boolean') throw new Error('Invalid runtime capability activity response');
@@ -293,6 +355,7 @@ export class ProcessManager {
         if (activity.runtime) await item.peer.call('capabilities.stop', { operationId, fingerprint: activity.runtime.fingerprint });
         if (activity.bridge) await item.bridge.cancelCapabilityWork(operationId, activity.bridge);
         if (activity.native) await item.native.cancelCapabilityWork(operationId, confirmed.instances.find(row => row.instanceId === item.config.instanceId)?.native);
+        if (activity.participant) await this.lifecycleParticipants.get(item.config.instanceId).cancelCapabilityWork(operationId, confirmed.instances.find(row => row.instanceId === item.config.instanceId)?.participant);
       }
       const remaining = await this.capabilityActivity(ids);
       if (remaining.busy) throw Object.assign(new Error('已确认工作的停止尚未完成，请稍后重试；Worker 配置尚未应用'), { capabilityActivity: remaining });
@@ -307,7 +370,7 @@ export class ProcessManager {
     for (const item of items) {
       // Native permissions must be ready before releasing the owner's queued
       // dispatch; it can run immediately, before the IPC acknowledgement arrives.
-      item.bridge?.setCapabilityHold?.(undefined); item.native?.setCapabilityHold?.(undefined);
+      item.bridge?.setCapabilityHold?.(undefined); item.native?.setCapabilityHold?.(undefined); this.lifecycleParticipants.get(item.config.instanceId)?.setCapabilityHold?.(undefined);
       if (item.phase === 'running' && item.peer) await item.peer.call('capabilities.hold', { operationId, held: false });
       else await this.releaseStoppedCapabilityHold(item, operationId);
       this.capabilityHolds.delete(item.config.instanceId);
@@ -332,7 +395,7 @@ export class ProcessManager {
   record() {
     const file = join(this.rootDir, 'processes.json'), temporary = `${file}.${randomUUID()}.tmp`;
     writeFileSync(temporary, JSON.stringify({ at: new Date().toISOString(), ...this.status() }, null, 2));
-    renameSync(temporary, file);
+    replaceAtomic(temporary, file);
   }
   event(item, event, extra = {}) {
     appendFileSync(join(item.config.stateDir, 'lifecycle.jsonl'), JSON.stringify({ at: new Date().toISOString(), instanceId: item.config.instanceId,
@@ -350,17 +413,21 @@ export class ProcessManager {
     if (this.reconfiguring) throw new Error('Runtime configuration is changing');
     const item = this.instance(id);
     this.capabilityLifecycle(item, capabilityOperationId);
-    return this.exclusive(item, () => this.startInstance(item));
+    const stopEpoch = item.stopEpoch;
+    return this.exclusive(item, () => this.startInstance(item, stopEpoch));
   }
-  async startInstance(item) {
+  async startInstance(item, stopEpoch = item.stopEpoch) {
     if (this.closing) throw new Error('Runtime manager is closing');
-    await this.closeManagement(item);
-    if (item.child) { if (item.phase === 'running') return this.status(); throw new Error('Instance is not stopped'); }
-    // A timed-out DSH drain retains ownership. Never fork another generation into those Sessions.
-    if (item.bridge) { await item.bridge.close(); item.bridge = null; item.cleanupPending = false; }
-    if (item.native) { await item.native.close(); item.native = null; item.cleanupPending = false; }
+    if (item.stopEpoch !== stopEpoch) throw new Error('Instance start was superseded by an explicit stop');
+    if (item.child && item.phase === 'running' && !item.cleanupPending) return this.status();
+    // A timed-out participant, native drain or bound child stop retains ownership.
+    // Retry every old owner before creating another business generation.
+    await this.stopInstance(item);
+    if (this.closing) throw new Error('Runtime manager is closing');
+    if (item.stopEpoch !== stopEpoch) throw new Error('Instance start was superseded by an explicit stop');
     item.phase = 'starting'; item.error = undefined; item.generation++;
     const generation = item.generation;
+    this.saveCleanupIntent(item, true);
     const stdout = openSync(join(item.config.stateDir, 'stdout.log'), 'a'), stderr = openSync(join(item.config.stateDir, 'stderr.log'), 'a');
     let child;
     try { child = fork(this.entry, [], { cwd: item.config.workspace, execPath: process.execPath, execArgv: [],
@@ -405,21 +472,23 @@ export class ProcessManager {
       const finish = (code, signal) => {
         if (ended) return;
         ended = true;
-        item.peer?.close('Instance process exited');
+        if (item.child === child) item.peer?.close('Instance process exited');
         // Invalidate all model/tool callbacks before allowing another generation to start.
         if (item.child === child) {
-          item.phase = item.phase === 'stopping' ? 'stopped' : 'failed';
-          if (item.phase === 'failed') item.error = `Instance exited (${code ?? signal ?? 'unknown'})`;
+          if (item.phase !== 'stopping') { item.phase = 'failed'; item.error = `Instance exited (${code ?? signal ?? 'unknown'})`; }
+          item.cleanupPending = true;
         }
-        let cleanupFailed = false;
-        Promise.all([Promise.resolve(bridge.close()), Promise.resolve(item.native?.close())]).catch(error => {
-          cleanupFailed = true; item.error = `Session cleanup failed: ${error.message}`;
-        }).finally(() => {
+        const native = item.native;
+        const suspension = this.suspendParticipant(item, 'Instance process exited');
+        Promise.allSettled([suspension, Promise.resolve().then(() => bridge.close()), Promise.resolve().then(() => native?.close())]).then(results => {
           if (item.child === child) {
-            item.child = null; item.peer = null; item.bridge = cleanupFailed ? bridge : null;
-            if (!cleanupFailed) item.native = null;
-            item.cleanupPending = cleanupFailed;
-            if (cleanupFailed) item.phase = 'failed';
+            const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+            item.child = null; item.peer = null;
+            item.bridge = results[1].status === 'rejected' ? bridge : null;
+            item.native = results[2].status === 'rejected' ? native : null;
+            // The business owner must still verify its durable outgoing child
+            // bindings, including after a crash or lost close acknowledgement.
+            if (errors.length) { item.error = `Session cleanup failed: ${errors.map(error => error.message).join('; ')}`; item.phase = 'failed'; }
             this.event(item, 'exit', { code, signal });
           }
           resolveExit();
@@ -434,21 +503,32 @@ export class ProcessManager {
     try {
       const hold = this.capabilityHolds.get(item.config.instanceId);
       const result = await item.peer.call('initialize', { ...item.config, ...(hold ? { capabilityHold: { ...hold } } : {}) }, 240000);
-      if (result?.pid !== child.pid || result?.instanceId !== item.config.instanceId || child.exitCode !== null) throw new Error('Instance initialization identity mismatch');
+      if (this.closing || item.child !== child || item.generation !== generation || item.phase !== 'starting' || result?.pid !== child.pid || result?.instanceId !== item.config.instanceId || child.exitCode !== null) throw new Error('Instance initialization identity mismatch');
       item.phase = 'running'; this.event(item, 'ready');
+      const participant = this.lifecycleParticipants.get(item.config.instanceId);
+      if (participant) {
+        const isCurrent = () => this.instances.get(item.config.instanceId) === item && item.generation === generation && item.child === child && item.phase === 'running' && !item.cleanupPending && !this.closing;
+        await participant.resumeInstance({ runtimeId: this.lifecycleOwnerId, generation, isCurrent });
+        if (!isCurrent()) throw new Error('Instance changed while resuming its lifecycle participant');
+      }
       this.completeRestart(item);
       return this.status();
     } catch (error) {
-      item.error = error.message; await this.stopInstance(item); item.phase = 'failed'; this.record(); throw error;
+      item.error = error.message;
+      try { await this.stopInstance(item); } catch (cleanup) { error.message += `; Cleanup pending: ${cleanup.message}`; }
+      item.phase = 'failed'; this.record(); throw error;
     }
   }
   ready(id) { const item = this.instance(id); if (item.phase !== 'running' || !item.peer) throw new Error('SuperJarvis instance is not running'); return item; }
-  async delegate(source, sourceGeneration, input) {
+  async delegate(source, sourceGeneration, input, { managementOwner } = {}) {
+    const request = DelegationRequestSchema.parse(input), control = ['query', 'stop'].includes(request.operation);
     const current = (item, generation, peer) => {
-      if (this.closing || item.generation !== generation || item.phase !== 'running' || !item.peer || peer && item.peer !== peer) throw new Error('Delegation instance generation is no longer active');
+      if (item.generation !== generation || !item.peer || peer && item.peer !== peer || (this.closing || item.phase !== 'running') && !(control && ['running', 'stopping', 'failed'].includes(item.phase))) throw new Error('Delegation instance generation is no longer active');
     };
-    current(source, sourceGeneration);
-    const request = DelegationRequestSchema.parse(input), sourceId = source.config.instanceId;
+    if (managementOwner) {
+      if (!control || source.management !== managementOwner || !managementOwner.active || managementOwner.ended) throw new Error('Management-only delegation permits bound cleanup controls only');
+    } else current(source, sourceGeneration);
+    const sourceId = source.config.instanceId;
     if (request.path[0] !== sourceId) throw new Error('Delegation path must identify the authenticated source instance');
     const capability = source.config.delegationTargets.find(target => target.instanceId === request.targetInstanceId);
     const target = this.instances.get(request.targetInstanceId);
@@ -456,9 +536,23 @@ export class ProcessManager {
     if (request.tools.some(tool => !capability.tools.includes(tool))) throw new Error('Delegation tools exceed the parent and child intersection');
     if (request.operation === 'submit' && (!capability.tools.length || !request.tools.length)) throw new Error('Delegation submission requires shared read-only tools');
     const targetGeneration = target.generation, targetPeer = target.peer, sourcePeer = source.peer;
-    current(target, targetGeneration);
-    const result = await (target.native ? target.native.wire.call('delegation', { sourceInstanceId: sourceId, request }) : targetPeer.call('delegation', { sourceInstanceId: sourceId, request }));
-    current(source, sourceGeneration, sourcePeer); current(target, targetGeneration, targetPeer);
+    let result;
+    if (control && target.phase !== 'running') {
+      result = await this.exclusive(target, async () => {
+        if (target.phase !== 'stopped' || target.child || target.bridge || target.native || target.cleanupPending) await this.stopInstance(target);
+        const owner = target.management ?? await this.openManagement(target);
+        try { return await owner.peer.call('lifecycle.delegation', { sourceInstanceId: sourceId, request }, 30000); }
+        finally { await this.closeManagement(target); }
+      }, { kind: 'management', queue: true });
+    } else {
+      current(target, targetGeneration);
+      result = await (control ? targetPeer.call('lifecycle.delegation', { sourceInstanceId: sourceId, request }, 30000)
+        : target.native ? target.native.wire.call('delegation', { sourceInstanceId: sourceId, request }) : targetPeer.call('delegation', { sourceInstanceId: sourceId, request }));
+      current(target, targetGeneration, targetPeer);
+    }
+    if (managementOwner) {
+      if (source.management !== managementOwner || managementOwner.ended) throw new Error('Delegation cleanup owner changed');
+    } else current(source, sourceGeneration, sourcePeer);
     return result;
   }
   async conversationCall(id, method, input, { generation } = {}) {
@@ -519,7 +613,8 @@ export class ProcessManager {
       child.once('exit', end); child.once('close', end); child.once('error', end);
     });
     const denied = () => { throw new Error('Management-only instance cannot execute Sessions or delegation'); };
-    const peer = owner.peer = new ProcessPeer(child, { 'session.run': denied, 'session.cancel': denied, 'delegation.send': denied,
+    const peer = owner.peer = new ProcessPeer(child, { 'session.run': denied, 'session.cancel': denied,
+      'delegation.send': input => this.delegate(item, item.generation, input, { managementOwner: owner }),
       'runtime.restart': () => ({ running: false, effect: 'next-start' }) });
     try {
       owner.native = this.nativeFactory(item.config, peer, { adoption, managementOnly: true, isCurrent: () => owner.active && !owner.ended });
@@ -545,7 +640,10 @@ export class ProcessManager {
     if (owner.closing) return owner.closing;
     owner.closing = (async () => {
       clearTimeout(owner.idleTimer); owner.phase = 'closing'; this.record();
-      try { if (!owner.ended) await owner.peer.call('close', {}, 30000); } catch { /* Disconnect still drains this exact Store owner. */ }
+      try { if (!owner.ended) await owner.peer.call('close', {}, 30000); }
+      catch (error) {
+        if (!owner.ended && owner.child.connected && owner.child.exitCode === null) { owner.phase = 'failed'; this.record(); throw error; }
+      }
       let failure;
       try { await owner.native?.close(); } catch (error) { failure = error; }
       finally {
@@ -557,7 +655,7 @@ export class ProcessManager {
       if (failure) { owner.phase = 'failed'; this.record(); throw failure; }
       if (item.management === owner) item.management = undefined;
       this.event(item, 'management-close', { managementPid: owner.child.pid });
-    })();
+    })().catch(error => { owner.closing = undefined; throw error; });
     return owner.closing;
   }
   async releaseManagement(id) {
@@ -568,15 +666,56 @@ export class ProcessManager {
     const file = join(item.config.stateDir, 'restart-intent.json');
     if (!existsSync(file)) return undefined;
     const value = JSON.parse(readFileSync(file, 'utf8'));
-    if (value.version !== 1 || value.instanceId !== item.config.instanceId || !['requested', 'restarting', 'failed', 'complete'].includes(value.phase) ||
+    if (value.version !== 1 || value.instanceId !== item.config.instanceId || !['requested', 'restarting', 'failed', 'complete', 'cancelled'].includes(value.phase) ||
       typeof value.configHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.configHash) || value.desiredRunning !== true ||
       ['requested', 'restarting'].includes(value.phase) && value.configHash !== nativeHash(item.config)) throw new Error('Invalid organization restart intent');
     return value;
   }
+  cleanupIntent(item) {
+    const file = join(item.config.stateDir, 'lifecycle-cleanup.json');
+    if (!existsSync(file)) return undefined;
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    if (value.version !== 1 || value.instanceId !== item.config.instanceId || typeof value.pending !== 'boolean') throw new Error('Invalid organization cleanup intent');
+    return value;
+  }
+  saveCleanupIntent(item, pending) {
+    const file = join(item.config.stateDir, 'lifecycle-cleanup.json'), temporary = `${file}.${randomUUID()}.tmp`, fd = openSync(temporary, 'wx', 0o600);
+    try { writeFileSync(fd, JSON.stringify({ version: 1, instanceId: item.config.instanceId, generation: item.generation, pending, at: new Date().toISOString() })); fsyncSync(fd); }
+    finally { closeSync(fd); }
+    replaceAtomic(temporary, file);
+  }
+  async drainStoredDelegations(item) {
+    if (!this.cleanupIntent(item)?.pending) return;
+    if (existsSync(join(item.config.stateDir, 'orchestrator.sqlite'))) {
+      const owner = item.management ?? await this.openManagement(item);
+      try { await owner.peer.call('lifecycle.drain', {}, 30000); }
+      finally { await this.closeManagement(item); }
+    }
+    this.saveCleanupIntent(item, false);
+  }
+  async recoverCleanup() {
+    for (const item of this.stopOrder()) {
+      if (this.closing) return;
+      if (!item.cleanupPending) continue;
+      try { await this.exclusive(item, () => this.stopInstance(item)); }
+      catch (error) { item.error = `Pending cleanup could not recover: ${error.message}`; this.record(); }
+    }
+  }
+  stopOrder() {
+    const ordered = [], visited = new Set();
+    const visit = item => {
+      if (visited.has(item)) return;
+      visited.add(item);
+      for (const parent of item.config.allowedParents) visit(this.instance(parent));
+      ordered.push(item);
+    };
+    for (const item of this.instances.values()) visit(item);
+    return ordered;
+  }
   saveRestart(item, value) {
     const file = join(item.config.stateDir, 'restart-intent.json'), temporary = `${file}.${randomUUID()}.tmp`, fd = openSync(temporary, 'wx', 0o600);
     try { writeFileSync(fd, JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(temporary, file);
+    replaceAtomic(temporary, file);
   }
   requestRestart(item, generation) {
     if (this.closing || item.generation !== generation || item.phase !== 'running') throw new Error('Restart request belongs to an inactive instance');
@@ -586,14 +725,24 @@ export class ProcessManager {
     const intent = { version: 1, id: randomUUID(), instanceId: item.config.instanceId, generation, desiredRunning: true,
       configHash: nativeHash(item.config), phase: 'requested', at: new Date().toISOString() };
     this.saveRestart(item, intent);
-    const timer = setTimeout(() => {
-      if (this.closing) return;
-      void Promise.resolve().then(() => {
+    const timer = item.restartTimer = setTimeout(() => {
+      if (this.closing || item.generation !== generation || item.phase !== 'running') return;
+      void Promise.resolve().then(async () => {
+        // The original restart HTTP/management response must finish on its
+        // current owner before that same owner is fenced and replaced.
+        if (item.operation) await item.operation.catch(() => {});
+        if (this.closing || item.generation !== generation || item.phase !== 'running') return;
+        const current = this.restartIntent(item);
+        if (!current || current.id !== intent.id || current.phase !== 'requested') return;
         this.saveRestart(item, { ...intent, phase: 'restarting' });
         return this.restart(item.config.instanceId);
       }).catch(error => {
         item.error = error.message;
-        try { this.saveRestart(item, { ...intent, phase: 'failed', error: error.message }); this.record(); }
+        try {
+          const current = this.restartIntent(item);
+          if (current?.id === intent.id && ['requested', 'restarting'].includes(current.phase)) this.saveRestart(item, { ...intent, phase: 'failed', error: error.message });
+          this.record();
+        }
         catch (failure) { item.error = `Restart recovery record failed: ${failure.message}; ${error.message}`; }
       });
     }, 0); timer.unref?.();
@@ -601,7 +750,12 @@ export class ProcessManager {
   }
   completeRestart(item) {
     const intent = this.restartIntent(item);
-    if (intent && intent.phase !== 'complete' && intent.configHash === nativeHash(item.config)) this.saveRestart(item, { ...intent, phase: 'complete', completedAt: new Date().toISOString() });
+    if (intent && ['requested', 'restarting', 'failed'].includes(intent.phase) && intent.configHash === nativeHash(item.config)) this.saveRestart(item, { ...intent, phase: 'complete', completedAt: new Date().toISOString() });
+  }
+  cancelRestart(item) {
+    clearTimeout(item.restartTimer); item.restartTimer = undefined;
+    const intent = this.restartIntent(item);
+    if (intent && ['requested', 'restarting'].includes(intent.phase)) this.saveRestart(item, { ...intent, phase: 'cancelled', cancelledAt: new Date().toISOString() });
   }
   async recoverRestarts() {
     for (const item of this.instances.values()) {
@@ -614,38 +768,76 @@ export class ProcessManager {
       } catch (error) { item.error = `Pending restart could not recover: ${error.message}`; this.record(); }
     }
   }
-  stop(id, { capabilityOperationId } = {}) { if (this.reconfiguring) throw new Error('Runtime configuration is changing'); const item = this.instance(id); this.capabilityLifecycle(item, capabilityOperationId); return this.exclusive(item, () => this.stopInstance(item)); }
+  stop(id, { capabilityOperationId } = {}) {
+    if (this.reconfiguring) throw new Error('Runtime configuration is changing');
+    const item = this.instance(id); this.capabilityLifecycle(item, capabilityOperationId);
+    this.cancelRestart(item); item.stopEpoch++;
+    this.beginStop(item, 'Organization runtime stopped');
+    return this.exclusive(item, () => this.stopInstance(item), { queue: true });
+  }
   async stopInstance(item) {
-    await this.closeManagement(item);
-    if (!item.child) {
-      if (item.bridge) { await item.bridge.close(); item.bridge = null; item.cleanupPending = false; }
-      if (item.native) { await item.native.close(); item.native = null; item.cleanupPending = false; }
-      item.phase = 'stopped'; this.record(); return;
-    }
-    item.phase = 'stopping'; this.event(item, 'stop');
+    if (item.phase !== 'stopping') this.beginStop(item, 'Organization runtime stopped');
+    const failures = [];
+    const attempt = async operation => { try { await operation(); return true; } catch (error) { failures.push(error); return false; } };
     const child = item.child;
-    // Closing the bridge cancels this instance's DSH work; the other instances keep running.
-    await Promise.resolve(item.bridge?.close()).catch(error => { item.error = `Session cleanup failed: ${error.message}`; });
-    try { await item.peer?.call('close', {}, 30000); } catch { /* The exit path retains interrupted work on disk. */ }
-    await Promise.resolve(item.native?.close()).catch(error => { item.error = `Native cleanup failed: ${error.message}`; });
-    item.peer?.close();
-    if (child.connected) child.disconnect();
-    const timer = setTimeout(() => { if (item.child === child) child.kill(); }, 6000);
-    try { await item.exited; } finally { clearTimeout(timer); }
+    const bridge = item.bridge;
+    // Start every owner's cancellation before awaiting any individual drain.
+    const suspension = attempt(() => item.participantSuspension?.promise);
+    const management = attempt(() => this.closeManagement(item));
+    const bridgeClosed = attempt(() => bridge?.close()).then(closed => { if (closed && item.bridge === bridge) item.bridge = null; });
+    if (child) {
+      this.event(item, 'stop');
+      // The business owner first stops its exact durable child bindings while
+      // its native ports and IPC still exist. A failed acknowledgement is retryable.
+      const closing = attempt(() => item.peer.call('close', {}, 30000));
+      const [closed] = await Promise.all([closing, suspension, management, bridgeClosed]);
+      if (closed) {
+        const native = item.native;
+        if (await attempt(() => native?.close())) item.native = null;
+        item.peer?.close();
+        if (child.connected) child.disconnect();
+        const timer = setTimeout(() => { if (item.child === child) child.kill(); }, 6000);
+        try { await item.exited; } finally { clearTimeout(timer); }
+      } else if (!child.connected || child.exitCode !== null) await item.exited;
+    } else await Promise.all([suspension, management, bridgeClosed]);
+    if (!item.child) {
+      if (item.bridge && await attempt(() => item.bridge.close())) item.bridge = null;
+      if (item.native && await attempt(() => item.native.close())) item.native = null;
+      await attempt(() => this.drainStoredDelegations(item));
+    }
+    if (failures.length || item.child || item.bridge || item.native || item.management) {
+      item.phase = 'failed'; item.cleanupPending = true;
+      item.error = `Instance cleanup pending: ${failures.map(error => error.message).join('; ') || 'An owner remains active'}`;
+      this.record(); throw new Error(item.error);
+    }
+    item.phase = 'stopped'; item.cleanupPending = false; item.error = undefined;
+    if (this.cleanupIntent(item)?.pending) this.saveCleanupIntent(item, false);
+    this.record();
   }
   restart(id, { capabilityOperationId } = {}) {
     if (this.reconfiguring) throw new Error('Runtime configuration is changing');
     const item = this.instance(id);
     this.capabilityLifecycle(item, capabilityOperationId);
-    return this.exclusive(item, async () => { await this.stopInstance(item); return this.startInstance(item); });
+    const stopEpoch = item.stopEpoch;
+    if (!item.operation || item.operationKind === 'management') this.beginStop(item, 'Organization runtime restarting');
+    return this.exclusive(item, async () => { await this.stopInstance(item); return this.startInstance(item, stopEpoch); });
   }
   async close() {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
-    this.closePromise = Promise.resolve(this.reconfiguration).catch(() => {}).then(() => Promise.allSettled([...this.instances.values()].map(async item => {
-      if (item.operation) await item.operation.catch(() => {});
-      await this.stopInstance(item);
-    }))).finally(() => { this.releaseLock?.(); this.releaseLock = null; });
+    for (const item of this.instances.values()) this.beginStop(item, 'Runtime manager closing');
+    this.closePromise = (async () => {
+      await Promise.resolve(this.reconfiguration).catch(() => {});
+      const errors = [];
+      // Parents must receive the bound child stop acknowledgement before the
+      // target process is closed. Every participant was already revoked above.
+      for (const item of this.stopOrder()) {
+        if (item.operation) await item.operation.catch(() => {});
+        try { await this.stopInstance(item); } catch (error) { errors.push(error); }
+      }
+      if (errors.length) throw new AggregateError(errors, errors.map(error => error.message).join('; '));
+      this.releaseLock?.(); this.releaseLock = null;
+    })().catch(error => { this.closePromise = undefined; throw error; });
     return this.closePromise;
   }
 }

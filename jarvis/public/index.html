@@ -26,6 +26,8 @@
         <section class="conversation" aria-labelledby="conversation-title">
           <div class="conversation-head sr-only"><span class="conversation-title" id="conversation-title">与 <span data-assistant-name>贾维斯</span> 对话</span></div>
           <div class="thread" id="thread" aria-label="对话记录"></div>
+          <div class="chat-confirm instance-status" id="instance-status" role="status" hidden><span id="instance-status-label"></span><button class="action secondary" id="instance-start" type="button" hidden>启动实例</button></div>
+          <div class="chat-feedback" id="instance-start-error" role="alert" hidden></div>
           <div class="chat-feedback" id="chat-feedback" role="status"></div>
           <div class="chat-confirm" id="chat-confirm" hidden><span>清空后无法恢复此对话。</span><button class="action secondary" id="clear-cancel" type="button">取消</button><button class="action" id="clear-confirm" type="button">清空对话</button></div>
           <form class="composer" id="composer">
@@ -44,7 +46,7 @@
               <div class="composer-actions">
                 <button class="model-indicator" id="composer-model" type="button" title="切换模型与思考级别" aria-haspopup="dialog" aria-expanded="false" aria-controls="model-picker"><span class="model-dot" aria-hidden="true"></span><span id="composer-model-label">选择模型</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>
                 <span class="composer-hint" aria-hidden="true">Shift + Enter 换行</span>
-                <button class="composer-button" id="stop-generation" type="button" aria-label="停止生成" title="停止生成" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg></button>
+                <button class="composer-button" id="stop-generation" type="button" aria-label="停止当前回复" title="停止当前回复" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg></button>
                 <button class="composer-button" id="send-message" type="submit" aria-label="发送消息" title="发送消息" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button>
               </div>
             </div>

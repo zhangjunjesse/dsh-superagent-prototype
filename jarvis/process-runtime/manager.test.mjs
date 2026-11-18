@@ -99,7 +99,7 @@ test('failed DSH cleanup retains ownership and prevents starting another process
     if (cleanupBlocked) throw new Error('DSH still draining');
   } }) });
   try {
-    await manager.start('alpha'); await manager.stop('alpha');
+    await manager.start('alpha'); await assert.rejects(manager.stop('alpha'), /DSH still draining/);
     const stopped = manager.status().instances[0];
     assert.equal(stopped.pid, null); assert.equal(stopped.cleanupPending, true); assert.equal(stopped.phase, 'failed');
     await assert.rejects(manager.start('alpha'), /still draining/);

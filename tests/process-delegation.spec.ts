@@ -8,7 +8,7 @@ import { controlledNative, processRunOf, routeOriginal } from './fixtures/native
 
 const roots: string[] = [], runtimes: ProcessRuntime[] = []
 afterEach(async () => {
-  await Promise.all(runtimes.splice(0).map(runtime => runtime.close()))
+  for (const runtime of runtimes.splice(0).reverse()) await runtime.close()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 function configuration(id: string): ProcessRuntimeConfig {
@@ -24,6 +24,7 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
   const configs = { parent: configuration('parent'), child: configuration('child') }
   const calls: { instance: string; request: ProcessRun }[] = [], transport: DelegationRequest[] = [], stops: string[] = []
   const nodes = {} as Record<'parent' | 'child', ProcessRuntime>
+  const nativePorts = {} as Record<'parent' | 'child', ReturnType<typeof controlledNative>['native']>
   const waits = new Map<string, () => void>(); let dropped = false, heldQuery = false
   const open = (id: 'parent' | 'child') => {
     const host: ProcessHost = {
@@ -46,7 +47,8 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
       async delegate(request) {
         transport.push(structuredClone(request))
         if (options.holdQuery && request.operation === 'query' && !heldQuery) { heldQuery = true; await new Promise<void>(resolve => waits.set('transport', resolve)) }
-        const result = await nodes.child.delegation({ sourceInstanceId: id, request })
+        const envelope = { sourceInstanceId: id, request }
+        const result = await (['query', 'stop'].includes(request.operation) ? nodes.child.lifecycleDelegation(envelope) : nodes.child.delegation(envelope))
         if (options.dropAck && request.operation === 'submit' && !dropped) { dropped = true; throw new Error('Lost submit acknowledgement') }
         return result
       },
@@ -67,6 +69,7 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
         else await call('orchestrator_report', { state: 'ready', summary: `${id}: verified marker evidence` })
       }
     }, { cancel: sessionId => { if (sessionId.startsWith('worker-')) { const sessionKey = `worker:${sessionId.slice('worker-'.length)}`; stops.push(sessionKey); waits.get(sessionKey)?.() } } })
+    nativePorts[id] = native.native
     const runtime = createProcessRuntime(configs[id], host, { native: native.native }); nodes[id] = runtime; runtimes.push(runtime); return runtime
   }
   open('child'); open('parent')
@@ -87,10 +90,53 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
     expect(result.status).toBe('complete')
     return result
   }
-  return { nodes, calls, transport, stops, waits, configs, open, until, control }
+  return { nodes, calls, transport, stops, waits, configs, open, until, control, nativePorts }
 }
 
 describe('single-hop SuperJarvis delegation', () => {
+  it('retains business completion while refusing parent shutdown until that completed child execution is clean', async () => {
+    const h = pair()
+    await h.nodes.parent.chat({ id: 'completed', text: 'Read the bound child marker and finish.' })
+    const state = await h.until(value => value.tickets[0]?.ended?.outcome === 'completed')
+    expect(state.delegations.outgoing[0]?.finished).toBe(true)
+    expect(state.delegations.outgoing[0]?.snapshot?.executionStopped).not.toBe(true)
+    const port = h.nativePorts.child.executor, runningJobs = port.runningJobs
+    port.runningJobs = async () => [{ id: 'late-job', name: 'Completed ticket job still draining' }]
+    await expect(h.nodes.parent.close()).rejects.toThrow('native execution cleanup has not completed')
+    expect((await h.nodes.child.state()).tickets[0]?.ended?.outcome).toBe('completed')
+    port.runningJobs = runningJobs; await h.nodes.parent.close()
+    expect(h.transport.filter(request => request.operation === 'stop').length).toBeGreaterThanOrEqual(2)
+  })
+  it('still drains the exact persisted worker background owner after its in-memory session is disposed', async () => {
+    const h = pair()
+    await h.nodes.parent.chat({ id: 'disposed', text: 'Read the bound child marker and finish.' })
+    await h.until(value => value.tickets[0]?.ended?.outcome === 'completed')
+    const port = h.nativePorts.child.executor, current = port.current, stopBackground = port.stopBackground
+    const stopped: string[] = []
+    port.current = id => id.startsWith('worker-') ? undefined : current(id)
+    port.stopBackground = async id => { stopped.push(id); throw new Error('Disposed worker still owns a running job') }
+    await expect(h.nodes.parent.close()).rejects.toThrow('Disposed worker still owns a running job')
+    expect(stopped.some(id => id.startsWith('worker-'))).toBe(true)
+    port.current = current; port.stopBackground = stopBackground
+    await h.nodes.parent.close()
+  })
+  it.each(['jobs', 'descendants'] as const)('retains the fixed parent binding until stopped child %s are verified idle', async remaining => {
+    const h = pair({ holdWorker: true })
+    await h.nodes.parent.chat({ id: 'u1', text: 'Read only the bound child marker.' })
+    const state = await h.until(value => !!value.delegations.outgoing[0]?.snapshot?.ticketId && [...h.waits.keys()].some(key => key.startsWith('worker:')))
+    const original = state.delegations.outgoing[0]!.request, port = h.nativePorts.child.executor
+    const runningJobs = port.runningJobs, untilQuiet = port.untilQuiet
+    port.runningJobs = async () => remaining === 'jobs' ? [{ id: 'still-owned', name: 'Still running owned job' }] : []
+    port.untilQuiet = async () => remaining !== 'descendants'
+    await expect(h.nodes.parent.close()).rejects.toThrow('native execution cleanup has not completed')
+    expect((await h.nodes.child.state()).tickets[0]?.ended?.outcome).toBe('stopped')
+    port.runningJobs = runningJobs; port.untilQuiet = untilQuiet
+    await h.nodes.parent.close()
+    const controls = h.transport.filter(request => request.operation === 'stop')
+    expect(controls.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(controls.map(request => request.commandId)).size).toBe(1)
+    expect(controls.every(request => request.delegationId === original.delegationId && request.parentAssignmentId === original.parentAssignmentId)).toBe(true)
+  })
   it('uses a task-scoped child brain, machine admission, narrowed tools and one fixed result binding', async () => {
     const h = pair({ dropAck: true })
     await h.nodes.parent.chat({ id: 'u1', text: 'Read and review the child marker.' })
@@ -189,7 +235,7 @@ describe('single-hop SuperJarvis delegation', () => {
     } finally { h.waits.get('transport')?.() }
   })
 
-  it('rejects forged parent, tools, depth and reassignment; restores parent binding without replay after restart', async () => {
+  it('rejects forged parent, tools, depth and reassignment; retains the stopped bound child without replay after parent restart', async () => {
     const h = pair({ worker: async (_request, { call }) => { await call('orchestrator_report', { state: 'blocked', summary: 'Waiting for input' }) } })
     await h.nodes.parent.chat({ id: 'u1', text: 'Read child marker.' })
     await h.until(state => state.tickets[0]?.assignments.at(-1)?.report?.state === 'blocked')
@@ -203,7 +249,6 @@ describe('single-hop SuperJarvis delegation', () => {
     await h.until(state => state.delegations.outgoing[0]?.snapshot?.ticketId === before)
     expect((await h.nodes.child.state()).tickets).toHaveLength(1)
     expect(h.transport.filter(r => r.operation === 'submit')).toHaveLength(1)
-    await h.control('stop')
     await h.until(state => state.delegations.outgoing[0]?.snapshot?.status === 'stopped')
     expect((await h.nodes.child.state()).tickets[0]?.ended).toMatchObject({ by: 'executor', outcome: 'stopped' })
   }, 10000) // Includes a second complete parent application lifecycle and a subsequent stop admission.

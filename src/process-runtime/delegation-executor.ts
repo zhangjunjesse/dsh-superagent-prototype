@@ -84,6 +84,37 @@ export class DelegationExecutor {
         text: trigger.text, ...(operation === 'answer' ? { questionId: row.question!.childId } : {}) } }
     }
   }
+  /** Mark the original fixed bindings before awaiting any remote control. */
+  async shutdown(): Promise<void> {
+    // A completed business report can precede native job/subagent cleanup.
+    // Only a verified lifecycle acknowledgement releases this parent's ownership.
+    const rows = this.list().filter(row => !row.finished || row.snapshot?.executionStopped !== true)
+    for (const row of rows) {
+      const ticket = this.current(row)
+      if (ticket) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
+      this.store.set(this.name(row.request.parentTicketId, row.request.parentAssignmentId), { ...this.store.get(this.name(row.request.parentTicketId, row.request.parentAssignmentId))!, stopped: true })
+    }
+    const errors: Error[] = []
+    for (const pending of rows) {
+      const name = this.name(pending.request.parentTicketId, pending.request.parentAssignmentId), row = this.store.get(name)!
+      try {
+        if (!this.send) throw new Error('Bound child delegation transport is unavailable')
+        let snapshot = await this.send({ ...row.request, operation: 'query', commandId: key(row.request.delegationId, 'query'), text: undefined })
+        this.verify(row, snapshot)
+        if (snapshot.status !== 'missing') {
+          const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
+          snapshot = await this.send(request); this.verify(row, snapshot)
+          if (!['stopped', 'completed'].includes(snapshot.status) || snapshot.executionStopped !== true) throw new Error('Bound child stop has not acknowledged execution cleanup')
+        }
+        this.store.set(name, { ...this.store.get(name)!, stopped: true, finished: true, snapshot: { ...snapshot, executionStopped: true }, error: undefined, retryAt: undefined })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.store.set(name, { ...this.store.get(name)!, stopped: true, error: message })
+        errors.push(new Error(`${row.request.targetInstanceId}/${row.request.delegationId}: ${message}`))
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, errors.map(error => error.message).join('; '))
+  }
   private apply(row: Binding, snapshot: DelegationSnapshot): void {
     this.verify(row, snapshot); row.snapshot = snapshot
     const ticket = this.current(row)

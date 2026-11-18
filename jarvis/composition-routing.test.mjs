@@ -91,7 +91,7 @@ test('DSH host preserves integrated settings navigation and allows only declared
       modelCatalog: async () => ({ groups: [] }),
       resolveAgent: async id => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } },
       create: async ({ sessionId }) => {
-        agents.set(sessionId, { id: sessionId, session: { snapshotEvents: () => [] }, whenIdle: async () => {},
+        agents.set(sessionId, { id: sessionId, status: 'idle', inbox: { nextTurn: [], nextStep: [] }, cancel: () => {}, session: { snapshotEvents: () => [] }, whenIdle: async () => {},
           ctx: { on: subscribe, tools: { schemas: () => [], guard: () => () => {} }, systemPrompt: { section: () => () => {} } } });
       },
     },

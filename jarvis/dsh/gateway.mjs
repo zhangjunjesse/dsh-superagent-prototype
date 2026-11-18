@@ -89,15 +89,23 @@ export class JarvisGateway {
   }
   start() {
     this.started = true;
-    if (this.timer || !this.connected() || this.runtime.closing) return;
+    if (this.timer || !this.connected() || this.runtime.closing || !this.runtime.instanceState().canChat) return;
+    this.paused = false;
     this.timer = setInterval(() => { this.poll().catch(() => {}); }, 1500);
     this.timer.unref?.();
     this.poll().catch(() => {});
   }
   async poll() {
+    if (this.paused || !this.runtime.instanceState().canChat) return false;
+    const lease = this.runtime.captureLease();
     try { await this.service()?.sync?.(); }
     catch { /* The source ledger and its cursor retain feedback for the next bounded pass. */ }
-    if (!this.runtime.closing) return this.kick();
+    try { this.runtime.assertLease(lease); } catch { return false; }
+    if (!this.runtime.closing && !this.paused) return this.kick();
+  }
+  pause(reason = 'instance-stop') {
+    this.paused = true; clearInterval(this.timer); this.timer = undefined;
+    if (this.runtime.active?.kind === 'background') this.runtime.active.cancel?.(reason);
   }
   async close() {
     this.started = false; clearInterval(this.timer); this.timer = undefined;
@@ -178,7 +186,8 @@ export class JarvisGateway {
       item.sessionId === binding.dshSessionId && item.state === 'parked' && item.lastFailure) || [];
     return { gatewayError: this.lastError || parked[0]?.lastFailure, notificationRetryable: parked.length > 0 };
   }
-  async retry(input = {}) {
+  async retry(input = {}, lease = this.runtime.captureLease()) {
+    this.runtime.assertLease(lease);
     if (input.batchId !== undefined && (typeof input.batchId !== 'string' || input.batchId.length > 160)) throw new UserError('通知标识不正确');
     const service = this.service(), binding = this.runtime.store.sessionBinding();
     if (!service?.ledger?.deliveries) throw new UserError('后台通知模块暂不可用', 409);
@@ -186,6 +195,7 @@ export class JarvisGateway {
       delivery.sessionId === binding.dshSessionId && delivery.state === 'parked' && delivery.lastFailure && (!input.batchId || delivery.batchId === input.batchId));
     if (!item) return { retried: false, ...this.notificationStatus() };
     const evidence = await this.delivery.inspect(binding.dshSessionId, item.deliveryId);
+    this.runtime.assertLease(lease);
     if (this.service() !== service) throw new UserError('后台通知模块正在切换', 409);
     if (evidence.assistantCommitted) this.project(item, evidence.assistantText);
     else if (evidence.pending || evidence.state === 'running' || evidence.state === 'unresolved') throw new UserError('原通知仍需核对，暂不能重复表达', 409);
@@ -193,7 +203,8 @@ export class JarvisGateway {
     this.lastError = undefined;
     return { retried: true, ...this.notificationStatus() };
   }
-  async prepareUser(agent) {
+  async prepareUser(agent, lease = this.runtime.captureLease()) {
+    this.runtime.assertLease(lease);
     if (agent.status && agent.status !== 'idle') throw new UserError('会话仍在安全停止，请稍后重新发送', 409);
     const pending = [...(agent.inbox?.nextTurn || []), ...(agent.inbox?.nextStep || [])];
     if (!pending.length) return;
@@ -201,13 +212,16 @@ export class JarvisGateway {
     const service = this.service(), binding = this.runtime.store.sessionBinding();
     const deliveries = service?.ledger?.deliveries?.(binding.conversationId).filter(item => item.generation === binding.generation) || [];
     const owns = await this.ownsQueue(agent, deliveries);
+    this.runtime.assertLease(lease);
     if (this.service() !== service) throw new UserError('任务交办模块正在切换，请重试', 409);
     if (!owns || !owns()) throw new UserError('正在恢复后台消息，请稍后重新发送', 409);
     agent.cancel({ kind: 'user' }); await agent.whenIdle(); await this.runtime.ctx.sessionPersistence.flush();
+    this.runtime.assertLease(lease);
     if (this.service() !== service) throw new UserError('任务交办模块正在切换，请重试', 409);
     for (const item of deliveries) {
       if (!pending.some(message => message.id === 'jarvis-gateway:' + item.deliveryId || item.recoveryId && message.id === 'jarvis-gateway-resume:' + item.recoveryId)) continue;
       const evidence = await this.delivery.inspect(agent, item.deliveryId);
+      this.runtime.assertLease(lease);
       if (evidence.assistantCommitted) this.project(item, evidence.assistantText);
       else if (evidence.pending || evidence.state === 'running') throw new UserError('后台表达尚未安全停止，请稍后重新发送', 409);
       else this.nextAttempt(service, item);
@@ -216,7 +230,8 @@ export class JarvisGateway {
   kick() {
     if (this.draining) return this.draining;
     const runtime = this.runtime, service = this.service();
-    if (runtime.active || runtime.changing || runtime.preempting || runtime.closing || !service?.ledger?.reserve) return Promise.resolve(false);
+    if (this.paused || !runtime.instanceState().canChat || runtime.active || runtime.changing || runtime.preempting || runtime.closing || !service?.ledger?.reserve) return Promise.resolve(false);
+    const lease = runtime.captureLease();
     const binding = runtime.store.sessionBinding();
     if (binding.status !== 'ready' || runtime.agent?.status && runtime.agent.status !== 'idle') return Promise.resolve(false);
     let manifest;
@@ -231,6 +246,7 @@ export class JarvisGateway {
     const finished = Promise.withResolvers(), operation = new AbortController();
     const active = { kind: 'background', turn: { id: 'notification:' + manifest.batchId, source: 'gateway' }, done: finished.promise,
       promptSnapshot: runtime.promptSettings.snapshot('background'),
+      lease,
       cancel: (reason = 'user') => { active.cancelReason = reason; operation.abort(); } };
     runtime.active = active;
     this.draining = this.express(service, manifest, binding, active, operation.signal).finally(() => {
@@ -244,6 +260,10 @@ export class JarvisGateway {
     this.authorizeBinding(binding, active);
   }
   authorizeBinding(binding, active) {
+    this.runtime.assertLease(active.lease);
+    this.authorizeStoredBinding(binding, active);
+  }
+  authorizeStoredBinding(binding, active) {
     const current = this.runtime.store.sessionBinding();
     if (this.runtime.active !== active || current.status !== 'ready' || current.conversationId !== binding.conversationId ||
       current.generation !== binding.generation || current.dshSessionId !== binding.dshSessionId) throw new Error('Gateway expression binding changed');
@@ -257,24 +277,29 @@ export class JarvisGateway {
     const timer = setTimeout(() => active.cancel('timeout'), Number(this.runtime.model().value.timeout) * 1000);
     try {
       agent = await this.runtime.ensureAgent();
+      this.authorize(service, binding, active);
       active.promptSnapshot = await this.runtime.promptSettings.prepare(active.promptSnapshot, agent);
       this.authorize(service, binding, active);
       const existing = this.runtime.store.turn('notification:' + item.batchId);
       if (existing) { service.ledger.saveDelivery({ ...item, state: 'projected', assistantText: existing.assistant }); return true; }
       let evidence = await this.delivery.inspect(agent, item.deliveryId, signal);
+      this.authorize(service, binding, active);
       if (evidence.pending && agent.status === 'idle') {
         if (item.recoveryId) {
           const recovery = await this.delivery.inspectResume(agent, item.deliveryId, item.recoveryId, signal);
+          this.authorize(service, binding, active);
           if (recovery.admitted) {
             const owns = await this.ownsQueue(agent, [item]);
             this.authorize(service, binding, active);
             if (!owns || !owns()) return false;
             agent.cancel({ kind: 'user' }); await agent.whenIdle(); await this.runtime.ctx.sessionPersistence.flush();
             evidence = await this.delivery.inspect(agent, item.deliveryId);
+            this.authorize(service, binding, active);
             if (evidence.assistantCommitted) { this.project(item, evidence.assistantText); return true; }
             if (evidence.pending || evidence.state === 'running') return false;
             item = this.nextAttempt(service, item);
             evidence = await this.delivery.inspect(agent, item.deliveryId, signal);
+            this.authorize(service, binding, active);
           }
         }
         if (evidence.pending) {
@@ -289,11 +314,13 @@ export class JarvisGateway {
             if (!owns()) throw new QueueDeferred('Feedback recovery queue changed before steering');
           } });
           evidence = await this.delivery.inspect(agent, item.deliveryId, signal);
+          this.authorize(service, binding, active);
         }
       }
       if (!evidence.admitted) {
         if (queue(agent).length || agent.status !== 'idle') return false;
         if (service.reviewDelivery && !await service.reviewDelivery(item)) return false;
+        this.authorize(service, binding, active);
         const text = notificationText(item);
         evidence = await this.delivery.send(agent, { deliveryId: item.deliveryId, text }, { signal, authorize: () => this.authorizeFresh(service, binding, active, agent) });
       }
@@ -302,6 +329,7 @@ export class JarvisGateway {
       while (!evidence.assistantCommitted && (evidence.pending || evidence.state === 'running')) {
         await this.waitForProgress(agent, signal);
         evidence = await this.delivery.inspect(agent, item.deliveryId, signal);
+        this.authorize(service, binding, active);
       }
       this.authorize(service, binding, active);
       if (evidence.assistantCommitted) { this.project(item, evidence.assistantText); this.lastError = undefined; return true; }
@@ -311,19 +339,20 @@ export class JarvisGateway {
     } catch (error) {
       if (error instanceof QueueDeferred) return false;
       if (agent && signal.aborted) {
-        try { await this.cancelOwned(agent, item, () => this.authorizeBinding(binding, active)); }
+        try { await this.cancelOwned(agent, item, () => this.authorizeStoredBinding(binding, active)); }
         catch { /* Retain the manifest if ownership or the service binding cannot be proved. */ }
       }
       if (this.service() === service && agent) {
         try {
           const evidence = await this.delivery.inspect(agent, item.deliveryId);
+          this.authorizeStoredBinding(binding, active);
           if (evidence.assistantCommitted) { this.project(item, evidence.assistantText); return true; }
-          if (!evidence.pending && evidence.state !== 'running' && ['preempt', 'shutdown'].includes(active.cancelReason)) this.nextAttempt(service, item);
+          if (!evidence.pending && !['running', 'unresolved'].includes(evidence.state) && (active.lifecycleStopped || ['preempt', 'shutdown'].includes(active.cancelReason))) this.nextAttempt(service, item);
           else if (evidence.pending || evidence.state === 'running' || evidence.state === 'unresolved') service.ledger.saveDelivery({ ...item, state: 'admitted' });
           else this.failAttempt(service, item);
         } catch { /* The durable manifest remains pending; a later lifecycle pass reconciles the evidence. */ }
       }
-      if (['preempt', 'shutdown'].includes(active.cancelReason)) this.lastError = undefined;
+      if (active.lifecycleStopped || ['preempt', 'shutdown'].includes(active.cancelReason)) this.lastError = undefined;
       else this.lastError ||= '后台反馈暂未完成，原任务与事件仍保留。';
       return false;
     } finally { clearTimeout(timer); }
@@ -343,23 +372,32 @@ export class JarvisGateway {
     this.runtime.store.markGatewayManaged();
     const definitions = [
       { name: 'jarvis_work_query', description: '只读查询已交办任务。模糊目标先查候选，再必要澄清；查询不授权选中任务。',
-        parameters: queryParameters, run: args => this.query(args) },
+        parameters: queryParameters, run: (args, lease) => this.query(args, lease) },
       { name: 'jarvis_work_submit', description: '可靠登记当前用户的新交办、追加、回答或停止。request.quote必须引用当前用户原文；queued仅代表已收到，随后简短回复，不等待后台完成。',
-        parameters: submitParameters, run: args => this.submit(agent, args) },
+        parameters: submitParameters, run: (args, lease) => this.submit(agent, args, lease) },
     ];
     return definitions.map(({ run, ...definition }) => agent.ctx.tools.register({ ...definition,
       output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-      execute: async (args, execution) => { execution?.signal?.throwIfAborted(); return run(args); },
+      execute: async (args, execution) => {
+        execution?.signal?.throwIfAborted();
+        const lease = this.runtime.nativeWork.get(execution)?.lease ?? this.runtime.nativeLease(agent);
+        this.runtime.assertLease(lease);
+        const result = await run(args, lease); this.runtime.assertLease(lease); return result;
+      },
     }));
   }
-  async query(args) {
+  async query(args, lease = this.runtime.active?.lease ?? this.runtime.captureLease()) {
+    this.runtime.assertLease(lease);
     if (!this.runtime.allowed('jarvis_work_query')) return { status: 'denied', reason: '任务查询工具已被用户关闭。' };
     const service = this.service();
     if (!service?.query) return { status: 'unavailable', reason: '任务执行入口尚未接通。' };
-    try { return await service.query(args); } catch { return { status: 'needs_clarification', reason: '查询参数不正确。' }; }
+    let result;
+    try { result = await service.query(args); } catch { this.runtime.assertLease(lease); return { status: 'needs_clarification', reason: '查询参数不正确。' }; }
+    this.runtime.assertLease(lease); return result;
   }
   origin(agent) {
     const { active, store } = this.runtime;
+    try { this.runtime.assertLease(active?.lease); } catch { return undefined; }
     const binding = store.sessionBinding();
     const persisted = active?.kind === 'user' && active.turn?.source === 'user' ? store.turn(active.turn.id) : undefined;
     if (!persisted || !currentInputSource(agent, active.turn.requestId).user || binding.status !== 'ready' || persisted.source !== 'user' || persisted.requestId !== active.turn.requestId ||
@@ -369,18 +407,22 @@ export class JarvisGateway {
       source: 'user', ...(persisted.selectedWorkRef ? { selectedWorkRef: persisted.selectedWorkRef } : {}),
       ...(persisted.selectedQuestionId ? { selectedQuestionId: persisted.selectedQuestionId } : {}) };
   }
-  async submit(agent, args) {
+  async submit(agent, args, lease = this.runtime.active?.lease ?? this.runtime.captureLease()) {
+    this.runtime.assertLease(lease);
     if (!this.runtime.allowed('jarvis_work_submit')) return { status: 'denied', reason: '交办工具已被用户关闭。' };
     const origin = this.origin(agent);
     if (!origin) return { status: 'denied', reason: '只能根据当前真实用户轮次交办；后台反馈和历史消息不提供新授权。' };
     const service = this.service();
     if (!service?.submit) return { status: 'unavailable', reason: '任务执行入口尚未接通。' };
-    const turn = this.runtime.active.turn;
+    const active = this.runtime.active, turn = active.turn;
     const result = await service.submit(args, origin);
-    if (result.status === 'queued' || result.status === 'replayed') {
+    // A receipt for already committed work belongs to its original turn even if
+    // stop revoked the lease during the RPC. Preserve that evidence, never resend.
+    if ((result.status === 'queued' || result.status === 'replayed') && this.runtime.active === active) {
       turn.gatewayReceipts = [{ status: result.status, commandId: result.commandId, workRef: result.workRef, receivedAt: result.receivedAt }];
       this.runtime.store.updateTurn(turn);
     }
+    this.runtime.assertLease(lease);
     return result;
   }
   notifications(cursor, limit) {

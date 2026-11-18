@@ -5,7 +5,11 @@
   const feedback = byId('chat-feedback');
   const send = byId('send-message');
   const stop = byId('stop-generation');
+  const instanceStatus = byId('instance-status');
+  const instanceStart = byId('instance-start');
+  const instanceStartError = byId('instance-start-error');
   let turns = [], activeId = null, busy = false, pollTimer, notificationTimer, notificationCursor = 0, selection = null, viewRevision = 0;
+  let instance = null, startingInstance = false, startError = '', stateSyncError = false, stateRequest = null, activeStream = null;
   const nodes = new Map();
   send.disabled = true;
   try { await jarvis.ready; } catch { return; }
@@ -152,7 +156,7 @@
         node.body.append(row);
       }
       const lastUser = turns.findLast(item => item.source !== 'gateway' && item.role !== 'assistant');
-      if (turn.source !== 'gateway' && turn.id === lastUser?.id && turn.status !== 'complete' && turn.status !== 'streaming' && !busy) {
+      if (turn.source !== 'gateway' && turn.id === lastUser?.id && turn.status !== 'complete' && turn.status !== 'streaming' && !busy && canChat()) {
         const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'action secondary'; retry.textContent = '重新生成';
         retry.addEventListener('click', () => submit({ id: turn.id, retry: true })); node.body.append(retry);
       }
@@ -160,16 +164,40 @@
     }
     if (bottom || turns.length <= 1) thread.scrollTop = thread.scrollHeight;
   }
+  function canChat() { return !startingInstance && (!instance || (instance.canChat === true && !stateSyncError)); }
+  function canStopReply() { return !instance || instance.phase === 'running'; }
+  function renderInstanceStatus() {
+    instanceStatus.hidden = !instance || (canChat() && !startError);
+    if (!instance) return;
+    let label;
+    if (stateSyncError) label = '无法同步实例状态，暂时不能发送消息，请稍后重试。';
+    else if (startingInstance || instance.phase === 'starting') label = '实例正在启动，暂时不能对话。';
+    else if (instance.cleanupPending) label = '实例的会话清理未完成，暂时不能对话，请在运行状态中重试停止实例。';
+    else label = ({
+      stopping: '实例正在停止，聊天、任务路由和 Worker 正在结束。',
+      stopped: '实例已停止，聊天、任务路由和 Worker 均已停止。历史记录可继续查看。',
+      failed: '实例运行失败，暂时不能对话，可以重新启动。',
+    })[instance.phase] || '实例暂时不能接收消息。';
+    const reason = !stateSyncError && typeof instance.reason === 'string' ? instance.reason.trim() : '';
+    byId('instance-status-label').textContent = label + (reason ? ' ' + reason : '');
+    instanceStart.hidden = !['stopped', 'failed'].includes(instance.phase) && !startingInstance;
+    instanceStart.disabled = startingInstance || stateSyncError || !!instance.cleanupPending || !!instance.capabilityHold;
+    instanceStart.textContent = startingInstance ? '正在启动…' : '启动实例';
+    instanceStartError.textContent = startError;
+    instanceStartError.hidden = !startError;
+  }
   function controls() {
     byId('conversation-page').dataset.busy = String(busy);
     document.dispatchEvent(new Event('jarvis:activity'));
-    send.disabled = busy || !input.value.trim();
-    send.hidden = busy;
+    send.disabled = busy || !canChat() || !input.value.trim();
+    send.hidden = busy && canStopReply();
     // A running reply must not prevent the user from preparing their next message.
     input.disabled = false;
-    stop.hidden = !busy;
-    stop.disabled = !activeId;
+    stop.hidden = !busy || !canStopReply();
+    stop.disabled = !activeId || !canStopReply();
     byId('reset').disabled = busy;
+    notificationRetry.disabled = !canChat();
+    renderInstanceStatus();
     resizeInput();
   }
   const replyContext = document.createElement('div'); replyContext.className = 'reply-context'; replyContext.hidden = true;
@@ -179,10 +207,11 @@
   const notificationLabel = document.createElement('span'); notificationLabel.textContent = '有后台消息暂未送达。';
   const notificationRetry = document.createElement('button'); notificationRetry.type = 'button'; notificationRetry.textContent = '重试通知';
   notificationRetry.addEventListener('click', async () => {
+    if (!canChat()) return;
     notificationRetry.disabled = true;
     try { syncNotificationStatus(await jarvis.api('/api/notifications/retry', 'POST', {})); await syncNotifications(); }
-    catch { notificationLabel.textContent = '重试失败，请稍后再试。'; }
-    finally { notificationRetry.disabled = false; }
+    catch (error) { notificationLabel.textContent = '重试失败，请稍后再试。'; if (error.status === 503 && instance) await followActive(); }
+    finally { notificationRetry.disabled = !canChat(); }
   });
   notificationStatus.append(notificationLabel, notificationRetry); feedback.after(notificationStatus);
   function syncNotificationStatus(state) {
@@ -250,27 +279,63 @@
     const index = turns.findIndex(item => item.id === turn.id);
     if (index < 0) turns.push(turn); else turns[index] = turn;
   }
+  function scheduleStatePoll() {
+    clearTimeout(pollTimer);
+    if (document.visibilityState !== 'hidden' && (instance || busy)) pollTimer = setTimeout(followActive, busy ? 1200 : 5000);
+  }
+  function syncState(state) {
+    const availableBefore = canChat(), busyBefore = busy;
+    instance = state.instance || null;
+    jarvis.state.instance = instance;
+    stateSyncError = false;
+    if (instance?.canChat) startError = '';
+    // Once the server closes this runtime, late data from its old stream cannot revive it.
+    if (activeStream && instance && (instance.phase !== 'running' ||
+      instance.generation !== activeStream.generation || instance.runtimeId !== activeStream.runtimeId)) activeStream.interrupted = true;
+    let changed = false;
+    if (!activeStream || activeStream.interrupted) {
+      if (Array.isArray(state.turns) && JSON.stringify(turns) !== JSON.stringify(state.turns)) { turns = state.turns; changed = true; }
+      activeId = state.activeSource === 'background' ? null : state.active;
+      busy = Boolean(activeId);
+    }
+    syncNotificationStatus(state);
+    controls();
+    if (changed || busyBefore !== busy || availableBefore !== canChat()) render();
+  }
+  async function refreshChatState() {
+    if (stateRequest?.revision === viewRevision) return stateRequest.promise;
+    const request = { revision: viewRevision };
+    stateRequest = request;
+    request.promise = (async () => {
+      const state = await jarvis.api('/api/state');
+      if (request.revision === viewRevision) syncState(state);
+    })();
+    try { await request.promise; }
+    finally { if (stateRequest === request) stateRequest = null; }
+  }
   async function followActive() {
     clearTimeout(pollTimer);
-    try {
-      const state = await jarvis.api('/api/state');
-      turns = state.turns;
-      activeId = state.active;
-      busy = Boolean(activeId && state.activeSource !== 'background');
-      syncNotificationStatus(state);
+    const revision = viewRevision;
+    try { await refreshChatState(); }
+    catch {
+      if (revision !== viewRevision) return;
+      stateSyncError = !!instance;
+      if (!instance) feedback.textContent = '无法同步对话，请刷新重试';
       controls(); render();
-      if (busy) pollTimer = setTimeout(followActive, 1200);
-    } catch { feedback.textContent = '无法同步对话，请刷新重试'; }
+    } finally { scheduleStatePoll(); }
   }
   async function submit(payload) {
-    if (busy) return;
+    if (busy || !canChat()) return;
     viewRevision++;
+    const stream = { revision: viewRevision, generation: instance?.generation, runtimeId: instance?.runtimeId, interrupted: false };
+    activeStream = stream;
     busy = true; activeId = null; feedback.textContent = ''; controls();
+    scheduleStatePoll();
     const originalText = input.value;
-    let gotStart = false, gotDone = false;
+    let gotDone = false;
     try {
       const response = await fetch(jarvis.url('/api/chat'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Jarvis-CSRF': jarvis.state.csrf }, body: JSON.stringify(payload) });
-      if (!response.ok) { const error = await response.json(); throw new Error(error.error || '发送失败'); }
+      if (!response.ok) { const error = await response.json(); throw Object.assign(new Error(error.error || '发送失败'), { status: response.status }); }
       const reader = response.body.getReader();
       const decoder = new TextDecoder(); let buffer = '';
       while (true) {
@@ -281,8 +346,9 @@
           const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
           if (!line.trim()) continue;
           const event = JSON.parse(line);
+          if (activeStream !== stream || stream.revision !== viewRevision || stream.interrupted) { if (event.type === 'done') gotDone = true; continue; }
           if (event.type === 'start') {
-            gotStart = true; activeId = event.turn.id; replaceTurn(event.turn);
+            activeId = event.turn.id; replaceTurn(event.turn);
             if (!payload.retry) { if (input.value === originalText) input.value = ''; clearSelection(); } controls(); render();
           }
           if (event.type === 'delta' || event.type === 'replace') {
@@ -295,24 +361,35 @@
           }
           if (event.type === 'done') {
             gotDone = true; replaceTurn(event.turn);
-            if (event.turn.status === 'complete') byId('connection-status').textContent = '已连接';
+            if (event.turn.status === 'complete' && byId('connection-status')) byId('connection-status').textContent = '已连接';
           }
         }
         if (chunk.done) break;
       }
       if (!gotDone) throw new Error('回复连接中断');
     } catch (error) {
+      if (activeStream !== stream || stream.revision !== viewRevision) return;
       feedback.textContent = error.message || '回复失败，请重试';
+      stream.interrupted = true;
       // Before acceptance the field was never cleared; preserve any newer draft typed during the request.
       try {
-        const state = await jarvis.api('/api/state'); turns = state.turns; activeId = state.activeSource === 'background' ? null : state.active;
+        await refreshChatState();
         if (turns.some(turn => turn.id === payload.id) && !payload.retry && input.value === originalText) input.value = '';
       } catch {}
     } finally {
-      if (gotDone) activeId = null;
-      busy = Boolean(activeId); controls(); render();
-      if (busy) pollTimer = setTimeout(followActive, 1000);
-      else input.focus();
+      if (activeStream === stream && stream.revision === viewRevision) {
+        stream.interrupted = true;
+        if (gotDone) activeId = null;
+        if (instance) {
+          try { await refreshChatState(); } catch { if (activeStream === stream && stream.revision === viewRevision) stateSyncError = true; }
+        }
+        if (activeStream === stream && stream.revision === viewRevision) {
+          activeStream = null;
+          busy = Boolean(activeId); controls(); render();
+          scheduleStatePoll();
+          if (!busy && !byId('conversation-page').hidden) input.focus();
+        }
+      } else if (activeStream === stream) activeStream = null;
     }
   }
   byId('composer').addEventListener('submit', event => {
@@ -323,7 +400,7 @@
   input.addEventListener('keydown', event => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); byId('composer').requestSubmit(); }
   });
-  input.addEventListener('input', () => { send.disabled = busy || !input.value.trim(); resizeInput(); });
+  input.addEventListener('input', () => { send.disabled = busy || !canChat() || !input.value.trim(); resizeInput(); });
   window.addEventListener('resize', resizeInput);
   if (typeof ResizeObserver !== 'undefined') {
     let previousWidth;
@@ -333,9 +410,24 @@
     }).observe(input);
   }
   stop.addEventListener('click', async () => {
+    if (!activeId || !canStopReply()) return;
     stop.disabled = true;
     try { await jarvis.api('/api/stop', 'POST', { id: activeId }); }
-    catch (error) { feedback.textContent = error.message; stop.disabled = false; }
+    catch (error) { feedback.textContent = error.message; stop.disabled = !canStopReply(); }
+    finally { if (instance) await followActive(); }
+  });
+  instanceStart.addEventListener('click', async () => {
+    if (!instance || startingInstance || instanceStart.disabled || !['stopped', 'failed'].includes(instance.phase)) return;
+    startingInstance = true; startError = ''; viewRevision++; controls(); render();
+    try {
+      const system = await jarvis.api('/api/system');
+      if (!Number.isInteger(system.revision)) throw new Error('无法读取实例配置版本，请重试。');
+      await jarvis.api('/api/system/root/start', 'POST', { revision: system.revision });
+      await refreshChatState();
+    } catch (error) {
+      startError = error.message || '实例启动失败，请重试。';
+      try { await refreshChatState(); } catch { stateSyncError = true; }
+    } finally { startingInstance = false; controls(); render(); scheduleStatePoll(); }
   });
   byId('reset').addEventListener('click', () => { if (!busy) byId('chat-confirm').hidden = false; });
   byId('clear-cancel').addEventListener('click', () => { byId('chat-confirm').hidden = true; });
@@ -343,10 +435,15 @@
     try { await jarvis.api('/api/conversation', 'DELETE'); viewRevision++; turns = []; clearSelection(); feedback.textContent = ''; byId('chat-confirm').hidden = true; render(); }
     catch (error) { feedback.textContent = error.message; }
   });
-  turns = jarvis.state.turns; activeId = jarvis.state.active; busy = Boolean(activeId && jarvis.state.activeSource !== 'background');
+  instance = jarvis.state.instance || null;
+  turns = jarvis.state.turns; activeId = jarvis.state.activeSource === 'background' ? null : jarvis.state.active; busy = Boolean(activeId);
   syncNotificationStatus(jarvis.state);
   controls(); render();
-  if (busy) followActive();
+  if (busy) followActive(); else scheduleStatePoll();
   syncNotifications();
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') syncNotifications(); });
+  document.addEventListener('jarvis:instance-updated', () => { if (instance) followActive(); });
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(pollTimer);
+    if (document.visibilityState !== 'hidden') { syncNotifications(); if (instance || busy) followActive(); }
+  });
 })();

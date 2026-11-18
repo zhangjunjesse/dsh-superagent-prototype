@@ -50,6 +50,7 @@ const peer = new ProcessPeer(process, {
   },
   'test.capabilityTask'(task) { capabilityTasks.push(task); return capabilityActivity(); },
   'test.stopBlocked'(input) { stopBlocked = input.blocked; return { stopCalls, stopBlocked }; },
+  'lifecycle.drain'() { return { stopped: true }; },
   close() { return { stopped: true }; },
 });
 process.on('disconnect', () => process.exit(0));
