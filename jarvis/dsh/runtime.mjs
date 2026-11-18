@@ -101,20 +101,23 @@ export class JarvisRuntime {
     const lease = this.lease, hold = this.capabilityHold ?? state?.capabilityHold;
     let current = false;
     try { current = lease?.isCurrent() === true; } catch { /* A failed generation witness grants no admission. */ }
+    // Waiting Worker settings fence task dispatch; only their switching window closes daily input.
     const canChat = !this.closing && !this.changing && !this.preempting && !this.suspending && !this.suspendFailed && !this.nativeUnknownJobs.size && state?.configured !== false && state?.phase === 'running' && !state.cleanupPending &&
-      lease?.runtimeId === this.lifecycle?.runtimeId && state.generation === lease?.generation && current && !hold;
-    const reason = canChat ? undefined : this.closing ? '服务正在关闭' : hold ? '实例正在应用能力设置，暂不接收新消息' :
+      lease?.runtimeId === this.lifecycle?.runtimeId && state.generation === lease?.generation && current && !hold?.frozen && state.capabilityTransitioning !== true;
+    const reason = canChat ? undefined : this.closing ? '服务正在关闭' :
       this.nativeUnknownJobs.size ? '原生后台任务缺少真实结束确认，实例清理尚未完成' : state?.cleanupPending || this.suspendFailed ? '实例停止尚未完成，请重试停止' : state?.phase === 'starting' ? '实例正在启动' :
       state?.phase === 'stopping' || this.suspending ? '实例正在停止' : this.changing || this.preempting ? '日常会话正在切换，请稍后重试' :
-      state?.phase === 'failed' ? '实例运行失败，请先恢复运行' : '实例已停止，请先启动实例';
+      state?.phase === 'failed' ? '实例运行失败，请先恢复运行' : state?.phase === 'running' && (hold?.frozen || state.capabilityTransitioning === true)
+        ? 'Worker 设置正在切换，暂不接收新消息' : '实例已停止，请先启动实例';
     return { instanceId: state?.instanceId, phase: state?.phase ?? 'stopped', generation: state?.generation ?? 0,
       runtimeId: this.lifecycle?.runtimeId, cleanupPending: Boolean(state?.cleanupPending || this.suspendFailed || this.nativeUnknownJobs.size),
-      ...(hold ? { capabilityHold: hold } : {}), canChat, reason };
+      ...(hold ? { capabilityHold: hold } : {}), ...(state?.capabilityTransitioning === true ? { capabilityTransitioning: true } : {}), canChat, reason };
   }
   captureLease() {
     if (!this.lifecycleManaged) { if (this.closing) throw new UserError('服务正在关闭', 409); return undefined; }
     const state = this.instanceState();
-    if (!state.canChat) throw new UserError(state.reason, state.capabilityHold || this.changing || this.preempting || ['starting', 'stopping'].includes(state.phase) ? 409 : 503);
+    const switching = state.phase === 'running' && (state.capabilityHold?.frozen || state.capabilityTransitioning);
+    if (!state.canChat) throw new UserError(state.reason, switching || this.changing || this.preempting || ['starting', 'stopping'].includes(state.phase) ? 409 : 503);
     return this.lease;
   }
   assertLease(lease) {

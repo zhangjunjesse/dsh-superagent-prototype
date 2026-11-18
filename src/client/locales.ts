@@ -30,7 +30,7 @@ const TEXT = {
   workerCapabilitiesFailed: ['已保存，应用失败', 'Saved; application failed'],
   workerCapabilitiesRecoveryFailed: ['设置已生效，恢复相关组织运行失败', 'Settings applied; related organizations could not resume'],
   workerCapabilitiesCancelled: ['已取消待应用，继续使用当前生效设置', 'Pending application cancelled; current settings remain in effect'],
-  workerCapabilitiesKeepApplied: ['等待期间仍使用当前生效的工具与技能；本次保存尚未改变权限。', 'While waiting, the currently applied tools and skills remain in use. This save has not changed permissions yet.'],
+  workerCapabilitiesKeepApplied: ['日常对话在等待期间可以继续。正在执行的工作结束后自动切换工具和技能。只等人答复的工单会保留。', 'Chat stays available while waiting. Tools and skills switch when active work finishes. Tickets waiting for a reply are preserved.'],
   workerCapabilitiesCancelToEdit: ['取消待应用后可重新修改；取消后继续使用当前生效设置。', 'Cancel the pending application to edit again. The currently applied settings will remain in use.'],
   workerCapabilitiesAppliedTools: ['当前生效工具', 'Currently applied tools'],
   workerCapabilitiesAppliedSkills: ['当前生效技能', 'Currently applied skills'],

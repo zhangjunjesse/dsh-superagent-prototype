@@ -4,9 +4,10 @@ import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
+import type { Ticket } from '../core/index.ts'
 import type { RuntimeNativePorts } from '../app/runtime-ports.ts'
 import type { Machine } from '../deployment.ts'
-import { KV } from '../kv.ts'
+import { family, KV } from '../kv.ts'
 import { LIMITS } from '../limits.ts'
 import { SettingsSchema } from '../policy.ts'
 import { GatewayLedger } from '../jarvis-gateway/ledger.ts'
@@ -15,12 +16,13 @@ import { GatewayPump } from '../jarvis-gateway/pump.ts'
 import { jarvisKind, SourceBackend } from '../jarvis-gateway/source.ts'
 import * as github from '../sources/github.ts'
 import * as feishu from '../sources/feishu.ts'
-import { InboundDelegations } from './delegation-ingress.ts'
+import { InboundDelegations, type DelegationLimit } from './delegation-ingress.ts'
 import { DelegationExecutor } from './delegation-executor.ts'
+import { CapabilitySchema, DelegationCatalogSchema, type Capability } from './delegation-contract.ts'
 import { EngineConfigSchema, normalizeEngineConfig } from './engine-config.ts'
 import { initializeOriginalConfiguration } from './original-config.ts'
 import { TaskFiles, artifactLinks } from './task-files.ts'
-import { effectiveWorkerTools } from './worker-capabilities.ts'
+import { effectiveWorkerTools, WorkerSkillsSchema, WorkerToolSchema } from './worker-capabilities.ts'
 import { CapabilityDrain, type CapabilityHold } from './capability-drain.ts'
 import type { ProcessHost, ProcessRunResult, ProcessRuntimeConfig } from './runtime.ts'
 
@@ -50,6 +52,8 @@ export interface ProcessRuntimeOptions {
   capabilityHold?: CapabilityHold;
 }
 type Preparation = { prepare(id: string, text: string): Promise<ProcessRunResult>; cancel(sessionKey: string): Promise<unknown> }
+const WorkerCapabilityBindingSchema = z.object({ version: z.literal(1), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
+const workerCapabilities = family<z.infer<typeof WorkerCapabilityBindingSchema>, [string]>('process-runtime:worker-capabilities:')
 
 /** Validate adopted identities against the actual locked Store rather than trusting transport observations. */
 function verifyAdoption(runtime: Runtime, config: ProcessRuntimeConfig, adoption: OriginalAdoption): void {
@@ -86,8 +90,10 @@ export class OriginalProcess {
   private closing?: Promise<void>
   private draining = false
   private quiescing?: Promise<void>
+  private readyTargets = new Set<string>()
+  private catalogRefresh?: Promise<void>
 
-  constructor(readonly config: ProcessRuntimeConfig, host: ProcessHost, readonly options: ProcessRuntimeOptions, preparation: Preparation) {
+  constructor(readonly config: ProcessRuntimeConfig, private readonly host: ProcessHost, readonly options: ProcessRuntimeOptions, preparation: Preparation) {
     if (!options?.native) throw new Error('The original complete task runtime requires its shared DSH native ports')
     const directory = realpathSync.native(config.stateDir), workspace = realpathSync.native(config.workspace)
     const marker = join(directory, 'process-instance.json'), ownership = { instanceId: config.instanceId, workspace }
@@ -114,8 +120,12 @@ export class OriginalProcess {
         setup: { native: options.native.deployment, allowLocal: true },
         masterDirectory: adoption?.sessions.find(item => item.role === 'orchestrator')?.cwd,
         expectedMasterId: adoption?.masterId,
-        workerTools: ticket => effectiveWorkerTools(this.inbound?.toolsFor(ticket) ?? config.workerTools).names,
-        workerSkills: () => config.workerSkills ?? [],
+        workerTools: ticket => effectiveWorkerTools(this.workerCapabilities(ticket).tools).names,
+        workerSkills: ticket => this.workerCapabilities(ticket).skills,
+        prepareTicket: ticket => {
+          runtime!.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 1, ...this.workerCapabilities(ticket) }))
+          return ticket
+        },
         localTicket: ticket => !this.delegated.remote(ticket),
         executionHeld: () => this.draining || (this.capabilityDrain?.frozen ?? false),
         authorizeCapabilityStop: operationId => this.capabilityDrain.authorizeStop(operationId),
@@ -126,7 +136,15 @@ export class OriginalProcess {
         scope: { scope: input => input.source === 'delegation'
           ? this.inbound?.listens(input.meta) ? { listened: true, observed: false } : { listened: false, reason: 'delegation_not_allowed' }
           : this.runtime.sources.scope(input) },
-        routing: { targets: trigger => trigger.source === 'delegation' ? [] : config.delegationTargets ?? [], select: (id, target) => this.delegated.select(id, target) },
+        routing: {
+          targets: async trigger => {
+            if (trigger.source === 'delegation') return []
+            await this.refreshDelegationCatalog()
+            return (config.delegationTargets ?? []).filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
+          },
+          prepare: async (id, target) => { if (target && !this.delegated.selected(id)) await this.refreshDelegationCatalog() },
+          select: (id, target) => this.delegated.select(id, target),
+        },
         executor: local => ({
           start: (ticket, assignment) => this.delegated.remote(ticket) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
@@ -156,8 +174,9 @@ export class OriginalProcess {
       const kind = jarvisKind(ledger, identity)
       this.unregister = runtime.sources.register(kind)
       this.inbound = new InboundDelegations(config, runtime.store, runtime.engine,
-        { ...preparation, admitted: id => this.capabilityDrain.prepare(id) })
-      this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host), () => this.capabilityDrain?.frozen ?? false)
+        { ...preparation, admitted: id => this.capabilityDrain.prepare(id), acceptNew: () => this.delegationReady() })
+      this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
+        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools)
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
       const backend = new SourceBackend(runtime.context(kind), identity)
@@ -171,6 +190,78 @@ export class OriginalProcess {
     } catch (error) {
       this.unregister?.(); ledger?.close(); void runtime?.stop(); throw error
     }
+  }
+  /** Existing task grants can only narrow; changing instance settings never grants an old task new tools or skills. */
+  private workerCapabilities(ticket: Ticket) {
+    const stored = this.runtime.store.get(workerCapabilities(ticket.id)), saved = stored && WorkerCapabilityBindingSchema.parse(stored)
+    const selected = this.delegated?.selected(ticket.origin.triggerId)
+    const childTools = selected && selected !== 'local' ? this.config.delegationTargets?.find(target => target.instanceId === selected)?.tools ?? [] : undefined
+    return {
+      tools: (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
+        .filter(tool => (!childTools || childTools.some(name => name === tool)) && (!saved || saved.tools.some(name => name === tool))),
+      skills: (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill)),
+    }
+  }
+  /** Catch up a catalog addition already committed by the host before validating the unchanged relationships. */
+  async prepareCapabilityConfiguration(targets: readonly Capability[]): Promise<void> {
+    const known = new Set((this.config.delegationTargets ?? []).map(target => target.instanceId))
+    // A failed host commit may replay configuration after this owner updated its
+    // tools. Do not compare that new descriptor with the still-old host tools.
+    if (targets.some(target => !known.has(target.instanceId))) await this.refreshDelegationCatalog()
+  }
+  /** Called synchronously under the frozen owner after both business and native work have drained. */
+  configureCapabilities(input: { workerTools: string[]; workerSkills: string[]; delegationTargets: Capability[]; delegationLimits: DelegationLimit[] }): void {
+    const previous = new Map((this.config.delegationTargets ?? []).map(target => [target.instanceId, target]))
+    if (input.delegationTargets.length !== previous.size || new Set(input.delegationTargets.map(target => target.instanceId)).size !== previous.size
+      || input.delegationTargets.some(target => {
+        const prior = previous.get(target.instanceId)
+        return !prior || target.organizationName !== prior.organizationName || target.description !== prior.description
+          || target.tools.some(tool => !input.workerTools.includes(tool))
+      })) throw new Error('Worker capability configuration cannot change delegation relationships or organization identities')
+    this.inbound.validateCapabilityLimits(input.delegationLimits, input.workerTools)
+    const limits = new Map(input.delegationLimits.map(limit => [limit.sourceInstanceId, limit.tools]))
+    this.runtime.store.atomic(() => {
+      // Include ended tickets: their authorized continuation must not acquire a
+      // newly enabled capability, or regain one removed by an earlier change.
+      for (const ticket of this.runtime.store.tickets.list()) {
+        const current = this.workerCapabilities(ticket)
+        const basis = ticket.mandate.basis, parentTools = basis.via === 'delegation' ? limits.get(basis.delegation.parentInstanceId) ?? [] : undefined
+        this.runtime.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 1,
+          tools: current.tools.filter(tool => input.workerTools.includes(tool) && (!parentTools || parentTools.includes(tool))),
+          skills: current.skills.filter(skill => input.workerSkills.includes(skill)) }))
+      }
+      this.inbound.configureCapabilityLimits(input.delegationLimits, input.workerTools)
+    })
+    this.config.workerTools = [...input.workerTools]
+    this.config.workerSkills = [...input.workerSkills]
+    this.config.delegationTargets = structuredClone(input.delegationTargets)
+  }
+  /** Only additive catalog changes can enter a running owner; bound descriptors remain immutable. */
+  private refreshDelegationCatalog(): Promise<void> {
+    return this.catalogRefresh ??= this.readDelegationCatalog().catch(error => {
+      this.readyTargets = new Set(); throw error
+    }).finally(() => { this.catalogRefresh = undefined })
+  }
+  private async readDelegationCatalog(): Promise<void> {
+    if (!this.host.delegate || !this.host.delegationCatalog) { this.readyTargets = new Set(); return }
+    const catalog = DelegationCatalogSchema.parse(await this.host.delegationCatalog())
+    const byId = new Map(catalog.targets.map(target => [target.instanceId, target]))
+    const identity = (target: Capability) => JSON.stringify(CapabilitySchema.parse(target))
+    for (const target of this.config.delegationTargets ?? []) {
+      const current = byId.get(target.instanceId)
+      if (!current || identity(current) !== identity(target)) throw new Error('A running delegation catalog may only add targets')
+    }
+    for (const target of catalog.targets) {
+      if (target.instanceId === this.config.instanceId || target.tools.some(tool => !this.config.workerTools.includes(tool)))
+        throw new Error('Delegation catalog exceeds the current organization capability')
+    }
+    this.config.delegationTargets = catalog.targets
+    this.readyTargets = new Set(catalog.readyInstanceIds)
+  }
+  /** The original admission owner is available without consuming or disturbing current work. */
+  delegationReady(): boolean {
+    return !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
+      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId
   }
   close(): Promise<void> { return this.closing ??= this.shutdown() }
   /** Fence original admission and drain the original pass/source owners without closing their Store. */

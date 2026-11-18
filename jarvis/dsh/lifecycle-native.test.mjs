@@ -131,14 +131,31 @@ test('installed native capability cancellation stops the confirmed invocation an
   const invocation = f.execute('read'); await entered.promise;
   f.runtime.setCapabilityHold({ operationId: 'daily-capabilities', frozen: false });
   const confirmed = await f.runtime.capabilityActivity(); assert.ok(confirmed.work.some(item => item.kind === 'native-tool'));
-  assert.equal((await f.execute('calculate', { operation: 'arithmetic', expression: '1+1' })).isError, true);
+  assert.equal((await f.execute('calculate', { operation: 'arithmetic', expression: '1+1' })).value.result, 2, 'pending Worker settings preserve daily read tools');
   f.runtime.setCapabilityHold({ operationId: 'daily-capabilities', frozen: true });
+  assert.equal((await f.execute('calculate', { operation: 'arithmetic', expression: '1+1' })).isError, true, 'the switching window still freezes new daily invocations');
   await f.runtime.cancelCapabilityWork('daily-capabilities', confirmed);
   assert.equal((await invocation).isError, true); dispose(); assert.equal(f.toolCalls.length, 0);
   assert.equal((await f.runtime.capabilityActivity()).busy, false); assert.equal(f.runtime.capabilityHold.operationId, 'daily-capabilities');
   assert.equal(f.runtime.instanceState().canChat, false);
   f.runtime.setCapabilityHold(undefined); assert.equal(f.runtime.instanceState().canChat, true);
   assert.equal((await f.execute('read')).isError, false);
+});
+
+test('installed native daily model requests remain available during waiting Worker settings and freeze only for the switch', { skip: !available, timeout: 24000 }, async t => {
+  const f = await fixture(t); f.start();
+  const agent = f.runtime.agent, binding = f.runtime.store.sessionBinding();
+  f.runtime.setCapabilityHold({ operationId: 'daily-waiting-requests', frozen: false });
+  f.prompt(agent); await agent.whenIdle();
+  assert.equal(f.modelCalls.length, 1, f.errors.map(error => error.stack).join('\n'));
+  assert.equal(f.runtime.instanceState().canChat, true);
+  f.runtime.setCapabilityHold({ operationId: 'daily-waiting-requests', frozen: true });
+  f.prompt(agent); await agent.whenIdle();
+  assert.equal(f.modelCalls.length, 1, 'the real request middleware prevents a new model invocation while frozen');
+  f.runtime.setCapabilityHold({ operationId: 'daily-waiting-requests', frozen: false });
+  f.prompt(agent); await agent.whenIdle();
+  assert.equal(f.modelCalls.length, 2);
+  assert.deepEqual(f.runtime.store.sessionBinding(), binding);
 });
 
 test('installed native Session retired by clear retains an execution guard while the new Session runs', { skip: !available, timeout: 24000 }, async t => {

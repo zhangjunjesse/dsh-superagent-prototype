@@ -458,6 +458,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/core-delegation.spec.ts` | Verified machine admission, immutable parent authority, fixed targets, actionable inputs, question CAS, revocation and nonhuman stop |
 | `tests/process-delegation.spec.ts` | Parent and child runtime flow, isolated child brain, tool intersection, fixed bindings, followups, questions, stops, local capacity and restart without replay |
 | `tests/process-delegation-races.spec.ts` | Late input and rejected-control completion fences, stop during missing-query, transport failure visibility and recovery |
+| `tests/process-live-routing.spec.ts` | Live child discovery, readiness at selection and admission, and continuity of existing assignments |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |

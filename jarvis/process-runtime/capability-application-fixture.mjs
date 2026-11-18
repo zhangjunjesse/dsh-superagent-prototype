@@ -21,6 +21,11 @@ new ProcessPeer(process, {
   },
   'capabilities.freeze'(input) { hold = { operationId: input.operationId, frozen: true }; return activity(); },
   'capabilities.activity': activity,
+  'capabilities.configure'(input) {
+    if (!hold?.frozen || hold.operationId !== input.operationId || activity().busy) throw new Error('Fixture must be idle and frozen');
+    config.workerTools = input.workerTools; config.workerSkills = input.workerSkills;
+    return { configured: true, instanceId: config.instanceId };
+  },
   'capabilities.stop'(input) {
     if (!hold?.frozen || input.fingerprint !== activity().fingerprint) throw new Error('Fixture confirmation mismatch');
     tasks = []; persist(); return activity();

@@ -1,9 +1,11 @@
 /** Durable machine ingress. It never creates a human UserTurn or writes a Ticket directly. */
 import { Engine, key, latestAssignment, type DelegationAuthority, type Mandate, type Trigger, type Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
-import { family } from '../kv.ts'
+import { z } from 'zod'
+import { family, record } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
 import { DelegationRequestSchema, type DelegationEnvelope, type DelegationRequest, type DelegationSnapshot } from './delegation-contract.ts'
+import { WorkerToolSchema } from './worker-capabilities.ts'
 
 interface Command { request: DelegationRequest; hash: string; at: string; trigger?: Trigger }
 interface Incoming {
@@ -12,6 +14,11 @@ interface Incoming {
 }
 const incoming = family<Incoming, [string]>('process-delegation:in:')
 const commandIndex = family<string, [string]>('process-delegation:trigger:')
+/** Current host-verified tool intersection for one configured direct parent. */
+export interface DelegationLimit { sourceInstanceId: string; tools: string[] }
+const CapabilityLimitsSchema = z.array(z.object({ sourceInstanceId: z.string().min(1).max(200), tools: z.array(WorkerToolSchema) }).strict())
+const capabilityLimits = record<z.infer<typeof CapabilityLimitsSchema>>('process-delegation:capability-limits')
+const grantedTools = family<z.infer<typeof WorkerToolSchema>[], [string]>('process-delegation:granted-tools:')
 const sameParent = (a: DelegationRequest, b: DelegationRequest) => a.delegationId === b.delegationId && a.parentTicketId === b.parentTicketId
   && a.parentAssignmentId === b.parentAssignmentId && a.parentDecisionId === b.parentDecisionId && a.targetInstanceId === b.targetInstanceId
   && fingerprint(a.tools) === fingerprint(b.tools) && fingerprint(a.path) === fingerprint(b.path)
@@ -25,12 +32,41 @@ export class InboundDelegations {
   private closing = false
   constructor(private config: Config, private store: Store, private engine: Engine,
     private callbacks: { prepare(id: string, text: string): Promise<Preparation>; cancel(sessionKey: string): Promise<unknown>;
-      admitted?(id: string): boolean }) {}
+      admitted?(id: string): boolean; acceptNew?(): boolean }) {}
 
-  private permitted(source: string, request: DelegationRequest): boolean {
+  private related(source: string, request: DelegationRequest): boolean {
     return source !== this.config.instanceId && !!this.config.allowedParents?.includes(source)
       && request.targetInstanceId === this.config.instanceId && request.path[0] === source
-      && request.tools.length > 0 && request.tools.every(tool => this.config.workerTools.includes(tool))
+  }
+  private permitted(source: string, request: DelegationRequest, bound?: Incoming): boolean {
+    return this.related(source, request) && request.tools.length > 0 && (bound ? bound.source === source && sameParent(bound.request, request)
+        : request.tools.every(tool => this.config.workerTools.includes(tool) && this.parentTools(source)?.includes(tool) !== false))
+  }
+  private parentTools(source: string): readonly string[] | undefined {
+    const stored = this.store.get(capabilityLimits)
+    return stored && (CapabilityLimitsSchema.parse(stored).find(limit => limit.sourceInstanceId === source)?.tools ?? [])
+  }
+  private allowedTools(row: Incoming): z.infer<typeof WorkerToolSchema>[] {
+    const saved = this.store.get(grantedTools(row.request.delegationId)), parent = this.parentTools(row.source)
+    const granted = saved && z.array(WorkerToolSchema).parse(saved)
+    return row.request.tools.filter(tool => this.config.workerTools.includes(tool) && (!parent || parent.includes(tool))
+      && (!granted || granted.includes(tool)))
+  }
+  /** The private host supplies the complete current set, never a model-selected permission override. */
+  validateCapabilityLimits(limits: DelegationLimit[], workerTools: readonly string[]): void {
+    const parents = new Set(this.config.allowedParents ?? []), provided = new Set(limits.map(limit => limit.sourceInstanceId))
+    if (provided.size !== limits.length || provided.size !== parents.size
+      || limits.some(limit => !parents.has(limit.sourceInstanceId) || limit.tools.some(tool => !workerTools.includes(tool))))
+      throw new Error('Worker capability configuration requires the exact configured parent relationships and their tool intersection')
+  }
+  /** Preserve immutable requests and mandates; only their execution grant is narrowed, including queued preparations. */
+  configureCapabilityLimits(limits: DelegationLimit[], workerTools: readonly string[]): void {
+    this.validateCapabilityLimits(limits, workerTools)
+    for (const name of this.store.keys(incoming)) {
+      const row = this.store.get(name)!, parent = limits.find(limit => limit.sourceInstanceId === row.source)?.tools ?? []
+      this.store.set(grantedTools(row.request.delegationId), this.allowedTools(row).filter(tool => workerTools.includes(tool) && parent.includes(tool)))
+    }
+    this.store.set(capabilityLimits, CapabilityLimitsSchema.parse(limits))
   }
   private authority(row: Incoming): DelegationAuthority {
     const r = row.request
@@ -39,22 +75,24 @@ export class InboundDelegations {
   }
   listens(meta: Record<string, unknown>): boolean {
     const row = typeof meta.delegationId === 'string' && this.store.get(incoming(meta.delegationId))
-    return !!row && this.permitted(row.source, row.request)
+    return !!row && this.permitted(row.source, row.request, row)
   }
   authorize(trigger: Trigger): DelegationAuthority | undefined {
     const id = this.store.get(commandIndex(trigger.id)), row = id && this.store.get(incoming(id))
-    if (!row || !this.permitted(row.source, row.request)) return
+    if (!row || !this.permitted(row.source, row.request, row)) return
     const saved = row.commands[trigger.dispatch?.commandId ?? '']?.trigger
     if (saved && fingerprint(saved) === fingerprint(trigger)) return this.authority(row)
   }
   revalidate(mandate: Mandate): boolean {
     if (mandate.basis.via !== 'delegation') return false
     const row = this.store.get(incoming(mandate.basis.delegation.delegationId))
-    return !!row && this.permitted(row.source, row.request) && fingerprint(this.authority(row)) === fingerprint(mandate.basis.delegation)
+    return !!row && this.permitted(row.source, row.request, row) && fingerprint(this.authority(row)) === fingerprint(mandate.basis.delegation)
   }
   toolsFor(ticket: Ticket): string[] | undefined {
     const basis = ticket.mandate.basis
-    return basis.via === 'delegation' ? [...basis.delegation.tools].filter(tool => this.config.workerTools.includes(tool)) : undefined
+    if (basis.via !== 'delegation') return
+    const row = this.store.get(incoming(basis.delegation.delegationId))
+    return row && this.revalidate(ticket.mandate) ? this.allowedTools(row).filter(tool => basis.delegation.tools.includes(tool)) : []
   }
   private ticket(row: Incoming): Ticket | undefined {
     const command = row.commands[row.request.commandId], trigger = command?.trigger
@@ -80,9 +118,10 @@ export class InboundDelegations {
   }
   async receive(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     const request = DelegationRequestSchema.parse(envelope.request), source = envelope.sourceInstanceId
-    if (!this.permitted(source, request)) throw new Error('Delegation relationship, path or tools are not allowed')
+    if (!this.related(source, request)) throw new Error('Delegation relationship, path or tools are not allowed')
     let row = this.store.get(incoming(request.delegationId))
     if (row && (row.source !== source || !sameParent(row.request, request))) throw new Error('Delegation identity or permission conflict')
+    if (!this.permitted(source, request, row)) throw new Error('Delegation relationship, path or tools are not allowed')
     if (request.operation === 'query') return row ? this.snapshot(row) : { delegationId: request.delegationId,
       parentTicketId: request.parentTicketId, parentAssignmentId: request.parentAssignmentId, childInstanceId: this.config.instanceId, status: 'missing', receipts: {} }
     const hash = fingerprint(request), old = row?.commands[request.commandId]
@@ -90,11 +129,17 @@ export class InboundDelegations {
     if (!request.text?.trim()) throw new Error('A delegation command requires text')
     if (!row) {
       if (request.operation !== 'submit') throw new Error('Unknown delegation; no control target exists')
+      // Validate at the actual first durable admission. Replayed commands and
+      // bound lifecycle controls above retain their original semantics.
+      if (this.closing || this.callbacks.acceptNew?.() === false) throw new Error('Child organization is not ready to admit new delegations')
       row = { source, request, phase: 'queued', commands: {} }
     } else if (request.operation === 'submit') throw new Error('Delegation already has its original submit command')
     const command: Command = { request, hash, at: new Date().toISOString() }
     if (request.operation === 'submit') {
-      row.commands[request.commandId] = command; this.store.set(incoming(request.delegationId), row)
+      this.store.atomic(() => {
+        this.store.set(grantedTools(request.delegationId), this.allowedTools(row!))
+        row!.commands[request.commandId] = command; this.store.set(incoming(request.delegationId), row!)
+      })
     } else {
       const ticket = this.ticket(row)
       if (request.operation === 'stop' && !ticket) {
@@ -150,7 +195,7 @@ export class InboundDelegations {
   }
   preparationContext(id: string) {
     const row = this.store.get(incoming(id))
-    if (row?.phase !== 'preparing' || !this.permitted(row.source, row.request)) throw new Error('Delegation preparation is no longer authorized')
+    if (row?.phase !== 'preparing' || !this.permitted(row.source, row.request, row)) throw new Error('Delegation preparation is no longer authorized')
     if (!row.request.taskContext) throw new Error('This historical delegation has no original parent task material')
     return row.request.taskContext
   }

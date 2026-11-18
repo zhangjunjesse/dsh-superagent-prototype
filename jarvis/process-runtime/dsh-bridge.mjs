@@ -246,6 +246,21 @@ export class DshBridge {
   }
 
   setCapabilityHold(hold) { this.capabilityHold = hold ? { ...hold } : undefined; }
+  async configureCapabilities({ operationId, workerTools, workerSkills }) {
+    if (this.capabilityHold?.operationId !== operationId || !this.capabilityHold.frozen) throw new Error('Bridge configuration requires its frozen maintenance owner');
+    if (JSON.stringify([workerTools, workerSkills]) === JSON.stringify([this.config.workerTools, this.config.workerSkills])) return;
+    // Installed Worker tool wrappers belong to a Session scope. Resume that same persisted
+    // Session with fresh wrappers on its next turn, retaining its identity and history.
+    const workers = [...this.sessions].filter(([, binding]) => binding.role === 'worker');
+    if (workers.length) await this.ctx.sessionPersistence.flush();
+    for (const [key, binding] of workers) {
+      if (this.active.has(key) || binding.agent.status !== 'idle') throw new Error('A Worker Session is still executing');
+      await binding.handle.dispose();
+      this.sessions.delete(key);
+    }
+    this.config.workerTools = [...workerTools];
+    this.config.workerSkills = [...workerSkills];
+  }
   capabilityActivity() {
     const work = [...this.active.values()].map(active => ({ id: `bridge:${active.input.sessionKey}:${active.input.requestId}`,
       title: active.input.text.slice(0, 200), kind: active.input.role === 'jarvis' ? 'conversation' : 'bridge-request',

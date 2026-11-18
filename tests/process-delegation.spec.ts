@@ -44,6 +44,10 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
         return { status: stops.includes(request.sessionKey) ? 'cancelled' : 'complete', text: 'ack' }
       },
       async cancel({ sessionKey }) { stops.push(sessionKey); waits.get(sessionKey)?.() },
+      async delegationCatalog() {
+        return { targets: configs[id].delegationTargets ?? [],
+          readyInstanceIds: id === 'parent' && (await nodes.child.delegationReadiness()).ready ? ['child'] : [] }
+      },
       async delegate(request) {
         transport.push(structuredClone(request))
         if (options.holdQuery && request.operation === 'query' && !heldQuery) { heldQuery = true; await new Promise<void>(resolve => waits.set('transport', resolve)) }

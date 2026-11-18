@@ -16,7 +16,7 @@ export class CapabilityApplications {
       if (!record || typeof record.id !== 'string' || seen.has(record.id)
         || typeof record.instanceId !== 'string'
         || !['waiting', 'applying', 'failed', 'applied', 'cancelled'].includes(record.state)
-        || !['waiting', 'forcing', 'stopping', 'committed', 'releasing', 'cancelling', 'complete'].includes(record.stage)
+        || !['waiting', 'forcing', 'stopping', 'configuring', 'committed', 'releasing', 'cancelling', 'complete'].includes(record.stage)
         || !active(record) && record.stage !== 'complete'
         || active(record) && record.stage === 'complete'
         || record.state === 'waiting' && record.stage !== 'waiting'
@@ -39,7 +39,8 @@ export class CapabilityApplications {
     });
     this.busy = null; this.closed = false;
   }
-  initialHolds() { return this.records.filter(active).flatMap(item => item.affected.map(instanceId => ({ instanceId, operationId: item.id }))); }
+  initialHolds() { return this.records.filter(active).flatMap(item => item.affected.map(instanceId =>
+    ({ instanceId, operationId: item.id, frozen: item.stage === 'configuring' }))); }
   pending(id) { return this.records.find(item => active(item) && item.instanceId === id); }
   latest(id) { return this.pending(id) ?? this.records.findLast(item => item.instanceId === id); }
   affected(id) { return this.records.find(item => active(item) && item.affected.includes(id)); }
@@ -113,13 +114,15 @@ export class CapabilityApplications {
       let record = this.pending(instanceId);
       if (!record || input.applicationId !== record.id) throw failure(409, '待生效设置已变化，请重新读取');
       if (input.action === 'cancel') {
-        if (['forcing', 'committed', 'releasing'].includes(record.stage)) throw failure(409, '配置正在处理已确认的停止或恢复操作，请重试应用');
+        if (['forcing', 'configuring', 'committed', 'releasing'].includes(record.stage)) throw failure(409, '配置正在执行已确认的变更，请重试应用');
         record = this.update(record.id, { state: 'applying', stage: 'cancelling', error: undefined });
       } else if (input.action === 'retry') {
         if (record.state !== 'failed') throw failure(409, '该设置无需重试，请重新读取');
         record = this.update(record.id, { state: record.stage === 'waiting' ? 'waiting' : 'applying', error: undefined });
       } else if (input.action === 'apply-now') {
         if (record.stage !== 'waiting' || record.state === 'applying') throw failure(409, '配置已在应用，请重新读取');
+        const covered = await this.coverDelegationLimits(record);
+        if (covered !== record) throw failure(409, '受影响的组织已更新，请重新查看并确认需要停止的工作');
         const activity = await this.control.manager.capabilityActivity(record.affected);
         const confirmation = this.confirmation(record, activity);
         if (!confirmation || input.confirmation !== confirmation) throw failure(409, '相关工作已变化，请重新查看并确认需要停止的工作');
@@ -139,6 +142,22 @@ export class CapabilityApplications {
       if (current?.phase !== 'running') await this.control.manager.start(id, { capabilityOperationId: record.id });
     }
   }
+  targetNodes(record) {
+    const nodes = clone(this.control.nodes), node = nodes.find(item => item.id === record.instanceId);
+    node.workerTools = clone(record.tools); node.workerSkills = clone(record.skills);
+    return nodes;
+  }
+  async coverDelegationLimits(record) {
+    const manager = this.control.manager, nodes = this.targetNodes(record);
+    const additional = manager.affectedInstances(this.control.runtimeConfig(nodes)).filter(id => !record.affected.includes(id));
+    if (!additional.length) return record;
+    // A pending intent written by an older host may omit a child's incoming grant.
+    this.assertUnrelated(additional);
+    const running = manager.status().instances.filter(item => additional.includes(item.instanceId) && item.phase === 'running');
+    record = this.update(record.id, { affected: [...record.affected, ...additional], desiredRunning: [...record.desiredRunning, ...running.map(item => item.instanceId)] });
+    await manager.holdCapabilities(additional, record.id);
+    return record;
+  }
   async advance(id) {
     let record = this.records.find(item => item.id === id);
     if (!record || !active(record) || record.state === 'failed' || this.closed) return;
@@ -151,30 +170,35 @@ export class CapabilityApplications {
         this.update(id, { state: 'cancelled', stage: 'complete', cancelledAt: now(), error: undefined });
         return;
       }
+      if (record.stage === 'forcing') {
+        const nodes = this.targetNodes(record);
+        await control.checkExecution(nodes.find(item => item.id === record.instanceId));
+        await manager.cancelCapabilityWork(record.affected, record.id, record.forceActivity);
+        const needsNewScope = manager.affectedInstances(control.runtimeConfig(nodes)).some(instanceId => !record.affected.includes(instanceId));
+        record = this.update(id, { state: 'applying', stage: needsNewScope ? 'stopping' : 'configuring', error: undefined });
+      }
+      // Older versions wrote this stage before stopping the instances. Resume an
+      // ordinary drain under the new policy without stopping any remaining owners.
+      if (record.stage === 'stopping') {
+        await manager.unfreezeCapabilityWork(record.affected, id);
+        record = this.update(id, { state: 'waiting', stage: 'waiting', forceActivity: undefined });
+      }
       if (record.stage === 'waiting') {
+        record = await this.coverDelegationLimits(record);
         await this.restoreRunning(record);
         const activity = await manager.capabilityActivity(record.affected);
         if (activity.busy) return;
-        record = this.update(id, { state: 'applying', stage: 'stopping', error: undefined });
+        await control.checkExecution(this.targetNodes(record).find(item => item.id === record.instanceId));
+        if (!await manager.freezeIdleCapabilities(record.affected, id)) return;
+        try { record = this.update(id, { state: 'applying', stage: 'configuring', error: undefined }); }
+        catch (error) { await manager.unfreezeCapabilityWork(record.affected, id); throw error; }
       }
-      if (record.stage === 'forcing') {
-        // The manager freezes and verifies this exact acknowledged set before any domain stop.
-        await manager.cancelCapabilityWork(record.affected, record.id, record.forceActivity);
-        record = this.update(id, { state: 'applying', stage: 'stopping', error: undefined });
-      }
-      if (record.stage === 'stopping') {
-        for (const instanceId of record.affected) {
-          await manager.stop(instanceId, { capabilityOperationId: record.id });
-          const status = manager.status().instances.find(item => item.instanceId === instanceId);
-          if (status?.phase !== 'stopped' || status.pid || status.cleanupPending) throw new Error('相关会话尚未清理完成');
-        }
-        const nodes = clone(control.nodes), node = nodes.find(item => item.id === record.instanceId);
-        node.workerTools = clone(record.tools); node.workerSkills = clone(record.skills);
-        // Recheck catalog and original execution directory immediately before applying.
-        await control.checkExecution(node);
-        await manager.reconfigureManaged(control.runtimeConfig(nodes), { persist: () => {
+      if (record.stage === 'configuring') {
+        const nodes = this.targetNodes(record);
+        await control.checkExecution(nodes.find(item => item.id === record.instanceId));
+        await manager.configureCapabilities(record.affected, id, control.runtimeConfig(nodes), () => {
           record = this.update(id, { state: 'applying', stage: 'committed', committedAt: now(), error: undefined }, nodes);
-        } });
+        });
       }
       if (record.stage === 'committed' || record.stage === 'releasing') {
         // The acknowledged work has stopped and the new config is committed.
@@ -190,7 +214,7 @@ export class CapabilityApplications {
       // Keep the durable stage: retry resumes exactly where the failure occurred.
       this.update(id, { state: 'failed', ...(current.stage === 'forcing' && error.status === 409 ? { stage: 'waiting', forceActivity: undefined } : {}),
         error: error.message || '配置应用失败，请重试' });
-      if (!['committed', 'releasing', 'forcing'].includes(current.stage)) {
+      if (!['configuring', 'committed', 'releasing', 'forcing'].includes(current.stage)) {
         try { await this.restoreRunning(current); } catch { /* Hold and failure remain visible; retry owns recovery. */ }
       }
     }
@@ -213,7 +237,7 @@ export class CapabilityApplications {
     const canApplyNow = active(record) && record.stage === 'waiting' && record.state !== 'applying';
     return { id: record.id, state: record.state, savedAt: record.savedAt,
       ...(record.appliedAt ? { appliedAt: record.appliedAt } : {}), ...(record.error ? { error: record.error } : {}), affected,
-      canCancel: active(record) && !['committed', 'releasing', 'forcing'].includes(record.stage),
+      canCancel: active(record) && !['configuring', 'committed', 'releasing', 'forcing'].includes(record.stage),
       canRetry: record.state === 'failed', canApplyNow,
       ...(canApplyNow ? { confirmation: this.confirmation(record, activity) } : {}) };
   }

@@ -78,7 +78,12 @@ export interface RuntimeOptions {
   scope?: EngineOptions['scope']
   executor?(local: DshExecutor): Executor
   prepareTicket?: EngineOptions['prepareTicket']
-  routing?: { targets(trigger: Trigger): readonly unknown[]; select(triggerId: string, target?: string): void }
+  routing?: {
+    targets(trigger: Trigger): readonly unknown[] | Promise<readonly unknown[]>
+    /** Refresh trusted availability before the synchronous target selection transaction. */
+    prepare?(triggerId: string, target?: string): Promise<void>
+    select(triggerId: string, target?: string): void
+  }
   reportArtifacts?: ExecutorToolsHost['reportArtifacts']
   /** Runs after Store/composition is established, before initialize resolves setup. */
   initialize?(runtime: Runtime): void
@@ -189,7 +194,8 @@ export class Runtime extends Service implements SourceHost {
           { trigger, message, imageKey, stateDir: machine.stateDir }, signal) : undefined,
         settings: () => store.settings(), paused: () => this.paused() || options.executionHeld?.() === true, threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: async candidate => ({ ...await candidateCard(links, candidate),
-          ...(options.routing ? { execution_targets: options.routing.targets(candidate.triggers[0]!) } : {}) }),
+          ...(options.routing ? { execution_targets: await options.routing.targets(candidate.triggers[0]!) } : {}) }),
+        prepareTarget: options.routing?.prepare,
         selectTarget: options.routing ? (id, target, run) => store.atomic(() => { options.routing!.select(id, target); return run() }) : undefined })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
       const { assessor } = this, executor = options.executor?.(this.executor) ?? this.executor
@@ -224,7 +230,7 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
-        selectTarget: options.routing?.select,
+        prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select,
         reportArtifacts: options.reportArtifacts,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),

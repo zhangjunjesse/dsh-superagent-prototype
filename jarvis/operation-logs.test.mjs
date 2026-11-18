@@ -101,11 +101,29 @@ test('logs are an independent DSH page and preserve conversation DOM, input and 
   assert.deepEqual([...ui.id('logs-list').querySelectorAll('[data-log-id]')].map(button => button.dataset.logId), ['3', '2']);
   assert.match(ui.id('logs-coverage').textContent, /同一流程仅展示已收录事件/);
   await ui.go(''); assert.deepEqual([...ui.id('thread').children], messages); assert.equal(ui.id('input').value, '尚未发送的内容');
-  await ui.go('#settings/organization/child/worker'); await until(() => ui.id('field-workerModelId'), 'child Worker');
+  ui.w.superagentSettings = { mountSuperagentSettings(target, options) {
+    target.dataset.instance = options.instanceId; target.dataset.section = options.location.group;
+    return { unmount() {}, isDirty: () => false, isBusy: () => false, update() {} };
+  } };
+  await ui.go('#settings/organization/child/worker');
+  await until(() => ui.id('superagent-engine-host')?.dataset.section === 'execution', 'child Worker execution settings');
+  assert.equal(ui.id('superagent-engine-host').dataset.instance, 'child');
   await ui.go('#logs'); assert.equal(ui.id('logs-organization').getAttribute('href'), '#settings/organization/child/worker');
   ui.id('logs-organization').click(); await until(() => ui.w.location.hash.endsWith('/child/worker') && !ui.id('composition-page').hidden, 'original organization');
   assert.equal(ui.id('composition-page').querySelector('[data-current-instance]').dataset.currentInstance, 'child');
   assert.equal(ui.requests.filter(request => request.method !== 'GET').length, 0);
+});
+
+test('a task link opens its own trace, updates on navigation and allows clearing the filter', async t => {
+  const ui = await open(t, { hash: '#logs?trace=work%3Aroot%3AJW-one' });
+  await until(() => ui.id('logs-list').querySelector('[data-log-id="3"]'));
+  assert.ok(ui.requests.filter(r => r.path === '/api/logs').every(r => r.query.get('trace') === 'work:root:JW-one'));
+  await ui.go('#logs?trace=work%3Aroot%3AJW-two');
+  await until(() => ui.id('logs-list').querySelector('[data-log-id="2"]'));
+  assert.equal(ui.id('logs-list').children.length, 1);
+  ui.id('logs-clear-trace').click();
+  await until(() => ui.id('logs-count').textContent.includes('匹配 3 条'));
+  assert.equal(ui.w.location.hash, '#logs');
 });
 
 test('standalone hides logs entry and a direct log route reports unavailable without querying a missing endpoint', async t => {

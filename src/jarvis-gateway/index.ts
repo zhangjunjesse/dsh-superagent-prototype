@@ -8,6 +8,8 @@ import { GatewayService } from './service.ts'
 import { GatewayPump } from './pump.ts'
 import { jarvisKind, SourceBackend } from './source.ts'
 export { GatewayService, GatewayLedger, GatewayPump }
+// Read-only host projections share the Core's actual stage and persisted identity rules.
+export { ticketStage, latestAssignment, key } from '../core/index.ts'
 export * from './contracts.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { jarvisGateway: GatewayService } }

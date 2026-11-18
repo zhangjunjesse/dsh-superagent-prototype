@@ -33,6 +33,8 @@ export interface MainToolsHost {
   quietly<T>(run: () => T): T
   /** A process owner may choose a configured direct child inside the same routing transaction. */
   selectTarget?(triggerId: string, target?: string): void
+  /** Refreshes child availability before the original atomic routing decision. */
+  prepareTarget?(triggerId: string, target?: string): Promise<void>
 }
 /** Schedules an Engine pass to execute the recorded routing decision and formats the tool response. */
 function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: string; ticketId?: string | undefined }) {
@@ -135,25 +137,30 @@ function routeTool(host: MainToolsHost): Tool {
     name: 'orchestrator_route',
     description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
-    execute: async ({ decisions }) => {
+    execute: async ({ decisions }, signal) => {
       const decided = new Map<string, string>()
-      const results = decisions.map(item => {
+      const results = []
+      for (const item of decisions) {
+        signal.throwIfAborted()
         const head = { trigger_id: item.trigger_id, kind: item.kind }
         const problem = invalid(item)
-        if (problem) return { ...head, refused: problem }
+        if (problem) { results.push({ ...head, refused: problem }); continue }
         try {
+          if (item.kind === 'accept' && host.prepareTarget) await host.prepareTarget(item.trigger_id, item.target_instance_id ?? undefined)
+          signal.throwIfAborted()
           const result = route(host, item, decided)
-          if ('refused' in result) return { ...head, ...result }
+          if ('refused' in result) { results.push({ ...head, ...result }); continue }
           for (const id of result.triggerIds ?? []) if (!decided.has(id)) decided.set(id, item.trigger_id)
           const ticket = result.ticketId ? host.store.tickets.get(result.ticketId) : undefined
-          return { ...head, ...(result.decision ? { decision: result.decision } : {}), reason: result.reason,
-            ...(ticket ? { ticket: ticketCard(ticket) } : {}) }
+          results.push({ ...head, ...(result.decision ? { decision: result.decision } : {}), reason: result.reason,
+            ...(ticket ? { ticket: ticketCard(ticket) } : {}) })
         } catch (error) {
-          if (error instanceof UserError) return { ...head, refused: error.message }
+          signal.throwIfAborted()
+          if (error instanceof UserError) { results.push({ ...head, refused: error.message }); continue }
           host.context.logger.warn('dsh-superagent could not route trigger %s: %s', item.trigger_id, String(error))
-          return { ...head, refused: `Not recorded: ${error instanceof Error ? error.message : String(error)}; retry this item` }
+          results.push({ ...head, refused: `Not recorded: ${error instanceof Error ? error.message : String(error)}; retry this item` })
         }
-      })
+      }
       host.requestPass()
       return { results }
     },

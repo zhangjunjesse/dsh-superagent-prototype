@@ -64,6 +64,8 @@ export interface AssessorHost {
   candidateCard(candidate: Candidate): Promise<Record<string, unknown>>
   /** Native attachment work stays with the real Agent in a shared DSH host. */
   image?(sessionId: string, trigger: Trigger, message: { id: string; text: string }, key: string, signal: AbortSignal): Promise<unknown>
+  /** Observes host availability before an accepted candidate fixes its target. */
+  prepareTarget?(triggerId: string, target?: string): Promise<void>
   selectTarget?(triggerId: string, target: string | undefined, run: () => ReturnType<AssessorHost['engine']['decide']>): ReturnType<AssessorHost['engine']['decide']>
 }
 
@@ -281,6 +283,8 @@ export class MasterAssessor implements Assessor {
     let outcome: AssessmentOutcome = assessmentOutcome(result, this.host.settings(), candidate.strength)
     if (outcome.kind === 'accept' && outcome.acknowledgement) outcome = { ...outcome, acknowledgement: checkedImText(outcome.acknowledgement) }
     if (result.target_instance_id && (outcome.kind !== 'accept' || !this.host.selectTarget)) throw new Error('An execution target is available only for an accepted candidate in an organization with direct children')
+    if (outcome.kind === 'accept' && this.host.prepareTarget) await this.host.prepareTarget(triggerId, result.target_instance_id)
+    signal?.throwIfAborted()
     const run = () => this.host.engine.decide(triggerId, { ...outcome, evalId: candidate.evalId })
     const decision = outcome.kind === 'accept' && this.host.selectTarget ? this.host.selectTarget(triggerId, result.target_instance_id, run) : run()
     return { state: decision.kind, ...(decision.ticketId ? { ticket_id: decision.ticketId } : {}), reason: reasonText(decision.reason) }

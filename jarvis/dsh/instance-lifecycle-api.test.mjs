@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JarvisRuntime } from './runtime.mjs';
 import { createJarvisHandler } from './index.mjs';
@@ -11,8 +12,7 @@ import { ProcessManager } from '../process-runtime/manager.mjs';
 // Real HTTP, daily Store and process lifecycle; model/controller responses are controlled.
 // Actual installed DSH request/tool boundaries have separate native fixture coverage.
 async function fixture(t) {
-  const base = resolve('.artifacts/instance-lifecycle/api'); mkdirSync(base, { recursive: true });
-  const directory = mkdtempSync(join(base, 'run-'));
+  const directory = mkdtempSync(join(tmpdir(), 'jarvis-lifecycle-api-'));
   const agents = new Map(), events = new Map(), started = Promise.withResolvers();
   let calls = 0, held, agent, manager;
   const on = (name, fn) => { const set = events.get(name) ?? new Set(); events.set(name, set); set.add(fn); return () => set.delete(fn); };
@@ -51,7 +51,8 @@ async function fixture(t) {
     workspace: join(directory, 'system/root/work'), model: { provider: 'fixture', model: 'fixture' }, workerTools: ['read'] }] };
   const createManager = () => new ProcessManager(ctx, config, {
     entry: fileURLToPath(new URL('../process-runtime/manager-fixture-child.mjs', import.meta.url)), nativeFactory: () => null,
-    bridgeFactory: () => ({ close: async () => {}, run: async () => ({ status: 'complete', text: '' }) }),
+    bridgeFactory: () => ({ close: async () => {}, run: async () => ({ status: 'complete', text: '' }),
+      capabilityActivity: async () => ({ busy: false, work: [] }) }),
     lifecycleParticipants: { root: runtime },
   });
   manager = createManager();
@@ -62,6 +63,9 @@ async function fixture(t) {
   t.after(async () => {
     held?.resolve(); await manager.close(); await runtime.close();
     await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+    const target = resolve(directory);
+    if (dirname(target) !== resolve(tmpdir()) || !basename(target).startsWith('jarvis-lifecycle-api-')) throw new Error('Refusing cleanup outside the isolated daily HTTP fixture');
+    rmSync(target, { recursive: true, force: true });
   });
   const request = (path, method = 'GET', body) => fetch(`${origin}/jarvis/api${path}`, { method,
     headers: { 'content-type': 'application/json', 'x-jarvis-csrf': 'lifecycle-test', origin },
@@ -107,4 +111,31 @@ test('daily HTTP admission follows the real instance lifecycle and preserves the
   assert.notEqual(reconnected.instance.runtimeId, previousOwner);
   assert.deepEqual(reconnected.turns, stopped.turns);
   assert.equal(f.calls, 2, 'host reconnection keeps a manually stopped instance closed');
+});
+
+test('daily HTTP stays available while Worker settings wait, freezes only during switching, and still refuses stopped input', { timeout: 15000 }, async t => {
+  const f = await fixture(t), state = () => f.request('/state').then(response => response.json());
+  await f.manager.start('root');
+  const original = await state();
+  await f.manager.holdCapabilities(['root'], 'http-worker-settings');
+  const waiting = await state();
+  assert.equal(waiting.instance.canChat, true);
+  assert.equal(waiting.instance.capabilityHold.frozen, false);
+  const response = await f.request('/chat', 'POST', { id: 'http-while-waiting', text: 'a normal conversation' });
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse((await response.text()).trim().split('\n').at(-1)).turn.status, 'complete');
+  await f.manager.freezeCapabilityWork(['root'], 'http-worker-settings');
+  assert.equal((await state()).instance.canChat, false);
+  assert.equal((await f.request('/chat', 'POST', { id: 'http-while-frozen', text: 'must wait' })).status, 409);
+  assert.equal(f.calls, 1);
+  await f.manager.unfreezeCapabilityWork(['root'], 'http-worker-settings');
+  assert.equal((await state()).instance.canChat, true);
+  const resumed = await f.request('/chat', 'POST', { id: 'http-after-unfreeze', text: 'another normal conversation' });
+  assert.equal(resumed.status, 200); await resumed.text();
+  assert.equal(f.calls, 2);
+  assert.equal((await state()).binding.dshSessionId, original.binding.dshSessionId);
+  await f.manager.releaseCapabilities(['root'], 'http-worker-settings');
+  await f.manager.stop('root');
+  assert.equal((await f.request('/chat', 'POST', { id: 'http-truly-stopped', text: 'must not run' })).status, 503);
+  assert.equal(f.calls, 2);
 });

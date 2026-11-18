@@ -12,6 +12,7 @@ import { handleArtifactRequest } from '../process-runtime/artifact-http.mjs';
 import { OperationLogs } from '../operation-logs/index.mjs';
 import { readOriginalAdoption } from '../process-runtime/original-adoption.mjs';
 import { registerOriginalManagement } from './original-management.mjs';
+import { TaskVisibility } from './task-visibility.mjs';
 
 export const name = 'dsh-superagent-jarvis';
 export const inject = ['agents', 'agentPresets', 'sessionController', 'sessionPersistence', 'tools', 'systemPrompt', 'llm', 'webServer', 'connection',
@@ -81,12 +82,13 @@ export async function apply(ctx, config) {
       try { await runtime.close(); } finally { await logs?.close(); }
     }
   });
-  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/jarvis', handler: createJarvisHandler(ctx, runtime, { csrf, system, systemError, logs }) }));
+  const tasks = new TaskVisibility({ runtime, system });
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/jarvis', handler: createJarvisHandler(ctx, runtime, { csrf, system, systemError, logs, tasks }) }));
   ctx.logger.info('Jarvis available at /jarvis/');
 }
 
 /** Log evidence and instance controls share the existing login and same-origin boundary. */
-export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, logs }) {
+export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, logs, tasks }) {
   return async (req, res) => {
     try {
       const host = req.headers.host;
@@ -96,7 +98,8 @@ export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, l
       const systemPath = path === '/api/system' || path.startsWith('/api/system/');
       const logsPath = path === '/api/logs' || path.startsWith('/api/logs/');
       const promptsPath = path === '/api/prompts' || path.startsWith('/api/prompts/');
-      if (systemPath || logsPath || promptsPath) {
+      const tasksPath = path === '/api/tasks' || path.startsWith('/api/tasks/');
+      if (systemPath || logsPath || promptsPath || tasksPath) {
         if (typeof ctx.connection?.requestRejection !== 'function') throw new UserError(promptsPath ? '提示词管理认证暂不可用' : logsPath ? '日志访问认证暂不可用' : '当前宿主未提供实例管理认证', 503);
         const rejection = ctx.connection.requestRejection(req);
         if (rejection !== undefined) throw new UserError(rejection === 401
@@ -104,6 +107,15 @@ export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, l
           : (promptsPath ? '不允许访问提示词管理' : logsPath ? '不允许访问运行日志' : '不允许访问实例管理'), rejection);
       }
       if (!['GET', 'HEAD'].includes(req.method) && req.headers['x-jarvis-csrf'] !== csrf) throw new UserError('页面会话已失效，请刷新页面', 403);
+      if (tasksPath) {
+        if (!tasks) throw new UserError('任务状态暂不可读取，请稍后重试', 503);
+        if (req.method !== 'GET') throw new UserError('任务状态只支持读取', 405);
+        const parameters = new URL(req.url, `http://${host}`).searchParams;
+        if (path === '/api/tasks') return json(res, 200, tasks.list(parameters));
+        const match = /^\/api\/tasks\/(JW-[A-Za-z0-9-]{1,196})$/.exec(path);
+        if (match) return json(res, 200, tasks.detail(match[1], parameters));
+        throw new UserError('未找到此任务', 404);
+      }
       if (promptsPath) {
         if (path === '/api/prompts' && req.method === 'GET') return json(res, 200, await runtime.prompts());
         if (path === '/api/prompts' && req.method === 'PUT') return json(res, 200, await runtime.savePrompts(await body(req)));
@@ -143,7 +155,7 @@ export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, l
         throw new UserError('未找到此实例操作', 404);
       }
       if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ready: true, app: 'jarvis', runtime: 'dsh', pid: process.pid });
-      if (req.method === 'GET' && path === '/api/state') return json(res, 200, { ...await runtime.state(), csrf });
+      if (req.method === 'GET' && path === '/api/state') return json(res, 200, { ...await runtime.state(), csrf, ...(tasks ? { tasksAvailable: true } : {}) });
       if (req.method === 'GET' && path === '/api/notifications') {
         const parameters = new URL(req.url, `http://${host}`).searchParams;
         return json(res, 200, runtime.notifications(Number(parameters.get('cursor') || 0), Number(parameters.get('limit') || 20)));

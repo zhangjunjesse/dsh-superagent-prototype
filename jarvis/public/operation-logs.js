@@ -14,6 +14,7 @@
   let items = [], nextCursor = null, total = 0, loaded = false, historyLoaded = false, loading = false, listError = '';
   let listRequest = 0, selectedId = null, selectedDetail = null, detailRequest = 0, detailLoading = false, detailError = '';
   let renderedList = '', renderedCoverage = '';
+  let linkedTrace = '';
   const visible = () => active && !page.hidden && !frame?.hidden && document.visibilityState !== 'hidden';
   const node = (tag, className, value) => {
     const element = document.createElement(tag);
@@ -245,10 +246,19 @@
     renderList(); loadList();
   }
   function showTrace(trace) {
+    if (routeTrace(location.hash) && routeTrace(location.hash) !== trace) {
+      history.replaceState(null, '', '#logs?trace=' + encodeURIComponent(trace));
+      linkedTrace = trace;
+    }
     filters.trace = trace;
     for (const key of ['q', 'organization', 'role', 'level']) filters[key] = '';
     for (const id of ['logs-query', 'logs-organization-filter', 'logs-role', 'logs-level']) byId(id).value = '';
     resetFilterPage();
+  }
+  function routeTrace(hash) {
+    if (!hash.startsWith('#logs?')) return '';
+    const params = new URLSearchParams(hash.slice(6)), value = params.get('trace');
+    return params.size === 1 && value && value.length <= 500 && !/[\u0000-\u001f]/.test(value) ? value : '';
   }
   function applyFilters() {
     filters.q = byId('logs-query').value.trim();
@@ -288,7 +298,11 @@
     const work = event.target.closest('[data-work-ref]')?.dataset.workRef;
     if (work && selectedDetail?.organizationId) showTrace(`work:${selectedDetail.organizationId}:${work}`);
   });
-  byId('logs-clear-trace').addEventListener('click', () => { filters.trace = ''; resetFilterPage(); });
+  byId('logs-clear-trace').addEventListener('click', () => {
+    if (routeTrace(location.hash)) history.replaceState(null, '', '#logs');
+    linkedTrace = '';
+    filters.trace = ''; resetFilterPage();
+  });
   byId('logs-export').addEventListener('click', () => {
     if (!selectedDetail) return;
     const url = URL.createObjectURL(new Blob([JSON.stringify(selectedDetail, null, 2) + '\n'], { type: 'application/json' }));
@@ -303,10 +317,17 @@
 
   // The settings router is the sole owner of accepted navigation and draft guards.
   window.operationLogsUI = {
-    isRoute: hash => hash === '#logs',
+    isRoute: hash => hash === '#logs' || Boolean(routeTrace(hash)),
     enter(returnRoute) {
       active = true;
       byId('logs-organization').href = typeof returnRoute === 'string' && returnRoute.startsWith('#settings') ? returnRoute : '#settings/organization';
+      const trace = routeTrace(location.hash);
+      const clearPreviousLink = !trace && linkedTrace && filters.trace === linkedTrace;
+      linkedTrace = trace;
+      if (clearPreviousLink || trace && trace !== filters.trace) {
+        detailRequest++; selectedId = null; selectedDetail = null; detailLoading = false; detailError = ''; renderDetail();
+        showTrace(trace); return;
+      }
       updateVisibility(); renderControls();
     },
     leave() { active = false; clearTimeout(timer); listRequest++; loading = false; },

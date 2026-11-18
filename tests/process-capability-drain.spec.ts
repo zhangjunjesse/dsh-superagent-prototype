@@ -71,7 +71,7 @@ describe('original Runtime capability admission and drain', () => {
       await submit(runtime, 'queued')
       await wait(async () => expect((await runtime.capabilitiesActivity()).queued.triggers).toBe(1))
       expect((await runtime.state()).tickets).toHaveLength(1)
-      await expect(runtime.chat({ id: 'held-chat', text: 'New turn' })).rejects.toThrow('admission is held')
+      expect(await runtime.chat({ id: 'held-chat', text: 'New turn' })).toMatchObject({ status: 'complete', assistant: 'Conversation' })
       release.resolve()
       await wait(async () => expect((await runtime.capabilitiesActivity()).busy).toBe(false))
       expect((await runtime.state()).tickets[0]?.ended?.outcome).toBe('completed')
@@ -237,8 +237,10 @@ describe('original Runtime capability admission and drain', () => {
       operation: 'submit' as const, commandId: `submit-${id}`, text: 'Read the authorized delegated file', tools: ['read'], path: ['parent'] } })
     try {
       await runtime.delegation(request('existing')); await preparing.promise
-      await runtime.capabilitiesHold({ operationId: 'delegation-change', held: true })
       await runtime.delegation(request('queued'))
+      await runtime.capabilitiesHold({ operationId: 'delegation-change', held: true })
+      await expect(runtime.delegation(request('new-during-hold'))).rejects.toThrow('not ready to admit new delegations')
+      expect(await runtime.delegation({ ...request('new-during-hold'), request: { ...request('new-during-hold').request, operation: 'query' } })).toMatchObject({ status: 'missing' })
       const frozen = await runtime.capabilitiesFreeze({ operationId: 'delegation-change' })
       release.resolve()
       await wait(async () => expect((await runtime.capabilitiesActivity()).tasks.filter(task => task.reasons.includes('active_request'))).toHaveLength(0))

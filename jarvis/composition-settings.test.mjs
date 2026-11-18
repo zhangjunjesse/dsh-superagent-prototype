@@ -279,16 +279,19 @@ test('new settings code continues to support an already-open index without compo
 
 const organizationRoute='#settings/organization';
 const engineFixture = prefix => ({prompts:Object.fromEntries(['router','worker','communication','scope','delivery'].map(key=>[key,prefix+' '+key+' guidance']))});
-async function openOrganization(t, hash='#settings/model', { systemUnavailable=false, engineAvailable=true, reorderedModel=false, workerTools=['read'], workerSkills=[] } = {}) {
+async function openOrganization(t, hash='#settings/model', { systemUnavailable=false, engineAvailable=true, reorderedModel=false, workerTools=['read'], workerSkills=[], runtimeInstances=[], draft } = {}) {
   const roleModel={provider:'provider',model:'execution-model',reasoningEffort:'max'};
   const instance=(id,parent=null)=>({id,parent,kind:parent?'instance':'root',name:parent?'研发':'集团中枢',brainName:'旧名称',description:'组织职责',capabilities:'开发',concurrency:3,workerTools:[...workerTools],workerSkills:[...workerSkills],workspace:'D:/fixture/'+id,redelegate:!parent,model:{...roleModel},roleModels:{router:{...roleModel},worker:{...roleModel}},engine:engineFixture(id)});
   const backend={state:{runtime:'dsh',csrf:'fixture',basic:{revision:1,value:{assistantName:'贾维斯'}},model:{revision:2,hasKey:false,value:{endpoint:'provider',model:'chat-model',temperature:'',maxTokens:'',reasoning:'max',timeout:'120',stream:true}},models:{groups:[{id:'provider',name:'已连接服务',models:[{id:'chat-model',name:'对话模型',reasoning:{efforts:[{id:'max',name:'Max'},{id:'low',name:'Low'}]}},{id:'execution-model',name:'执行模型'}]}]},turns:[],active:null},system:{available:true,configured:true,revision:3,rootId:'root',nodes:[instance('root'),instance('child','root')],defaults:{model:{...roleModel},workerTools:['read']},catalogs:{root:{complete:true,tools:[{name:'read',label:'读取文件',available:true,group:'文件'}],skills:[{name:'review-code',description:'代码审查'}]}},runtime:{hostPid:100,instances:[]}},tools:{revision:1,tools:[{name:'read',description:'读取指定文件',parameters:{},allowed:true}]},hook:null};
   const dom=new JSDOM(html,{url:'http://organization.invalid/jarvis/'+hash,runScripts:'dangerously',pretendToBeVisual:true});
+  backend.state.tasksAvailable=true;
+  backend.system.runtime.instances=structuredClone(runtimeInstances);
   backend.systemUnavailable=systemUnavailable;
   if(reorderedModel)backend.state.model.value=Object.fromEntries(Object.entries(backend.state.model.value).reverse());
   if (engineAvailable) backend.system.defaults.engine=engineFixture('default');
   else backend.system.nodes.forEach(node=>{delete node.engine;});
   const w=dom.window,d=w.document,requests=[],errors=[],engine={mounts:[],current:null,fail:false};
+  if(draft!==undefined)w.sessionStorage.setItem('superjarvis.composition.draft.v1',JSON.stringify(draft));
   backend.execution={};
   const systemView=()=>({...backend.system,nodes:backend.system.nodes.map(item=>({...item,execution:backend.execution[item.id]??null,
     ...backend.execution[item.id]?{}:{executionError:'Actual configuration is unavailable'}}))});
@@ -310,7 +313,8 @@ async function openOrganization(t, hash='#settings/model', { systemUnavailable=f
     const method=options.method||'GET',body=options.body?JSON.parse(options.body):undefined;
     requests.push({path,method,body});
     if(path==='/api/system'&&backend.systemUnavailable)return Response.json({error:'运行服务暂不可用'},{status:503});
-    if(backend.hook){const result=await backend.hook({path,method,body});if(result)return result;}
+    if(backend.hook){const result=await backend.hook({path,method,body,query:new URL(url,w.location.href).searchParams});if(result)return result;}
+    if(path==='/api/tasks')return Response.json({organizations:backend.system.nodes.map(n=>({instanceId:n.id,items:[],nextCursor:null,availability:'live'}))});
     const preview=/^\/api\/system\/([^/]+)\/prompts\/preview$/.exec(path);
     if(preview&&method==='POST'){
       assert.equal(body.revision,backend.system.revision);assert.ok(['router','worker'].includes(body.role));
@@ -339,6 +343,63 @@ async function openOrganization(t, hash='#settings/model', { systemUnavailable=f
   const submit=name=>id(name).dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));
   return {w,d,id,go,input,submit,backend,requests,engine};
 }
+
+test('organization chart distinguishes delegated tasks from local Workers, pages scoped records and recovers from a failed read',async t=>{
+  const ui=await openOrganization(t);
+  let fail=false;
+  const calls=[];
+  ui.backend.hook=({path,query})=>{
+    if(path!=='/api/tasks')return;
+    const ids=query.getAll('organizationId'),cursor=Number(query.get('cursor'));
+    calls.push({ids,cursor});
+    if(fail)return Response.json({error:'暂时不可用'},{status:503});
+    return Response.json({organizations:ids.map(id=>({instanceId:id,availability:'live',nextCursor:id==='root'&&!cursor?5:null,items:[{
+      workRef:cursor?'JW-old':'JW-example',title:'写一篇笔记',status:'blocked',statusLabel:'受阻',
+      execution:id==='root'?{kind:'delegated',instanceId:'child',name:'研发'}:{kind:'local',name:'研发',workerId:'worker-abc'},
+      progress:{summary:'等待交付文件'},updatedAt:'2026-11-18T03:11:00Z',logs:{traceId:'work:root:JW-example'}
+    }]}))});
+  };
+  await ui.go(organizationRoute);
+  const org=id=>ui.d.querySelector('[data-task-organization="'+id+'"]');
+  await until(()=>org('root')?.textContent.includes('JW-example'),'task projections');
+  assert.ok(calls.some(c=>c.ids.join(',')==='root,child'));
+  assert.match(org('root').querySelector('summary').textContent,/受阻.*研发/);
+  assert.doesNotMatch(org('root').textContent,/worker-abc/);
+  assert.match(org('child').textContent,/本级执行.*worker-abc/);
+  assert.equal(org('root').querySelector('a').hash,'#logs?trace=work%3Aroot%3AJW-example');
+  org('root').open=true; org('root').querySelector('[data-action="org-tasks-next"]').click();
+  await until(()=>org('root').textContent.includes('JW-old'));
+  assert.ok(calls.some(c=>c.ids.join(',')==='root'&&c.cursor===5));
+  fail=true;org('root').querySelector('[data-action="org-tasks-first"]').click();
+  await until(()=>org('root').textContent.includes('状态未同步'));
+  assert.doesNotMatch(org('root').textContent,/暂无任务记录/);
+  fail=false;ui.d.dispatchEvent(new ui.w.Event('visibilitychange'));
+  await until(()=>org('root').textContent.includes('JW-example'));
+  assert.equal(org('root').open,true);
+});
+
+test('an existing running host shows the archived ticket and only labels delegation for the matching assignment',async t=>{
+  const ui=await openOrganization(t), trace='work:root:JW-record';
+  ui.w.eval('jarvis.state.tasksAvailable = undefined');
+  const entry = {id:1,organizationId:'root',traceId:trace,event:'core/ticket/snapshot',refs:{ticketId:'ticket'}};
+  ui.backend.hook=({path,query})=>{
+    if(path==='/api/logs') {
+      assert.ok(query.has('organization'));
+      const items=query.get('organization')!=='root'?[]:query.get('role')==='worker'?[entry]:[
+        {id:2,event:'instance/process-delegation/out/snapshot',traceId:trace,organizationId:'root',refs:{ticketId:'ticket',assignmentId:'old'}},
+        {id:3,event:'instance/process-delegation/out/snapshot',traceId:trace,organizationId:'root',refs:{ticketId:'ticket',assignmentId:'current'}}];
+      return Response.json({items,nextCursor:null});
+    }
+    if(path==='/api/logs/1')return Response.json({...entry,detail:{record:{id:'ticket',title:'历史工单',assignments:[{id:'current',report:{state:'blocked',summary:'缺少写入权限'}}]}}});
+    if(path==='/api/logs/3')return Response.json({detail:{record:{request:{parentTicketId:'ticket',parentAssignmentId:'current',targetInstanceId:'child'}}}});
+  };
+  await ui.go(organizationRoute);
+  const root=()=>ui.d.querySelector('[data-task-organization="root"]');
+  await until(()=>root()?.textContent.includes('缺少写入权限'));
+  assert.match(root().querySelector('summary').textContent,/上次记录.*执行受阻.*研发/);
+  assert.equal(root().querySelector('a').hash,'#logs?trace=work%3Aroot%3AJW-record');
+  assert.ok(!ui.requests.some(r=>r.path==='/api/logs/2'||r.path==='/api/tasks'));
+});
 
 test('unchanged Jarvis model navigation ignores JSON property order and still protects real edits',async t=>{
   const ui=await openOrganization(t,organizationRoute+'/root/jarvis/model',{reorderedModel:true});
@@ -519,6 +580,93 @@ test('new organizations save real identity before opening complete settings and 
   assert.deepEqual(ui.backend.system.nodes.filter(item=>item.id!==added.id),before);
   await ui.go(organizationRoute+'/'+added.id+'/engine/prompts');await until(()=>ui.engine.current,'new organization complete settings');
   assert.equal(ui.engine.current.options.instanceId,added.id);assert.equal(ui.engine.current.location.group,'prompts');
+});
+
+test('running organization adds a stopped child through the existing CAS save and starts only that child on explicit request',async t=>{
+  const runtimeInstances=[{instanceId:'root',pid:101,phase:'running',generation:6},{instanceId:'child',pid:102,phase:'running',generation:2}];
+  const ui=await openOrganization(t,organizationRoute,{runtimeInstances,draft:legacyDraft});
+  await until(()=>ui.id('composition-page').querySelector('[data-action="add-instance"]'),'add while running');
+  const page=ui.id('composition-page'),before=structuredClone(ui.backend.system.nodes),running=structuredClone(ui.backend.system.runtime);
+  const active={id:'current-conversation',status:'streaming',text:'正在处理的对话'};
+  ui.backend.state.active=active;ui.backend.state.turns=[{...active,assistant:'保留已经产生的回复'}];
+  const conversations=structuredClone(ui.backend.state),message=ui.d.createElement('article');
+  message.textContent='保留已经产生的回复';ui.id('thread').append(message);ui.id('input').value='尚未发送的消息';
+  let addedId;
+  ui.backend.hook=({path,method,body})=>{
+    if(path==='/api/system'&&method==='PUT'){
+      assert.equal(body.revision,3);assert.deepEqual(body.nodes.slice(0,before.length),before);
+      addedId=body.nodes.at(-1).id;ui.backend.system={...ui.backend.system,revision:4,nodes:body.nodes};
+      ui.backend.system.runtime.instances.push({instanceId:addedId,pid:null,phase:'stopped',generation:0});
+      return Response.json(ui.backend.system);
+    }
+    if(path==='/api/system/'+addedId&&method==='GET')return Response.json({available:true,instanceId:addedId,stateAvailable:false,
+      runtime:ui.backend.system.runtime.instances.find(item=>item.instanceId===addedId),counts:{},lifecycle:[]});
+    if(path==='/api/system/'+addedId+'/start'&&method==='POST'){
+      assert.deepEqual(body,{revision:4});
+      Object.assign(ui.backend.system.runtime.instances.find(item=>item.instanceId===addedId),{pid:103,phase:'running',generation:1});
+      return Response.json(ui.backend.system);
+    }
+  };
+  page.querySelector('[data-action="add-instance"]').click();ui.input('field-name','运行中新增的下级');
+  assert.match(ui.id('unit-form').querySelector('.save-scope small').textContent,/集团运行时.*当前对话和任务继续运行/);
+  assert.match(ui.id('unit-form').querySelector('.save-scope small').textContent,/尚未启动.*运行状态.*启动后.*接单/);
+  assert.doesNotMatch(ui.id('unit-form').querySelector('.save-scope small').textContent,/修改前先停止|重新启动当前组织/);
+  page.querySelector('[data-action="editor-tab"][data-id="brain"]').click();ui.input('field-brainName','新增大脑');
+  page.querySelector('[data-action="editor-tab"][data-id="basic"]').click();
+  assert.equal(ui.id('field-name').value,'运行中新增的下级','switching sections retains the new child draft');
+  ui.submit('unit-form');await until(()=>ui.backend.system.revision===4&&!ui.id('unit-form'),'new child saved while running');
+  assert.equal(ui.w.location.hash,organizationRoute,'save keeps the existing return route');
+  assert.match(ui.id('composition-toast').textContent,/下级 SuperJarvis 已添加.*尚未启动.*运行状态.*启动后.*接单/);
+  assert.deepEqual(ui.backend.system.nodes.filter(item=>item.id!==addedId),before);
+  assert.deepEqual(ui.backend.system.runtime.instances.filter(item=>item.instanceId!==addedId),running.instances);
+  assert.equal(ui.backend.system.runtime.instances.find(item=>item.instanceId===addedId).phase,'stopped');
+  assert.deepEqual(ui.backend.state,conversations);assert.equal(ui.id('thread').firstElementChild,message);assert.equal(ui.id('input').value,'尚未发送的消息');
+  assert.equal(ui.w.sessionStorage.getItem('superjarvis.composition.draft.v1'),JSON.stringify(legacyDraft));
+  assert.deepEqual(ui.requests.filter(request=>request.method!=='GET').map(({method,path})=>({method,path})),[{method:'PUT',path:'/api/system'}]);
+  page.querySelector('[data-action="enter-instance"][data-id="'+addedId+'"]').click();page.querySelector('[data-view="runtime"]').click();
+  const start=page.querySelector('[data-action="runtime-start"][data-id="'+addedId+'"]');
+  assert.ok(start);assert.equal(start.disabled,false);assert.match(page.querySelector('[data-runtime-phase]').textContent,/已停止/);
+  start.click();await until(()=>page.querySelector('[data-runtime-phase]').textContent==='运行中','explicit child start');
+  assert.deepEqual(ui.requests.filter(request=>request.method==='POST').map(request=>request.path),['/api/system/'+addedId+'/start']);
+  assert.deepEqual(ui.backend.system.runtime.instances.filter(item=>item.instanceId!==addedId),running.instances);
+  assert.deepEqual(ui.backend.state,conversations);assert.equal(ui.id('input').value,'尚未发送的消息');
+});
+
+test('new child conflict retains its draft until review and preserves current settings and running instances when rebased',async t=>{
+  const runtimeInstances=[{instanceId:'root',pid:101,phase:'running',generation:6},{instanceId:'child',pid:102,phase:'running',generation:2}];
+  const ui=await openOrganization(t,organizationRoute,{runtimeInstances,draft:legacyDraft});
+  await until(()=>ui.id('composition-page').querySelector('[data-action="add-instance"]'),'add');
+  const page=ui.id('composition-page');page.querySelector('[data-action="add-instance"]').click();ui.input('field-name','保留的新下级草稿');
+  ui.backend.system.revision=4;ui.backend.system.nodes[1].name='另一窗口保存的组织名称';ui.backend.system.nodes[1].workerTools=['glob'];
+  ui.backend.system.nodes[1].engine.prompts.router='另一窗口保存的原提示词';
+  const latest=structuredClone(ui.backend.system),draftId=ui.id('field-instance-display').value;
+  ui.backend.hook=({path,method,body})=>path==='/api/system'&&method==='PUT'&&body.revision!==ui.backend.system.revision
+    ?Response.json({error:'系统配置版本已更新'},{status:409}):null;
+  ui.submit('unit-form');await until(()=>ui.id('system-conflict-review')&&!ui.id('system-conflict-review').hidden,'explicit new-child conflict review');
+  assert.equal(ui.id('field-name').value,'保留的新下级草稿');assert.equal(ui.id('field-instance-display').value,draftId);
+  assert.match(ui.id('system-conflict-review').textContent,/保留的新下级草稿/);assert.equal(ui.w.compositionUI.isDirty(),true);
+  assert.deepEqual(ui.backend.system,latest,'the rejected save does not replace current configuration or runtime');
+  page.querySelector('[data-action="accept-latest"]').click();
+  assert.equal(ui.id('field-name').value,'保留的新下级草稿');assert.equal(ui.id('field-instance-display').value,draftId);
+  ui.submit('unit-form');await until(()=>ui.backend.system.revision===5&&!ui.id('unit-form'),'reviewed new child saved');
+  assert.deepEqual(ui.backend.system.nodes.filter(item=>item.id!==draftId),latest.nodes);
+  assert.equal(ui.backend.system.nodes.find(item=>item.id===draftId).name,'保留的新下级草稿');
+  assert.deepEqual(ui.backend.system.runtime,latest.runtime);assert.equal(ui.requests.some(request=>request.method==='POST'),false);
+  assert.deepEqual(ui.requests.filter(request=>request.method==='PUT').map(request=>request.body.revision),[3,4]);
+  assert.equal(ui.w.sessionStorage.getItem('superjarvis.composition.draft.v1'),JSON.stringify(legacyDraft));
+});
+
+test('running existing organization edits retain the stop requirement and preserve refused drafts without stopping the group',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/child/organization',{runtimeInstances:[{instanceId:'root',pid:101,phase:'running',generation:6},{instanceId:'child',pid:102,phase:'running',generation:2}]});
+  await until(()=>ui.id('field-name'),'existing organization');
+  assert.match(ui.id('unit-form').querySelector('.save-scope small').textContent,/修改前先停止实例.*重新启动当前组织/);
+  const before=structuredClone(ui.backend.system);ui.input('field-name','现有组织的未保存更改');
+  ui.backend.hook=({path,method})=>path==='/api/system'&&method==='PUT'
+    ?Response.json({error:'请先停止受影响的实例，再保存配置。'},{status:409}):null;
+  ui.submit('unit-form');await until(()=>ui.id('form-error').textContent.includes('请先停止受影响的实例')&&!ui.id('unit-form').inert,'running edit refused');
+  assert.equal(ui.id('field-name').value,'现有组织的未保存更改');assert.equal(ui.w.compositionUI.isDirty(),true);
+  assert.equal(ui.id('system-conflict-review').hidden,true,'an unchanged revision remains a lifecycle refusal');
+  assert.deepEqual(ui.backend.system,before);assert.equal(ui.requests.some(request=>request.method==='POST'),false);
 });
 
 test('metadata conflict review never writes stale Worker capabilities or obsolete prompt mirrors over newer saves',async t=>{

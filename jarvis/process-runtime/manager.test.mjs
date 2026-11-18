@@ -180,6 +180,33 @@ test('configuration barrier drains accepted requests, closes cached Store owners
   } finally { await manager.close(); }
 });
 
+test('online child additions roll back on commit failure and cannot alter existing grants or running configuration', { timeout: 10000 }, async () => {
+  const options = config(), [alpha, beta] = options.instances;
+  alpha.children = ['beta']; beta.parents = ['alpha'];
+  const manager = new ProcessManager({}, options, { entry, nativeFactory: () => null, bridgeFactory: idleBridge });
+  const child = { ...beta, instanceId: 'aardvark', stateDir: join(options.rootDir, 'new-state'), workspace: join(options.rootDir, 'new-work') };
+  const next = [{ ...alpha, children: ['aardvark', 'beta'] }, beta, child];
+  try {
+    await manager.start('alpha');
+    const before = manager.status(), recorded = () => JSON.parse(readFileSync(join(options.rootDir, 'processes.json'), 'utf8')).instances;
+    const catalog = () => manager.delegationCatalog(manager.instance('alpha'), before.instances[0].generation);
+    await assert.rejects(manager.reconfigureManaged(next, { persist() { throw new Error('disk full'); } }), /disk full/);
+    assert.deepEqual(manager.status(), before); assert.deepEqual(recorded(), before.instances);
+    assert.deepEqual((await catalog()).targets.map(target => target.instanceId), ['beta']);
+    for (const mixed of [
+      [{ ...next[0], brainName: 'changed' }, beta, child],
+      [next[0], { ...beta, workerTools: [] }, child],
+      [{ ...alpha, children: ['aardvark'] }, beta, child],
+    ]) await assert.rejects(manager.reconfigureManaged(mixed), /must be stopped/);
+    assert.deepEqual(manager.status(), before);
+    const management = await manager.management('beta', { method: 'GET', path: 'prompts' });
+    await manager.reconfigureManaged(next);
+    assert.deepEqual((await catalog()).targets.map(target => target.instanceId), ['aardvark', 'beta']);
+    assert.equal(manager.status().instances[1].managementPid, management.managementPid);
+    assert.deepEqual(manager.status().instances[0], before.instances[0]);
+  } finally { await manager.close(); }
+});
+
 test('original account restart requests create a durable intent and replace only the active organization owner', { timeout: 10000 }, async () => {
   const options = config(), manager = new ProcessManager({}, options, { entry, nativeFactory: () => null, bridgeFactory: idleBridge });
   try {
@@ -208,16 +235,21 @@ test('capability impact compares the full derived delegation catalog without res
     assert.deepEqual(manager.affectedInstances(sharedTool), ['alpha', 'beta']);
     const unrelatedTool = structuredClone(options.instances); unrelatedTool[1].workerTools.push('glob');
     assert.deepEqual(manager.affectedInstances(unrelatedTool), ['beta']);
+    const revokedParentTool = structuredClone(options.instances); revokedParentTool[0].workerTools = ['write'];
+    assert.deepEqual(manager.affectedInstances(revokedParentTool), ['alpha', 'beta']);
   } finally { await manager.close(); }
 });
 
-test('operation holds reject new foreground and manual restart, survive coordinator restart, and preserve the other organization', { timeout: 10000 }, async () => {
+test('waiting permits foreground chat and fences manual restart; freezing gates new chat and unrelated organizations stay available', { timeout: 10000 }, async () => {
   const options = config(), manager = new ProcessManager({}, options, { entry, nativeFactory: () => null, bridgeFactory: idleBridge });
   try {
     await manager.start('alpha'); await manager.start('beta'); const before = manager.status().instances;
     const activity = await manager.holdCapabilities(['alpha'], 'capability-one'); assert.equal(activity.busy, false);
     assert.equal(manager.status().instances[0].phase, 'running');
-    await assert.rejects(manager.chat('alpha', { id: 'new', text: 'Do not admit' }), /Worker 配置正在应用/);
+    assert.equal((await manager.chat('alpha', { id: 'new', text: 'Available while waiting' })).text, 'Available while waiting');
+    assert.equal(await manager.freezeIdleCapabilities(['alpha'], 'capability-one'), true);
+    await assert.rejects(manager.chat('alpha', { id: 'frozen', text: 'Wait during commit' }), error => error.status === 409);
+    await manager.unfreezeCapabilityWork(['alpha'], 'capability-one');
     assert.throws(() => manager.restart('alpha'), /held/);
     assert.throws(() => manager.start('alpha'), /held/);
     assert.throws(() => manager.stop('alpha'), /held/);
@@ -246,6 +278,29 @@ test('initial durable holds are present before process initialization and do not
     await manager.start('alpha', { capabilityOperationId: 'recovered-capability' });
     assert.equal((await manager.state('alpha')).capabilityHold.operationId, 'recovered-capability');
     assert.equal((await manager.capabilityActivity(['alpha'])).busy, false);
+  } finally { await manager.close(); }
+});
+
+test('a failed freeze and lost thaw acknowledgement cannot strand a different organization or block new foreground turns', { timeout: 8000 }, async () => {
+  const manager = new ProcessManager({}, config(), { entry, nativeFactory: () => null, bridgeFactory: idleBridge });
+  try {
+    await manager.start('alpha'); await manager.start('beta');
+    const ids = ['alpha', 'beta'], operation = 'partial-freeze';
+    await manager.holdCapabilities(ids, operation);
+    const peer = manager.instance('alpha').peer, call = peer.call.bind(peer);
+    let rejected = false;
+    peer.call = async (method, input, ...rest) => {
+      if (method === 'capabilities.freeze') { rejected = true; throw new Error('Lost freeze acknowledgement'); }
+      if (rejected && method === 'capabilities.hold' && input.frozen === false) throw new Error('Lost thaw acknowledgement');
+      return call(method, input, ...rest);
+    };
+    await assert.rejects(manager.freezeIdleCapabilities(ids, operation), /重试同步/);
+    assert.ok(ids.every(id => manager.capabilityHolds.get(id).frozen === false));
+    assert.equal((await manager.state('beta')).capabilityHold.frozen, false);
+    assert.equal((await manager.chat('beta', { text: 'still available' })).text, 'still available');
+    peer.call = call;
+    await manager.holdCapabilities(ids, operation);
+    assert.equal((await manager.state('alpha')).capabilityHold.frozen, false);
   } finally { await manager.close(); }
 });
 

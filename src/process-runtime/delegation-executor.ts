@@ -20,12 +20,18 @@ type Config = { instanceId: string; workerTools: string[]; delegationTargets?: C
 /** Keeps one parent Assignment bound to one child and reconciles its commands and evidence. */
 export class DelegationExecutor {
   constructor(private config: Config, private store: Store, private engine: Engine,
-    private send?: (request: DelegationRequest) => Promise<DelegationSnapshot>, private frozen: () => boolean = () => false) {}
+    private send?: (request: DelegationRequest) => Promise<DelegationSnapshot>, private frozen: () => boolean = () => false,
+    private ready: (instanceId: string) => boolean = () => false,
+    private toolsFor?: (ticket: Ticket) => readonly string[]) {}
+
+  /** Stored selection outlives catalog readiness; retries cannot move an existing task. */
+  selected(triggerId: string): string | undefined { return this.store.get(selections(triggerId)) }
 
   select(triggerId: string, target?: string): void {
-    const prior = this.store.get(selections(triggerId)), selection = target ?? 'local'
+    const prior = this.selected(triggerId), selection = target ?? 'local'
     if (prior && prior !== selection) throw new Error('Task execution target is already fixed')
     if (target && (!this.send || !this.config.delegationTargets?.some(item => item.instanceId === target))) throw new Error('Unknown or unavailable delegation target')
+    if (target && !prior && !this.ready(target)) throw new Error('The selected child is not ready for new tasks')
     const trigger = this.store.triggers.get(triggerId)
     if (target && trigger?.source === 'delegation') throw new Error('This stage permits only one delegation hop')
     this.store.set(selections(triggerId), selection)
@@ -40,7 +46,8 @@ export class DelegationExecutor {
     if (!capability) throw new Error('The fixed child target is no longer configured')
     const name = this.name(ticket.id, assignment.id)
     if (this.store.get(name)) return
-    const tools = capability.tools.filter(tool => this.config.workerTools.includes(tool))
+    const ceiling = this.toolsFor?.(ticket) ?? this.config.workerTools
+    const tools = capability.tools.filter(tool => this.config.workerTools.includes(tool) && ceiling.includes(tool))
     if (!tools.length) throw new Error('Parent and child have no common execution capability')
     const delegationId = key('delegation', this.config.instanceId, ticket.id, assignment.id)
     const source = this.store.triggers.get(ticket.origin.triggerId)

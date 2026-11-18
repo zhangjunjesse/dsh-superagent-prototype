@@ -10,6 +10,19 @@ export const CapabilitySchema = z.object({
 }).strict()
 export type Capability = z.infer<typeof CapabilitySchema>
 
+/** Trusted host catalog: readiness limits new routing without changing fixed task bindings. */
+export const DelegationCatalogSchema = z.object({
+  targets: z.array(CapabilitySchema), readyInstanceIds: z.array(id),
+}).strict().superRefine((catalog, context) => {
+  const targets = new Set(catalog.targets.map(target => target.instanceId))
+  if (targets.size !== catalog.targets.length) context.addIssue({ code: 'custom', message: 'Duplicate delegation target' })
+  if (new Set(catalog.readyInstanceIds).size !== catalog.readyInstanceIds.length)
+    context.addIssue({ code: 'custom', message: 'Duplicate ready delegation target' })
+  if (catalog.readyInstanceIds.some(target => !targets.has(target)))
+    context.addIssue({ code: 'custom', message: 'Ready delegation target is not configured' })
+})
+export type DelegationCatalog = z.infer<typeof DelegationCatalogSchema>
+
 /** The host binds sourceInstanceId; model tool arguments cannot set any identity or grant. */
 export const DelegationRequestSchema = z.object({
   targetInstanceId: id, delegationId: id, parentTicketId: id, parentAssignmentId: id, parentDecisionId: id,

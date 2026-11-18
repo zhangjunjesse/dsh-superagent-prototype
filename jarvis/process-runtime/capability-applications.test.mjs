@@ -13,18 +13,19 @@ const save = (control, revision, tools, id = 'root', skills = []) => control.man
 const action = (control, view, action, id = 'root') => control.management(id, { method: 'POST', path: 'worker-capabilities/application',
   body: { revision: view.revision, applicationId: view.application.id, action, ...(action === 'apply-now' ? { confirmation: view.application.confirmation } : {}) } }).then(value => value.body);
 async function fixture(t, extra = []) {
-  let cleanupBlocked = false;
+  let configurationBlocked = false;
   const options = { rootDir: mkdtempSync(join(base, 'case-')), defaultModel: model, validateModel: async () => true,
     capabilityCatalog: async () => ({ tools: ['read', 'glob', 'grep', 'write'].map(name => ({ name, label: name, group: 'files', available: true })),
       skills: [{ name: 'research', description: 'Research skill' }], complete: true }),
     managerOptions: { entry: fileURLToPath(new URL('./capability-application-fixture.mjs', import.meta.url)), nativeFactory: () => null,
       bridgeFactory: () => ({ run: async () => ({ text: 'OK' }), cancel: async () => {}, setCapabilityHold() {},
         capabilityActivity: async () => ({ work: [], fingerprint: 'idle' }), cancelCapabilityWork: async () => {},
-        close: async () => { if (cleanupBlocked) throw new Error('Controlled cleanup failure'); } }) } };
-  const control = new SystemControl({}, options); t.after(() => { cleanupBlocked = false; return control.close(); });
+        configureCapabilities: async () => { if (configurationBlocked) throw new Error('Controlled bridge configuration failure'); },
+        close: async () => {} }) } };
+  const control = new SystemControl({}, options); t.after(() => control.close());
   const initial = await control.get(); initial.nodes[0].workerTools = ['read', 'glob'];
   await control.save({ revision: initial.revision, nodes: [...initial.nodes, ...extra] });
-  return { control, options, blockCleanup(value) { cleanupBlocked = value; } };
+  return { control, options, blockConfiguration(value) { configurationBlocked = value; } };
 }
 const child = (id, tools = ['read']) => ({ id, parent: 'root', kind: 'instance', name: id, workerTools: tools });
 const peer = (control, id = 'root') => control.manager.instance(id).peer;
@@ -36,7 +37,7 @@ test('idle save applies and restores running organizations; stopped and unrelate
   const view = await save(control, control.revision, ['read', 'glob'], 'research');
   assert.equal(view.application.state, 'applied'); assert.deepEqual(view.tools, ['read', 'glob']); assert.deepEqual(view.applied.tools, view.tools);
   assert.deepEqual(view.application.affected.map(item => item.instanceId).sort(), ['research', 'root']);
-  assert.equal(control.manager.instance('root').generation, rootBefore + 1);
+  assert.equal(control.manager.instance('root').generation, rootBefore);
   assert.equal(control.manager.instance('research').phase, 'running'); assert.equal(control.manager.instance('other').phase, 'stopped');
   assert.deepEqual(control.manager.instance('root').config.delegationTargets.find(item => item.instanceId === 'research').tools, ['read', 'glob']);
   assert.equal(JSON.parse(readFileSync(control.file, 'utf8')).capabilityApplications.at(-1).state, 'applied');
@@ -100,13 +101,15 @@ test('stale force confirmation cannot stop a changed work set', async t => {
   assert.equal((await peer(control).call('test.inspect')).tasks[0].id, 'old');
 });
 
-test('cleanup failure preserves pending configuration and old permissions; retry finishes without falsely reporting applied', async t => {
-  const { control, blockCleanup } = await fixture(t); await control.action('root', 'start', control.revision);
-  blockCleanup(true);
+test('an incomplete live update keeps both owners frozen until retry commits their new permissions', async t => {
+  const { control, blockConfiguration } = await fixture(t); await control.action('root', 'start', control.revision);
+  blockConfiguration(true);
   const failed = await save(control, control.revision, ['read']);
   assert.equal(failed.application.state, 'failed'); assert.deepEqual(failed.applied.tools, ['read', 'glob']);
   assert.equal(failed.application.canRetry, true); assert.ok(failed.application.error);
-  blockCleanup(false);
+  assert.equal(failed.application.canCancel, false);
+  assert.equal(control.manager.capabilityHolds.get('root').frozen, true);
+  blockConfiguration(false);
   const done = await action(control, failed, 'retry');
   assert.equal(done.application.state, 'applied'); assert.deepEqual(done.applied.tools, ['read']);
 });
@@ -135,14 +138,13 @@ test('revision conflicts, overlapping edits and manual restart cannot bypass pen
   assert.equal(control.manager.instance('root').generation, 1);
 });
 
-test('committed configuration with failed restart stays recoverable and cannot be cancelled as if it were unapplied', async t => {
+test('committed configuration with a failed release stays recoverable after host restart and cannot be cancelled', async t => {
   const { control, options } = await fixture(t); await control.action('root', 'start', control.revision);
-  const start = control.manager.start.bind(control.manager); let blocked = true;
-  control.manager.start = (...args) => { if (blocked) throw new Error('Controlled new configuration startup failure'); return start(...args); };
+  control.manager.releaseCapabilities = async () => { throw new Error('Controlled release failure'); };
   const failed = await save(control, control.revision, ['read']);
   assert.equal(failed.application.state, 'failed'); assert.deepEqual(failed.applied.tools, ['read']); assert.equal(failed.application.canCancel, false);
   await assert.rejects(action(control, failed, 'cancel'), error => error.status === 409);
-  await control.close(); blocked = false;
+  await control.close();
   const reopened = new SystemControl({}, options); t.after(() => reopened.close()); await reopened.initialization;
   const persisted = await get(reopened); assert.equal(persisted.application.state, 'failed'); assert.deepEqual(persisted.applied.tools, ['read']);
   const done = await action(reopened, persisted, 'retry');

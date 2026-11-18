@@ -36,7 +36,8 @@ test('installed DSH applies Worker changes after pending prompt notices and reta
   }
   assert.equal(response.status, 200); assert.equal(response.body.application.state, 'applied', JSON.stringify(response.body.application));
   assert.deepEqual(response.body.applied.tools, ['read']);
-  const current = control.manager.status().instances[0]; assert.equal(current.phase, 'running'); assert.equal(current.generation, old.generation + 1);
+  const current = control.manager.status().instances[0]; assert.equal(current.phase, 'running'); assert.equal(current.generation, old.generation);
+  assert.equal(current.pid, old.pid);
   assert.equal(current.cleanupPending, undefined); assert.equal(current.capabilityHold, undefined);
   const retained = await control.management('root', { method: 'GET', path: 'prompts' });
   assert.equal(retained.body.current.config.communication, config.communication); assert.equal(retained.body.current.revision, saved.body.revision);

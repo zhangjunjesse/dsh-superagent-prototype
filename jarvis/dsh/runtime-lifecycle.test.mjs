@@ -171,13 +171,39 @@ test('a no-longer-resident child and replacement registry cannot hide its previo
   running = false; await f.runtime.suspendInstance(); f.start(); assert.equal(f.runtime.instanceState().canChat, true);
 });
 
-test('a pending capability hold blocks new admission and a frozen hold cancels only the confirmed native input set', async t => {
+test('pending Worker settings keep daily replies, queries and notification recovery available for the current instance', async t => {
+  const f = fixture(t); await f.runtime.ready(); f.bind(); f.start();
+  f.setService({ submit() {}, query: () => ({ status: 'available' }),
+    ledger: { reserve: () => undefined, pendingCount: () => 0, deliveries: () => [] } });
+  const binding = f.runtime.store.sessionBinding(), lease = f.runtime.captureLease();
+  f.runtime.setCapabilityHold({ operationId: 'waiting-worker-settings', frozen: false });
+  assert.equal(f.runtime.instanceState().canChat, true);
+  assert.equal(f.runtime.captureLease(), lease);
+  assert.deepEqual(await f.runtime.gateway.query({ operation: 'search' }), { status: 'available' });
+  assert.equal((await f.runtime.retryNotifications()).retried, false);
+  f.runtime.store.addTurn({ id: 'retry-while-worker-waits', user: 'finish the previous reply', assistant: 'retained partial', status: 'failed', attempt: 1 });
+  await f.runtime.chat({ id: 'retry-while-worker-waits', retry: true }, () => {}, signal());
+  assert.equal(f.runtime.store.turn('retry-while-worker-waits').status, 'complete');
+  await f.runtime.chat({ id: 'during-worker-wait', text: 'first normal reply' }, () => {}, signal());
+  await f.runtime.chat({ id: 'another-worker-wait', text: 'another normal reply' }, () => {}, signal());
+  assert.equal(f.prompts(), 3);
+  assert.equal(f.runtime.store.turn('during-worker-wait').status, 'complete');
+  assert.equal(f.runtime.store.turn('another-worker-wait').status, 'complete');
+  assert.deepEqual(f.runtime.store.sessionBinding(), binding);
+  assert.equal(f.runtime.capabilityHold.operationId, 'waiting-worker-settings');
+  assert.equal((await f.runtime.capabilityActivity()).busy, false);
+});
+
+test('a frozen capability hold closes new admission and cancels only the confirmed native input set', async t => {
   const f = fixture(t); await f.runtime.ready(); f.bind(); f.start();
   f.runtime.setCapabilityHold({ operationId: 'apply-one' });
-  await assert.rejects(f.runtime.chat({ id: 'held-admission', text: 'blocked' }, () => {}, signal()), { status: 409 });
+  assert.equal(f.runtime.instanceState().canChat, true);
   f.runtime.agent.inbox.nextTurn.push({ id: 'confirmed', role: 'user', content: [{ type: 'text', text: 'first' }], source: { kind: 'user' } });
   const confirmed = await f.runtime.capabilityActivity(); assert.equal(confirmed.busy, true);
   f.runtime.setCapabilityHold({ operationId: 'apply-one', frozen: true });
+  await assert.rejects(f.runtime.chat({ id: 'held-admission', text: 'blocked' }, () => {}, signal()), { status: 409 });
+  await assert.rejects(f.runtime.retryNotifications(), { status: 409 });
+  assert.equal(f.prompts(), 0);
   f.runtime.agent.inbox.nextStep.push({ id: 'late-input', role: 'user', content: [{ type: 'text', text: 'keep me' }], source: { kind: 'user' } });
   await assert.rejects(f.runtime.cancelCapabilityWork('apply-one', confirmed), { status: 409 });
   assert.equal(f.runtime.agent.inbox.nextTurn.length, 1); assert.equal(f.runtime.agent.inbox.nextStep.length, 1);
@@ -186,6 +212,60 @@ test('a pending capability hold blocks new admission and a frozen hold cancels o
   assert.equal((await f.runtime.capabilityActivity()).busy, false); assert.equal(f.runtime.instanceState().canChat, false);
   assert.equal(f.runtime.capabilityHold.operationId, 'apply-one');
   f.runtime.setCapabilityHold(undefined); assert.equal(f.runtime.instanceState().canChat, true);
+});
+
+test('freezing Worker settings during model validation cannot admit an uncommitted daily reply', async t => {
+  const f = fixture(t); await f.runtime.ready(); f.bind(); f.start();
+  f.runtime.setCapabilityHold({ operationId: 'freeze-validation', frozen: false });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  f.setModel(async () => { entered.resolve(); await release.promise; });
+  const pending = f.runtime.chat({ id: 'freeze-before-prompt', text: 'uncommitted input' }, () => {}, signal());
+  const rejected = assert.rejects(pending, { status: 409 });
+  await entered.promise;
+  f.runtime.setCapabilityHold({ operationId: 'freeze-validation', frozen: true });
+  assert.equal(f.runtime.instanceState().canChat, false);
+  release.resolve(); await rejected;
+  assert.equal(f.prompts(), 0); assert.equal(f.runtime.store.turn('freeze-before-prompt'), null);
+  f.runtime.setCapabilityHold({ operationId: 'freeze-validation', frozen: false });
+  f.setModel(async () => ({}));
+  await f.runtime.chat({ id: 'after-freeze-window', text: 'accepted after safe unfreeze' }, () => {}, signal());
+  assert.equal(f.runtime.store.turn('after-freeze-window').status, 'complete');
+});
+
+test('checking the Worker switching window holds new replies while an already admitted daily reply completes', async t => {
+  const f = fixture(t); await f.runtime.ready(); f.bind(); f.start();
+  f.runtime.setCapabilityHold({ operationId: 'check-switch-window', frozen: false });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  f.setModel(async () => { entered.resolve(); await release.promise; });
+  const pending = f.runtime.chat({ id: 'admitted-before-check', text: 'finish this reply' }, () => {}, signal());
+  await entered.promise;
+  f.setState({ capabilityTransitioning: true });
+  assert.equal(f.runtime.instanceState().canChat, false);
+  assert.equal(f.runtime.instanceState().capabilityTransitioning, true);
+  await assert.rejects(f.runtime.chat({ id: 'new-during-switch-check', text: 'wait' }, () => {}, signal()), { status: 409 });
+  assert.ok((await f.runtime.capabilityActivity()).work.some(work => work.kind === 'daily-chat'));
+  release.resolve(); await pending;
+  assert.equal(f.runtime.store.turn('admitted-before-check').status, 'complete');
+  assert.equal(f.runtime.store.turn('new-during-switch-check'), null);
+  f.setState({ capabilityTransitioning: false });
+  assert.equal(f.runtime.instanceState().canChat, true);
+});
+
+test('pending Worker settings never conceal stopped, stopping, cleanup or invalid-generation admission', async t => {
+  const f = fixture(t); await f.runtime.ready(); f.bind(); f.start();
+  f.setState({ capabilityHold: { operationId: 'owner-worker-wait', frozen: false } });
+  assert.equal(f.runtime.instanceState().canChat, true, 'the bound owner can supply the pending hold');
+  f.setState({ phase: 'stopping' });
+  await assert.rejects(f.runtime.chat({ id: 'waiting-but-stopping', text: 'blocked' }, () => {}, signal()), { status: 409 });
+  assert.match(f.runtime.instanceState().reason, /实例正在停止/);
+  f.setState({ phase: 'stopped' });
+  await assert.rejects(f.runtime.chat({ id: 'waiting-but-stopped', text: 'blocked' }, () => {}, signal()), { status: 503 });
+  assert.match(f.runtime.instanceState().reason, /实例已停止/);
+  f.setState({ phase: 'running', cleanupPending: true });
+  assert.equal(f.runtime.instanceState().canChat, false); assert.match(f.runtime.instanceState().reason, /停止尚未完成/);
+  f.setState({ cleanupPending: false, generation: f.state().generation + 1 });
+  await assert.rejects(f.runtime.chat({ id: 'waiting-stale-generation', text: 'blocked' }, () => {}, signal()), error => error.status === 409 || error.status === 503);
+  assert.equal(f.prompts(), 0);
 });
 
 test('a stopped poll cannot start background expression after its asynchronous sync returns in a new generation', async t => {

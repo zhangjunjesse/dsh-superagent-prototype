@@ -102,13 +102,15 @@ test('real delegated stop acknowledgment must settle before capability commit, a
         [...native.instances.get('root').sessions.values()].every(session => session.status === 'idle'));
     await workerStarted.promise;
     const rootGeneration = control.manager.instance('root').generation, childPid = control.manager.instance('child').child.pid;
+    // Remove only the parent's local tool. The child keeps its read grant, so
+    // it can be stopped only through the parent's acknowledged delegation.
     const waiting = (await control.management('root', { method: 'PUT', path: 'worker-capabilities',
-      body: { revision: control.revision, tools: ['glob'], skills: [] } })).body;
+      body: { revision: control.revision, tools: ['read'], skills: [] } })).body;
     assert.equal(waiting.application.state, 'waiting'); assert.deepEqual(waiting.application.affected.map(item => item.instanceId), ['root']);
     const fresh = await view(control); assert.ok(fresh.application.confirmation);
     const failed = await application(control, fresh, 'apply-now');
     assert.equal(failed.application.state, 'failed'); assert.equal(failed.application.canRetry, true); assert.equal(failed.application.canCancel, false);
-    assert.deepEqual(failed.tools, ['glob']); assert.deepEqual(failed.applied.tools, ['read', 'glob']);
+    assert.deepEqual(failed.tools, ['read']); assert.deepEqual(failed.applied.tools, ['read', 'glob']);
     assert.ok(rejectedStops > 0); assert.equal(childCancelled, false);
     assert.equal(control.manager.instance('root').generation, rootGeneration);
     assert.equal(control.manager.instance('child').child.pid, childPid);
@@ -121,8 +123,8 @@ test('real delegated stop acknowledgment must settle before capability commit, a
     await until(() => control.manager.state('root'), state => state.delegations.outgoing[0]?.finished === true);
     assert.equal(childCancelled, true);
     const done = await application(control, await view(control), 'retry');
-    assert.equal(done.application.state, 'applied'); assert.deepEqual(done.applied.tools, ['glob']);
-    assert.equal(control.manager.instance('root').generation, rootGeneration + 1);
+    assert.equal(done.application.state, 'applied'); assert.deepEqual(done.applied.tools, ['read']);
+    assert.equal(control.manager.instance('root').generation, rootGeneration);
     assert.equal(control.manager.instance('child').child.pid, childPid);
     const parent = await control.manager.state('root'), childState = await control.manager.state('child');
     assert.equal(parent.delegations.outgoing[0].finished, true); assert.equal(childState.tickets[0].ended.outcome, 'stopped');

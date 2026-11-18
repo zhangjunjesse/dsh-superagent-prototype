@@ -25,6 +25,7 @@ async function initialize(config, managementOnly = false) {
         // Lifecycle cleanup must remain available after ordinary native
         // admission is revoked, including a management-only recovery owner.
         delegate: input => managementOnly || closing ? peer.call('delegation.send', input) : native.wire.call('delegate', input),
+        delegationCatalog: () => peer.call('delegation.catalog', {}, 15000),
       }, { native, managementOnly, adoption, capabilityHold,
         restart: () => { void peer.call('runtime.restart').catch(error => { process.stderr.write(`Organization restart request failed: ${error.message}\n`); }); } });
       native.managementHandler = input => requireRuntime().management(input);
@@ -50,12 +51,14 @@ const peer = new ProcessPeer(process, {
   state: () => requireRuntime().state(),
   tool: input => requireRuntime().tool(input),
   delegation: input => requireRuntime().delegation(input),
+  'delegation.readiness': input => runtime ? runtime.delegationReadiness(input) : { ready: false },
   'lifecycle.delegation': input => runtime.lifecycleDelegation(input),
   'lifecycle.drain': () => runtime.drainDelegations(),
   management: input => requireRuntime().management(input),
   'capabilities.hold': input => requireRuntime().capabilitiesHold(input),
   'capabilities.activity': input => requireRuntime().capabilitiesActivity(input),
   'capabilities.freeze': input => requireRuntime().capabilitiesFreeze(input),
+  'capabilities.configure': input => requireRuntime().capabilitiesConfigure(input),
   'capabilities.stop': input => requireRuntime().capabilitiesStop(input),
   async close() {
     closing = true;

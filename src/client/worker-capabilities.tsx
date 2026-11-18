@@ -130,7 +130,7 @@ function ApplicationStatus({ view, operation, disabled }: { view: WorkerCapabili
     : state === 'cancelled' ? 'workerCapabilitiesCancelled' : 'workerCapabilitiesApplied'
   return <section className="dt-capability-application" data-capability-application={state ?? 'applied'} aria-label={t('workerCapabilitiesApplication')}>
     <p className="dt-capability-status" role="status">{t(title)}</p>
-    {pending && different(view) && <Hint>{t('workerCapabilitiesKeepApplied')}</Hint>}
+    {state === 'waiting' && different(view) && <Hint>{t('workerCapabilitiesKeepApplied')}</Hint>}
     {pending && application?.canCancel && <Hint>{t('workerCapabilitiesCancelToEdit')}</Hint>}
     {application?.error && <p className="dt-error" role="alert">{application.error}</p>}
     <CapabilityValues value={view.applied} />

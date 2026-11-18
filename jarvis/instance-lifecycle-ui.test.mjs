@@ -144,11 +144,56 @@ test('failed cleanup never claims a stopped instance or enables start', async t 
   assert.equal(ui.byId('send-message').disabled, true);
 });
 
-test('a capability hold blocks new admission while retaining stop for the current reply', async t => {
+test('pending Worker settings keep authoritative daily admission, reply retries and successive messages available', async t => {
+  const ui = await open(t, { lifecycle: instance('running', { capabilityHold: { operationId: 'waiting-settings', frozen: false } }) });
+  ui.input('等待设置时正常发送');
+  assert.equal(ui.byId('instance-status').hidden, true);
+  assert.equal(ui.byId('send-message').disabled, false);
+  assert.ok(ui.retry());
+  ui.submit();
+  await until(() => ui.backend.chats === 1 && ui.byId('conversation-page').dataset.busy === 'false', 'reply while settings wait');
+  assert.match(ui.byId('thread').textContent, /新回复/);
+  assert.equal(ui.backend.state.instance.capabilityHold.operationId, 'waiting-settings');
+  ui.input('等待设置时继续发送'); ui.submit();
+  await until(() => ui.backend.chats === 2 && ui.byId('conversation-page').dataset.busy === 'false', 'successive pending-settings reply');
+  assert.equal(ui.byId('instance-status').hidden, true);
+});
+
+test('a frozen Worker switching window closes new messages even if canChat is stale and preserves the draft', async t => {
+  const ui = await open(t);
+  ui.input('切换期间保留的草稿');
+  ui.backend.state.instance = instance('running', { canChat: true, capabilityHold: { operationId: 'switching-settings', frozen: true } });
+  await ui.poll();
+  assert.equal(ui.byId('send-message').disabled, true);
+  assert.match(ui.byId('instance-status').textContent, /Worker 设置正在切换/);
+  assert.equal(ui.retry(), undefined);
+  ui.submit(); await delay(0); assert.equal(ui.backend.chats, 0);
+  ui.backend.state.instance = instance('running', { capabilityHold: { operationId: 'switching-settings', frozen: false } });
+  await ui.poll();
+  assert.equal(ui.byId('send-message').disabled, false);
+  assert.equal(ui.byId('instance-status').hidden, true);
+  assert.equal(ui.byId('input').value, '切换期间保留的草稿');
+});
+
+test('checking a Worker switching window temporarily closes new daily input and follows the backend when it reopens', async t => {
+  const ui = await open(t); ui.input('核对切换窗口时保留');
+  ui.backend.state.instance = instance('running', { canChat: false, capabilityTransitioning: true,
+    capabilityHold: { operationId: 'checking-settings', frozen: false } });
+  await ui.poll();
+  assert.equal(ui.byId('send-message').disabled, true);
+  assert.match(ui.byId('instance-status').textContent, /Worker 设置正在切换/);
+  ui.backend.state.instance.capabilityTransitioning = false; ui.backend.state.instance.canChat = true;
+  await ui.poll();
+  assert.equal(ui.byId('send-message').disabled, false);
+  assert.equal(ui.byId('input').value, '核对切换窗口时保留');
+});
+
+test('an older host that still rejects a pending capability hold remains authoritative and retains stop for its current reply', async t => {
   const ui = await open(t, { lifecycle: instance('running', { canChat: false, capabilityHold: { phase: 'waiting' }, reason: '等待当前工作完成后应用设置' }), active: failedTurn.id });
   await until(() => ui.polls.size === 1, 'initial active state synchronized');
   ui.input('等待设置应用的草稿');
   assert.equal(ui.byId('send-message').disabled, true);
+  assert.match(ui.byId('instance-status').textContent, /等待当前工作完成后应用设置/);
   assert.equal(ui.byId('stop-generation').hidden, false);
   assert.equal(ui.byId('stop-generation').disabled, false);
   ui.byId('stop-generation').click();

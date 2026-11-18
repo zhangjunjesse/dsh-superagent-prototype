@@ -305,7 +305,8 @@ it('saves busy Worker authorization as pending, keeps old permissions explicit a
   expect(server.workerCapabilities.applied.tools).toEqual(['read', 'glob', 'grep'])
   const status = document.querySelector('[data-capability-application]')!
   expect(status.textContent).toContain('已保存，等待相关工作结束后自动应用')
-  expect(status.textContent).toContain('等待期间仍使用当前生效的工具与技能')
+  expect(status.textContent).toContain('日常对话在等待期间可以继续')
+  expect(status.textContent).toContain('只等人答复的工单会保留')
   expect(status.textContent).toContain('产品组织')
   expect(status.textContent).toContain('修复回归')
   expect(status.textContent).toContain('t1')

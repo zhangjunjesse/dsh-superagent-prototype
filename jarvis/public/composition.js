@@ -53,6 +53,8 @@
   const expandedPools = new Set();
   let topologyZoom = 1;
   let topologyObserver = null;
+  const taskPages = new Map();
+  const taskRequests = new Map();
   let editor = null, editorTab = 'basic', engineTab = 'source', editorReturn = 'overview', pendingDestination = null, toastTimer;
   let engineMount = null, engineMountEpoch = 0, engineQuery = {};
   let savedWindowDraft; try { savedWindowDraft=sessionStorage.getItem(STORAGE); } catch { /* unavailable browser storage remains a recoverable save error */ }
@@ -162,6 +164,7 @@
         else if (changed && !editor && !focusedField && currentView !== 'draft-review' && visible()) render();
         else updateRuntimeStatus();
         await refreshDetail();
+        if (currentView === 'overview') await refreshTopologyTasks();
       } catch (error) {
         if (epoch!==service.epoch) return;
         service.error = error.message || '无法连接运行服务。';
@@ -249,11 +252,165 @@
     topologyObserver?.disconnect();
     const n = node(currentInstanceId);
     main.innerHTML = `<section class="topology-workspace" aria-label="实例与 Worker 拓扑"><header class="topology-commandbar" data-current-instance="${escape(n.id)}"><div class="topology-context">${breadcrumb()}<h1 id="composition-title" class="sr-only" tabindex="-1">${escape(n.name)}</h1></div>${viewNavigation()}<div class="topology-command-actions">${button('实例配置','edit',n.id,'quiet','settings')}${canAddInstance()?button('添加 SuperJarvis','add-instance','','secondary','plus'):''}</div></header><div class="topology-canvas" id="topology-canvas" role="region" aria-label="执行拓扑画布" tabindex="0"><div class="topology-tree" id="topology-tree" style="zoom:${topologyZoom}"><svg class="topology-links" aria-hidden="true"></svg>${topologyBranch(n)}</div></div><div class="topology-legend"><span class="legend-brain">${icon('brain')}大脑</span><span class="legend-agent">${icon('bots')}普通 Worker</span><span class="legend-instance">${icon('portal')}虚拟入口 · SuperJarvis</span></div><div class="topology-controls">${button('全部展开','topology-expand','','quiet')}${button('收起下级','topology-collapse','','quiet')}<button type="button" class="btn quiet" data-action="topology-zoom-out" aria-label="缩小拓扑">−</button><output id="topology-zoom" aria-label="拓扑缩放比例">${Math.round(topologyZoom*100)}%</output><button type="button" class="btn quiet" data-action="topology-zoom-in" aria-label="放大拓扑">+</button>${button('100%','topology-reset','','quiet')}</div></section>`;
+    if (organizationMode() && service.snapshot?.configured) {
+      for (const brain of main.querySelectorAll('[data-brain-id]')) {
+        const id = brain.dataset.brainId;
+        const tasks = document.createElement('details');
+        tasks.className = 'org-tasks';
+        tasks.dataset.taskOrganization = id;
+        tasks.open = taskPages.get(id)?.open === true;
+        tasks.innerHTML = '<summary><strong>任务动态</strong><span></span></summary><div class="org-task-page"></div>';
+        brain.parentElement.append(tasks);
+        tasks.addEventListener('toggle', () => {
+          if (!tasks.isConnected) return;
+          taskPage(id).open = tasks.open;
+          if (tasks.open && !taskPage(id).data) void refreshTopologyTasks();
+          drawTopologyLinks();
+        });
+        paintTaskPage(tasks);
+      }
+      void refreshTopologyTasks();
+    }
     drawTopologyLinks();
     if (window.ResizeObserver) {
       topologyObserver = new ResizeObserver(drawTopologyLinks);
       topologyObserver.observe(byId('topology-tree'));
     }
+  }
+  function taskPage(id) {
+    if (!taskPages.has(id)) taskPages.set(id, { cursor: 0, open: false, data: null, error: false });
+    return taskPages.get(id);
+  }
+  function paintTaskPage(element) {
+    const id = element.dataset.taskOrganization, page = taskPage(id), rows = page.data?.items;
+    const failed = page.error || service.error || page.data?.availability === 'unavailable';
+    const first = rows?.[0];
+    const compact = element.querySelector('summary > span');
+    const historical = page.data?.availability === 'stored' || first?.availability === 'stored';
+    const target = first?.execution?.kind === 'delegated' ? first.execution.name || first.execution.instanceId : '';
+    compact.textContent = failed ? '状态未同步' : first ? [historical ? '上次记录' : '', first.statusLabel, target ? '→ ' + target : '', first.title].filter(Boolean).join(' · ')
+      : rows ? (page.data?.fromLogs ? '本页暂无工单快照' : '暂无任务记录') : page.onDemand ? '展开查看工单记录' : '正在读取…';
+    compact.dataset.status = failed || historical ? '' : first?.status || '';
+    compact.title = compact.textContent;
+    const panel = element.querySelector('.org-task-page');
+    const content = [];
+    if (failed) content.push('<p>任务状态暂时无法读取。</p>');
+    else if (historical) content.push('<p>' + (page.data?.fromLogs ? '以下为运行日志收录的工单记录。' : '以下为该组织上次保存的记录。') + '</p>');
+    if (rows?.length) {
+      content.push('<ul>');
+      for (const row of rows) {
+        const executor = row.execution || {};
+        const route = executor.kind === 'delegated' ? '委派给 ' + (executor.name || executor.instanceId)
+          : executor.kind === 'local' ? '本级执行' : executor.kind === 'unassigned' ? '尚未分派' : '执行方待确认';
+        const trace = row.logs?.traceId;
+        const time = row.updatedAt && new Date(row.updatedAt);
+        content.push('<li><strong>' + escape(row.title) + '</strong><span>' + escape([row.statusLabel,route].join(' · ')) + '</span>'
+          + (row.workRef ? '<code>' + escape(row.workRef) + '</code>' : '')
+          + (executor.workerId ? '<span>' + (executor.kind==='delegated'?'下级 Worker':'Worker') + ' · ' + escape(executor.workerId) + '</span>' : '')
+          + (row.progress?.summary ? '<p>' + (row.progress.state==='blocked'?'受阻原因 · ':'') + escape(row.progress.summary) + '</p>' : '')
+          + '<footer>' + (time && Number.isFinite(time.getTime()) ? '<time datetime="' + escape(row.updatedAt) + '">' + escape(time.toLocaleString('zh-CN',{hour12:false})) + '</time>' : '')
+          + (trace ? '<a href="#logs?trace=' + escape(encodeURIComponent(trace)) + '">运行日志</a>' : '') + '</footer></li>');
+      }
+      content.push('</ul>');
+    }
+    if (page.cursor || Number.isInteger(page.data?.nextCursor)) {
+      content.push('<nav aria-label="任务记录分页">');
+      if (page.cursor) content.push(button('返回最新','org-tasks-first',id,'quiet'));
+      if (Number.isInteger(page.data?.nextCursor)) content.push(button('下一页','org-tasks-next',id,'quiet'));
+      content.push('</nav>');
+    }
+    const html = content.join('');
+    if (panel._renderedTasks !== html) { panel.innerHTML = html; panel._renderedTasks = html; }
+  }
+  // Older running hosts already publish authenticated, immutable log snapshots.
+  // Display those as recorded evidence while their original tasks remain active.
+  async function recordedOrgTasks(id, before) {
+    const client = apiClient(), params = new URLSearchParams({ organization:id, role:'worker', q:'任务状态快照', limit:'12' });
+    if (before) params.set('before',String(before));
+    const list = await client.api('/api/logs?' + params);
+    if (!Array.isArray(list?.items)) throw new Error('无法读取工单快照');
+    const entries = [], seen = new Set();
+    for (const entry of list.items) {
+      if (entry.organizationId !== id || entry.event !== 'core/ticket/snapshot' || !entry.refs?.ticketId || seen.has(entry.refs.ticketId)) continue;
+      seen.add(entry.refs.ticketId); entries.push(entry);
+    }
+    const items = [];
+    for (const entry of entries) {
+      const detail = await client.api('/api/logs/' + entry.id), ticket = detail.detail?.record;
+      if (detail.organizationId !== id || detail.event !== entry.event) continue;
+      if (ticket?.id !== entry.refs.ticketId) {
+        items.push({title:entry.summary,statusLabel:'状态待核实',updatedAt:entry.at,logs:{traceId:entry.traceId}});
+        continue;
+      }
+      const assignment = ticket.assignments?.at(-1), report = assignment?.report, trace = entry.traceId;
+      const statusLabel = ticket.ended ? ({completed:'已完成',stopped:'已停止'}[ticket.ended.outcome] || '已结束')
+        : ({blocked:'执行受阻',failed:'执行失败',waiting:'等待后续事件',progress:'执行中',ready:'已回报'}[report?.state]
+          || (assignment?.startedAt ? '已接单' : '等待执行'));
+      const execution = { kind: 'unknown' };
+      if (ticket.mandate?.basis?.via === 'delegation') {
+        execution.kind='local';
+        if (assignment?.startedAt) execution.workerId='worker-'+ticket.id;
+      } else if (trace && assignment?.id && service.snapshot.nodes.some(n=>n.parent===id)) {
+        const query = new URLSearchParams({organization:id, role:'runtime', trace, q:'向下级交办状态快照', limit:'5'});
+        const delegates = await client.api('/api/logs?' + query).catch(()=>null);
+        const row = delegates?.items?.find(r=>r.organizationId===id && r.traceId===trace && r.event==='instance/process-delegation/out/snapshot'
+          && r.refs?.ticketId===ticket.id && r.refs?.assignmentId===assignment.id);
+        if (row) {
+          const out = (await client.api('/api/logs/'+row.id).catch(()=>null))?.detail?.record?.request;
+          if (out?.parentTicketId===ticket.id && out.parentAssignmentId===assignment.id && out.targetInstanceId) {
+            execution.kind='delegated'; execution.instanceId=out.targetInstanceId; execution.name=node(out.targetInstanceId)?.name;
+          }
+        }
+      }
+      const work = /^work:[^:]+:(JW-[\w-]+)$/.exec(trace || '');
+      items.push({title:ticket.title,workRef:work?.[1],updatedAt:ticket.updatedAt || entry.at,statusLabel,
+        status:report?.state,execution,progress:report,logs:{traceId:trace}});
+    }
+    return {instanceId:id,items,nextCursor:list.nextCursor,availability:'stored',fromLogs:true};
+  }
+  async function refreshTopologyTasks() {
+    if (!visible() || currentView !== 'overview' || !organizationMode() || !service.snapshot?.configured) return;
+    const groups = new Map(), revision = service.snapshot.revision;
+    const elements = [...main.querySelectorAll('[data-task-organization]')];
+    const fromLogs = apiClient().state?.tasksAvailable !== true;
+    for (const el of elements) {
+      const id = el.dataset.taskOrganization, cursor = taskPage(id).cursor;
+      if (fromLogs) {
+        const p=taskPage(id); p.onDemand=elements.length>4 && !el.open;
+        if (p.onDemand || (p.data && p.expires>Date.now())) { paintTaskPage(el); continue; }
+      }
+      if (!groups.has(cursor)) groups.set(cursor, []);
+      groups.get(cursor).push(id);
+    }
+    await Promise.all([...groups].map(async ([cursor, ids]) => {
+      const query = new URLSearchParams({ limit:'5', cursor:String(cursor) });
+      for (const id of ids) query.append('organizationId',id);
+      const key = revision + ':' + query;
+      if (taskRequests.has(key)) return taskRequests.get(key);
+      const request = (async () => {
+        let organizations;
+        try {
+          if (fromLogs) {
+            organizations = await Promise.all(ids.map(id=>recordedOrgTasks(id,cursor).catch(()=>({instanceId:id}))));
+          } else {
+            const result = await apiClient().api('/api/tasks?' + query);
+            organizations = Array.isArray(result?.organizations) ? result.organizations : [];
+          }
+        } catch { organizations = []; }
+        if (!visible() || currentView !== 'overview' || service.snapshot?.revision !== revision) return;
+        for (const el of main.querySelectorAll('[data-task-organization]')) {
+          const id = el.dataset.taskOrganization, page = taskPage(id);
+          if (!ids.includes(id) || page.cursor !== cursor) continue;
+          const data = organizations.find(org => org.instanceId === id);
+          page.error = !Array.isArray(data?.items);
+          if (!page.error) { page.data = data; page.expires = Date.now()+30000; }
+          paintTaskPage(el);
+        }
+        drawTopologyLinks();
+      })();
+      taskRequests.set(key,request);
+      try { await request; } finally { taskRequests.delete(key); }
+    }));
   }
   // Child instances expose a virtual Worker in their parent. Derive this view from
   // the existing relation instead of duplicating persisted configuration records.
@@ -291,7 +448,7 @@
     const paths = [], groups = [];
     const brains = new Map([...tree.querySelectorAll('[data-brain-id]')].map(el => [el.dataset.brainId,el]));
     for (const [id,brain] of brains) {
-      const b = position(brain), instance = brain.closest('.topology-instance');
+      const b = position(brain.parentElement.querySelector('.org-tasks') ? brain.parentElement : brain), instance = brain.closest('.topology-instance');
       const workers = instance.querySelectorAll(':scope > .topology-worker-grid > .topology-worker-branch > .topology-worker');
       const members = [b,...[...workers].map(position)];
       groups.push(topologyGroupFrame(node(id),members));
@@ -380,6 +537,7 @@
   }
   function updateRuntimeStatus() {
     if (!connected()) return;
+    for (const tasks of main.querySelectorAll('[data-task-organization]')) paintTaskPage(tasks);
     const notice=main.querySelector('.system-service-note'), message=notice?.querySelector('[data-system-service-message]');
     if (message) {
       message.textContent=service.error?'运行服务连接中断 · 已保留最近一次配置':service.snapshot.configured?savedConfigurationText():'尚未注册实例 · 保存配置后可启动';
@@ -560,11 +718,12 @@
     const n = editor.value, tabs = editorTabs(n); if (!tabs.some(([id])=>id===editorTab)) editorTab = 'basic';
     const title = editor.isNew ? '添加下级 SuperJarvis' : organizationMode() ? n.name+' · 设置' : '实例配置';
     const embedded=organizationMode() && editorTab==='engine' && !editor.isNew;
+    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'修改前先停止实例；保存后重新启动当前组织生效':'修改运行中的实例前，请先停止该实例';
     if (embedded && engineMount?.id===n.id && engineMount.target.isConnected) {
       engineMount.controller?.update(engineLocation()); return;
     }
     unmountEngine();
-    const content=embedded?'<div class="editor-content superagent-engine-host" id="superagent-engine-host"><p role="status">正在读取完整任务引擎设置…</p></div>':`<form class="editor-content" id="unit-form" novalidate><div class="editor-form-body">${editorFields(n)}<p class="field-error" id="form-error" role="alert" hidden></p><div id="system-conflict-review" hidden></div></div><div class="form-footer"><div class="save-scope"><span id="draft-indicator">${editor.dirty?'有未保存的更改':connected()?(organizationMode()?'保存当前实例配置':'保存到系统'):'保存到此窗口'}</span><small>${connected()?(organizationMode()?'修改前先停止实例；保存后重新启动当前组织生效':'修改运行中的实例前，请先停止该实例'):'尚未应用到运行环境'}</small></div><div>${button('取消','cancel-edit','','secondary')}<button class="btn primary" type="submit">${icon('check')}<span>${editor.isNew?'保存并添加':'保存配置'}</span></button></div></div></form>`;
+    const content=embedded?'<div class="editor-content superagent-engine-host" id="superagent-engine-host"><p role="status">正在读取完整任务引擎设置…</p></div>':`<form class="editor-content" id="unit-form" novalidate><div class="editor-form-body">${editorFields(n)}<p class="field-error" id="form-error" role="alert" hidden></p><div id="system-conflict-review" hidden></div></div><div class="form-footer"><div class="save-scope"><span id="draft-indicator">${editor.dirty?'有未保存的更改':connected()?(organizationMode()?'保存当前实例配置':'保存到系统'):'保存到此窗口'}</span><small>${saveNote}</small></div><div>${button('取消','cancel-edit','','secondary')}<button class="btn primary" type="submit">${icon('check')}<span>${editor.isNew?'保存并添加':'保存配置'}</span></button></div></div></form>`;
     main.innerHTML = `<div class="editor-header" data-current-instance="${escape(currentInstanceId)}"><div class="editor-context">${breadcrumb()}<h1 id="composition-title" tabindex="-1">${escape(title)}</h1></div><button class="back-link" type="button" data-action="cancel-edit">${icon('back')}<span>返回${{overview:'概览',children:'下级实例',workers:'普通 Worker',runtime:'运行状态'}[editorReturn]}</span></button></div><div class="editor-layout"><nav class="editor-nav" aria-label="配置分区">${tabs.map(([id,label])=>`<button type="button" class="${editorTab===id?'active':''}" data-action="editor-tab" data-id="${id}"${editorTab===id?' aria-current="page"':''}>${label}</button>`).join('')}</nav>${content}</div>`;
     if (embedded) mountEngine(n,byId('superagent-engine-host'));
     if (service.conflict) showConflictReview(service.conflict);
@@ -735,7 +894,7 @@
       const snapshot=await apiClient().api('/api/system','PUT',{revision:editing.revision,nodes});
       installSnapshot(snapshot); service.conflict=null;
       if (editor===editing) { editor=null; navigate(editorReturn); }
-      announce(savedConfigurationText());
+      announce(editing.isNew?'下级 SuperJarvis 已添加，尚未启动；进入下级的运行状态，启动后即可接单。':savedConfigurationText());
     } catch (error) {
       if (editor!==editing) { announce(error.message||'配置保存失败，请重试。'); return; }
       editor.dirty=true; byId('draft-indicator').textContent='更改尚未保存'; showEditorError(error.message||'配置保存失败，请重试。');
@@ -776,6 +935,13 @@
     if (target.disabled || service.busy || engineBusy()) return;
     if(target.dataset.view) { event.preventDefault(); goTo({view:target.dataset.view,instanceId:target.dataset.instanceId}); return; }
     const {action,id}=target.dataset;
+    if (action==='org-tasks-next' || action==='org-tasks-first') {
+      const p=taskPage(id), cursor=action==='org-tasks-first'?0:p.data?.nextCursor;
+      if (!Number.isInteger(cursor)) return;
+      p.cursor=cursor; p.data=null; p.error=false;
+      paintTaskPage(target.closest('[data-task-organization]'));
+      void refreshTopologyTasks(); return;
+    }
     if (action==='system-retry') {
       if (connected()) { refreshService(); return; }
       if (editor) { announce('请先保存或取消当前草稿，再重新连接。'); return; }
@@ -859,6 +1025,6 @@
       render();
     },
     isDirty: () => !!editor?.dirty || engineDirty(),
-    discard() { engineMount?.controller?.discard(); unmountEngine(); requestedEditorRoute=null; lastRequestedRoute=null; topologyObserver?.disconnect(); clearTimeout(service.pollTimer); editor=null; pendingDestination=null; service.conflict=null; currentInstanceId=rootId(); currentView='overview'; search=''; collapsedInstances.clear(); expandedPools.clear(); topologyZoom=1; main.replaceChildren(); },
+    discard() { engineMount?.controller?.discard(); unmountEngine(); requestedEditorRoute=null; lastRequestedRoute=null; topologyObserver?.disconnect(); clearTimeout(service.pollTimer); editor=null; pendingDestination=null; service.conflict=null; currentInstanceId=rootId(); currentView='overview'; search=''; collapsedInstances.clear(); expandedPools.clear(); taskPages.clear(); topologyZoom=1; main.replaceChildren(); },
   };
 })();

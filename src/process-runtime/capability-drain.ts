@@ -1,6 +1,6 @@
 /** Maintenance admission records attached to the original Store; task state stays in the original Engine. */
 import { z } from 'zod'
-import { latestAssignment, liveTicket, type Ticket, type Trigger } from '../core/index.ts'
+import { latestAssignment, liveTicket, waitsForPerson, type Ticket, type Trigger } from '../core/index.ts'
 import type { Runtime } from '../app/runtime.ts'
 import { record } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
@@ -87,9 +87,13 @@ export class CapabilityDrain {
   authorizeStop(operationId: string): void {
     if (!this.matching(operationId).frozen) throw new Error('Native delivery cancellation requires the frozen Worker capability owner')
   }
+  /** In-place configuration can change only while this exact maintenance owner fences execution. */
+  authorizeConfiguration(operationId: string): void {
+    if (!this.matching(operationId).frozen) throw new Error('Worker capability configuration requires its frozen maintenance owner')
+  }
   /** A synchronous observation: installing the hold/freeze always precedes this read. */
   snapshot(instanceId: string, extra: CapabilityTask[] = []) {
-    const { runtime } = this, work = new Map(extra.map(task => [task.id, task]))
+    const { runtime } = this, work = new Map(extra.map(task => [task.id, task])), waitingTasks: CapabilityTask[] = []
     const activity = new Map(runtime.executor.activity().map(task => [task.ticketId, task]))
     for (const ticket of runtime.store.tickets.list()) {
       const observed = activity.get(ticket.id)
@@ -100,7 +104,13 @@ export class CapabilityDrain {
         status: ticket.ended ? 'stopping' : ticket.attention ? 'awaiting_input' : assignment?.report?.state ?? assignment?.state ?? 'open',
         reasons: [...work.get(`ticket:${ticket.id}:${assignment?.id ?? ''}`)?.reasons ?? [], ...liveTicket(ticket) ? ['open_ticket'] : [],
           ...observed?.reasons ?? [], ...ticket.undelivered.length ? ['pending_inputs'] : []] }
-      work.set(task.id, task)
+      // A blocked/failed business ticket is durable task state, not an active
+      // execution. Its original executor must also have no launch, turn, retry,
+      // settling job or stop, and no input may be awaiting delivery. The host
+      // separately verifies native inboxes, jobs and subagents under the freeze.
+      if (liveTicket(ticket) && waitsForPerson(ticket) && !ticket.undelivered.length && !observed && !work.has(task.id)) {
+        waitingTasks.push({ ...task, reasons: ['waiting_for_person'] })
+      } else work.set(task.id, task)
     }
     for (const thread of runtime.store.threads.active()) {
       for (const id of thread.pending) {
@@ -138,7 +148,7 @@ export class CapabilityDrain {
       runtime.store.set(held, this.hold)
     }
     return { instanceId, operationId: this.hold?.operationId ?? null, held: !!this.hold, frozen: this.frozen,
-      busy: tasks.length > 0, fingerprint: hash, tasks,
+      busy: tasks.length > 0, fingerprint: hash, tasks, waitingTasks: waitingTasks.sort((a, b) => a.id.localeCompare(b.id)),
       queued: { triggers: runtime.store.threads.active().reduce((sum, thread) => sum + thread.pending.length, 0),
         delegations: incoming.filter(row => row.phase === 'queued').length }, blockingReasons: tasks.length ? ['affected_work_active'] : [] }
   }

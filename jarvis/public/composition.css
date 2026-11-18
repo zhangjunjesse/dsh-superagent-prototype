@@ -102,6 +102,18 @@
 #composition-page .topology-links .proxy-brain-link { stroke:#7c8490; stroke-dasharray:5 5; }
 #composition-page .topology-instance { position:relative; display:flex; flex:none; flex-direction:column; align-items:center; min-width:264px; }
 #composition-page .topology-brain-node { position:relative; z-index:2; flex:none; width:264px; }
+#composition-page .org-tasks { margin-top:4px; background:var(--panel); border:1px solid var(--line); border-radius:9px; color:var(--text); font-size:13px; }
+#composition-page .org-tasks > summary { padding:8px 10px; cursor:pointer; }
+#composition-page .org-tasks > summary strong { font-weight:550; }
+#composition-page .org-tasks > summary span { display:block; padding-left:15px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); }
+#composition-page .org-tasks > summary span[data-status=blocked], #composition-page .org-tasks > summary span[data-status=waiting] { color:#875413; }
+#composition-page .org-tasks > summary span[data-status=running] { color:#245ca5; }
+#composition-page .org-task-page:not(:empty) { padding:0 11px 9px; max-height:300px; overflow:auto; overflow-wrap:anywhere; scrollbar-width:thin; }
+#composition-page .org-task-page ul { margin:0; padding:0; list-style:none; }
+#composition-page .org-task-page li { display:grid; gap:4px; border-top:1px solid var(--line); padding:9px 0; }
+#composition-page .org-task-page p { margin:2px 0; }
+#composition-page .org-task-page code, #composition-page .org-task-page footer { font-size:12px; color:var(--muted); }
+#composition-page .org-task-page footer, #composition-page .org-task-page nav { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px; }
 #composition-page .topology-brain { display:flex; align-items:center; gap:12px; width:264px; min-width:0; height:80px; padding:10px 14px; border:1px solid #b9c0ca; border-radius:12px; color:var(--text); background:#f5f6f8; box-shadow:0 2px 5px #20273109; text-align:left; cursor:pointer; }
 #composition-page .topology-brain:hover { border-color:#929ba8; background:#f0f2f5; }
 #composition-page .brain-orb { display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; width:36px; height:36px; border:1px solid #d4d9e0; border-radius:11px; color:#4b5461; background:#e9edf1; }

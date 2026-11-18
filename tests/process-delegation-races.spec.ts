@@ -43,7 +43,7 @@ function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapsho
     now: () => new Date(Date.UTC(2026, 10, 15, 0, 0, clock++)).toISOString() })
   proxy = new DelegationExecutor({ instanceId: 'parent', workerTools: ['read'], delegationTargets: [
     { instanceId: 'child', organizationName: 'Child', description: 'Bounded reader', tools: ['read'] },
-  ] }, store, engine, send)
+  ] }, store, engine, send, () => false, id => id === 'child')
   const message = (id: string, operation: 'new' | 'append' = 'new', target?: Ticket): Trigger => ({
     id, source: 'jarvis', threads: [{ source: 'jarvis', id }], actor: { source: 'jarvis', id: 'user' },
     human: true, addressed: 'direct', at: '2026-11-15T00:00:00.000Z', text: `read requirement ${id}`, meta: {},

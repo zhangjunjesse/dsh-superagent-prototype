@@ -12,7 +12,7 @@ import type { GatewayLedger } from '../jarvis-gateway/ledger.ts'
 import type { GatewayService } from '../jarvis-gateway/service.ts'
 import type { GatewayPump } from '../jarvis-gateway/pump.ts'
 import { QuerySchema, SubmitSchema, fingerprint, type UserTurn } from '../jarvis-gateway/contracts.ts'
-import { CapabilitySchema, type Capability, type DelegationRequest, type DelegationSnapshot, type DelegationEnvelope, type VerifiedArtifact } from './delegation-contract.ts'
+import { CapabilitySchema, type Capability, type DelegationCatalog, type DelegationRequest, type DelegationSnapshot, type DelegationEnvelope, type VerifiedArtifact } from './delegation-contract.ts'
 import type { InboundDelegations } from './delegation-ingress.ts'
 import type { DelegationExecutor } from './delegation-executor.ts'
 import { WorkerToolSchema, WorkerSkillsSchema } from './worker-capabilities.ts'
@@ -59,6 +59,8 @@ export interface ProcessHost {
   run(request: ProcessRun): Promise<ProcessRunResult>
   cancel(request: { sessionKey: string; requestId?: string }): Promise<unknown>
   delegate?(request: DelegationRequest): Promise<DelegationSnapshot>
+  /** Authenticated host observation; model tools cannot supply a catalog or readiness. */
+  delegationCatalog?(): Promise<DelegationCatalog>
 }
 export interface ProcessToolCall {
   sessionKey: string; role: ProcessRole; requestId: string; name: string; args: unknown
@@ -185,7 +187,7 @@ export class ProcessRuntime {
     const pending = this.chatting.get(input.id)
     if (pending) return pending
     if (previous) return previous
-    if (this.original.capabilityDrain.operationId) throw new Error('New work admission is held for a pending Worker capability change')
+    if (this.original.capabilityDrain.frozen) throw new Error('New conversation replies are frozen for the confirmed Worker capability change')
     if (this.active.has('jarvis')) throw new Error('Jarvis already has an active user turn')
     const selection = { ...(input.selectedWorkRef ? { selectedWorkRef: input.selectedWorkRef } : {}), ...(input.selectedQuestionId ? { selectedQuestionId: input.selectedQuestionId } : {}) }
     const turn: ProcessTurn = { id: input.id, user: input.text, assistant: '', at: new Date().toISOString(), status: 'running', ...selection }
@@ -411,6 +413,13 @@ export class ProcessRuntime {
     const snapshot = await this.inbound.receive(envelope)
     return this.delegationResult(snapshot)
   }
+  /** Admission readiness uses the original Core and maintenance owner, not process liveness alone. */
+  async delegationReadiness(raw: unknown = {}): Promise<{ ready: boolean }> {
+    z.object({}).strict().parse(raw)
+    if (this.stopping || this.closed || this.options.managementOnly) return { ready: false }
+    await this.ready
+    return { ready: !this.stopping && !this.closed && this.original.delegationReady() }
+  }
   private delegationResult(snapshot: DelegationSnapshot): DelegationSnapshot {
     return { ...snapshot, artifacts: snapshot.ticketId ? this.taskFiles.links(this.config.instanceId, snapshot.ticketId)
       .map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: snapshot.ticketId! })) : [] }
@@ -481,6 +490,26 @@ export class ProcessRuntime {
     const { operationId } = z.object({ operationId: z.string().min(1).max(200) }).strict().parse(raw)
     this.original.capabilityDrain.freeze(operationId)
     return this.capabilitySnapshot()
+  }
+  /** Private host IPC only: update Worker policy in place while preserving original task and Session owners. */
+  async capabilitiesConfigure(raw: unknown) {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    const input = z.object({ operationId: z.string().min(1).max(200), workerTools: z.array(WorkerToolSchema),
+      workerSkills: WorkerSkillsSchema, delegationTargets: z.array(CapabilitySchema),
+      delegationLimits: z.array(z.object({ sourceInstanceId: z.string().min(1).max(200), tools: z.array(WorkerToolSchema) }).strict()) }).strict().parse(raw)
+    this.original.capabilityDrain.authorizeConfiguration(input.operationId)
+    await this.original.prepareCapabilityConfiguration(input.delegationTargets)
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    this.original.capabilityDrain.authorizeConfiguration(input.operationId)
+    // A management-only owner has no Sessions, Sources or effects running. The
+    // host verified its stopped native owner before opening this Store; durable
+    // pending tickets/effects can be preserved and tightened without executing.
+    if (this.capabilitySnapshot().busy && !this.options.managementOnly) throw new Error('Worker capability configuration requires all active execution to drain')
+    // Keep validation, grant tightening and policy replacement in one turn;
+    // frozen execution cannot enter between the observation and the change.
+    this.original.configureCapabilities(input)
+    return { configured: true, instanceId: this.config.instanceId }
   }
   /** Stops only identities present in the confirmed frozen manifest, through original domain operations. */
   async capabilitiesStop(raw: unknown) {
