@@ -93,7 +93,7 @@ export class SystemControl {
     mkdirSync(rootDir, { recursive: true });
     this.rootDir = realpathSync(rootDir); this.file = join(this.rootDir, 'system-config.json');
     this.defaultModel = defaultModel; this.validateModel = validateModel;
-    this.capabilityCatalog = capabilityCatalog; this.catalogCache = new Map();
+    this.capabilityCatalog = capabilityCatalog; this.catalogCache = new Map(); this.catalogRequests = new Map();
     this.revision = 0; this.nodes = null; this.identities = {}; this.saving = false; this.actions = new Map(); this.closing = false;
     let capabilityApplications = [];
     if (existsSync(this.file)) {
@@ -213,21 +213,31 @@ export class SystemControl {
       throw new SystemControlError(400, '当前仅能选择助手已保存的宿主模型');
     }
   }
-  async get() {
-    const nodes = this.nodes ?? this.initialNodes(), catalogs = {};
-    const projected = [];
-    for (const node of nodes) {
+  async get({ view } = {}) {
+    const nodes = this.nodes ?? this.initialNodes();
+    const snapshot = { available: true, revision: this.revision, configured: this.nodes !== null, rootId: 'root',
+      nodes: clone(nodes), defaults: { model: this.currentDefaultModel(), workerTools: [...tools], engine: defaultEngineConfig() },
+      catalogs: {}, runtime: this.manager.status() };
+    // The graph needs saved organization identities and live process state, not management-owner startup or skill discovery.
+    if (view === 'topology') return { ...snapshot, view: 'topology' };
+    const projectNode = async node => {
       const view = await this.executionView(node);
-      projected.push({ ...clone(node), ...view });
+      let catalog;
       if (this.capabilityCatalog) {
         try {
           if (view.executionError) throw new Error(view.executionError);
-          catalogs[node.id] = await this.catalog(view.execution?.directory ?? node.workspace);
-        } catch { catalogs[node.id] = { tools: [], skills: [], complete: false, error: '暂时无法读取当前执行目录的工具与技能，请重新连接后再试。' }; }
+          catalog = await this.catalog(view.execution?.directory ?? node.workspace);
+        } catch { catalog = { tools: [], skills: [], complete: false, error: '暂时无法读取当前执行目录的工具与技能，请重新连接后再试。' }; }
       }
+      return { node: { ...node, ...view }, catalog };
+    };
+    const projected = [];
+    // A stopped organization may need a management process; do not start every owner at once for a large graph.
+    for (let offset = 0; offset < snapshot.nodes.length; offset += 4) {
+      projected.push(...await Promise.all(snapshot.nodes.slice(offset, offset + 4).map(projectNode)));
     }
-    return { available: true, revision: this.revision, configured: this.nodes !== null, rootId: 'root', nodes: projected,
-      defaults: { model: this.currentDefaultModel(), workerTools: [...tools], engine: defaultEngineConfig() }, catalogs, runtime: this.manager.status() };
+    return { ...snapshot, nodes: projected.map(item => item.node),
+      catalogs: Object.fromEntries(projected.filter(item => item.catalog).map(item => [item.node.id, item.catalog])), runtime: this.manager.status() };
   }
   /** The original versioned settings remain the only authority after first initialization. */
   async executionView(node) {
@@ -295,9 +305,24 @@ export class SystemControl {
   async catalog(workspace, fresh = false) {
     const old = this.catalogCache.get(workspace);
     if (!fresh && old && Date.now() - old.at < 30000) return clone(old.value);
-    const value = await this.capabilityCatalog(workspace);
-    this.catalogCache.set(workspace, { at: Date.now(), value: clone(value) });
-    return value;
+    // Save/start validation always performs a fresh inspection; concurrent page reads may share their own in-flight scan.
+    if (fresh) {
+      const value = await this.capabilityCatalog(workspace);
+      this.catalogCache.set(workspace, { at: Date.now(), value: clone(value) });
+      return value;
+    }
+    let request = this.catalogRequests.get(workspace);
+    if (!request) {
+      request = Promise.resolve().then(() => this.capabilityCatalog(workspace));
+      this.catalogRequests.set(workspace, request);
+    }
+    try {
+      const value = await request;
+      this.catalogCache.set(workspace, { at: Date.now(), value: clone(value) });
+      return clone(value);
+    } finally {
+      if (this.catalogRequests.get(workspace) === request) this.catalogRequests.delete(workspace);
+    }
   }
   async checkExecution(node) {
     const view = await this.executionView(node);

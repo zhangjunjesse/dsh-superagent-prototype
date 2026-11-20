@@ -39,6 +39,21 @@ test('system API exposes persisted snapshot and selected instance detail, retain
   assert.deepEqual((await request('/api/state')).value, { runtime: 'dsh', turns: [], active: null, csrf: 'test-csrf' });
 });
 
+test('topology snapshots use the existing authenticated system read while ordinary reads retain the complete response', async t => {
+  const calls = [];
+  const request = await host(t, { get: async options => {
+    calls.push(options);
+    return { available: true, revision: 3, ...(options?.view === 'topology' ? { view: 'topology' } : { catalogs: { root: { complete: true } } }) };
+  } });
+  const path = '/api/system?view=topology';
+  assert.equal((await request(path, { headers: { 'x-test-session': '' } })).status, 401);
+  assert.equal((await request(path, { headers: { 'sec-fetch-site': 'cross-site' } })).status, 403);
+  assert.equal(calls.length, 0);
+  assert.equal((await request(path)).value.view, 'topology');
+  assert.equal((await request()).value.catalogs.root.complete, true);
+  assert.deepEqual(calls, [{ view: 'topology' }, undefined]);
+});
+
 test('system mutations require same-origin and CSRF before reaching control', async t => {
   let mutations = 0;
   const request = await host(t, { save: async () => { mutations++; return {}; } });

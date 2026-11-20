@@ -298,6 +298,7 @@
 #composition-page .worker-tool-options label { display:flex; align-items:center; gap:8px; font-size:15px; }
 #composition-page .worker-tool-options input { width:17px; height:17px; accent-color:var(--blue); }
 #composition-page .instance-model-fields { border-top:1px solid var(--line); padding-top:18px; }
+#composition-page .instance-model-catalog { grid-column:1/-1; min-width:0; }
 #composition-page .runtime-operation-note { color:var(--muted); font-size:13px; line-height:1.6; margin-top:14px; }
 #composition-page .runtime-query-note { color:var(--muted); font-size:13px; margin-bottom:14px; overflow-wrap:anywhere; }
 #composition-page .runtime-error { margin-bottom:16px; overflow-wrap:anywhere; }

@@ -14,19 +14,53 @@
   const promptsPage = byId('prompts-page');
   const promptsUI = window.jarvisPromptsUI;
   form.inert = true; basicForm.inert = true;
+  // The authenticated DSH page can read its organization graph independently
+  // of the workspace's slower model and conversation initialization.
+  const organizationStartup = compositionUI && location.pathname.startsWith('/jarvis/');
+  function renderStartupRoute() {
+    if (!organizationStartup) return;
+    let requested=location.hash;
+    if (['#settings','#settings/system'].includes(requested)) requested='#settings/organization';
+    else if (/^#settings\/(model|tools|skills)(?:\/.*)?$/.test(requested)) requested='#settings/organization/root/jarvis/'+requested.slice('#settings/'.length);
+    const open=compositionUI.isRoute(requested);
+    if (requested!==location.hash) history.replaceState(null,'',requested);
+    page.hidden=!open; conversation.hidden=open;
+    basicForm.hidden=true; form.hidden=true; capabilitiesPage.hidden=true;
+    compositionPage.hidden=!open;
+    if (logsPage) logsPage.hidden=true;
+    if (promptsPage) promptsPage.hidden=true;
+    if (open) {
+      page.classList.add('organization-settings'); page.querySelector('.settings-rail').hidden=true;
+      page.setAttribute('aria-labelledby','composition-title');
+      compositionUI.render(requested);
+      document.title='组织架构管理 · '+assistantIdentity.name;
+    }
+  }
+  const startupOpen = () => { if (organizationStartup) location.hash='#settings/organization'; };
+  const startupBack = () => { if (organizationStartup) location.hash=''; };
+  window.addEventListener('hashchange',renderStartupRoute);
+  byId('settings-open').addEventListener('click',startupOpen);
+  byId('settings-back').addEventListener('click',startupBack);
+  renderStartupRoute();
   try { await jarvis.ready; } catch { return; }
+  window.removeEventListener('hashchange',renderStartupRoute);
+  byId('settings-open').removeEventListener('click',startupOpen);
+  byId('settings-back').removeEventListener('click',startupBack);
   form.inert = false; basicForm.inert = false;
   const dsh = jarvis.state.runtime === 'dsh';
+  let catalogPicker;
   if (dsh) {
     for (const id of ['setting-protocol', 'setting-key', 'setting-sampling', 'setting-topP', 'setting-retries']) byId(id).closest('label').hidden = true;
     const endpoint = byId('setting-endpoint');
-    endpoint.closest('label').querySelector('span').textContent = '模型服务';
-    const select = document.createElement('select'); select.id = endpoint.id;
-    select.add(new Option('选择模型服务', ''));
-    for (const group of jarvis.state.models.groups) select.add(new Option(group.name, group.id));
-    endpoint.replaceWith(select);
-    byId('setting-model').setAttribute('list', 'dsh-model-list');
-    const list = document.createElement('datalist'); list.id = 'dsh-model-list'; form.append(list);
+    endpoint.type = 'hidden';
+    endpoint.closest('.model-section').hidden = true;
+    const reasoning = byId('setting-reasoning');
+    reasoning.closest('label').hidden = true;
+    const storedEffort = document.createElement('input'); storedEffort.id = reasoning.id; storedEffort.type = 'hidden';
+    reasoning.replaceWith(storedEffort);
+    const model = byId('setting-model'); model.closest('label').hidden = true;
+    const catalog = document.createElement('div'); catalog.id = 'settings-model-catalog'; catalog.className = 'model-field wide';
+    model.closest('.model-fields').prepend(catalog);
     byId('setting-timeout').closest('label').querySelector('span').textContent = '回复时限 · 秒';
     byId('settings-tab-connection').textContent = '模型选择';
     byId('settings-connection').querySelector('h2').textContent = '模型服务';
@@ -74,6 +108,20 @@
   let keyRemoved = false;
   const names = dsh ? ['endpoint', 'model', 'temperature', 'maxTokens', 'reasoning', 'timeout', 'stream'] : [ 'protocol', 'endpoint', 'model', 'sampling', 'temperature', 'topP', 'maxTokens', 'reasoning', 'timeout', 'retries', 'stream'];
   const fields = Object.fromEntries(names.map(name => [name, byId(`setting-${name}`)]));
+  if (dsh) catalogPicker = jarvisModels.mount(byId('settings-model-catalog'), {
+    id: 'setting-model', label: '贾维斯模型',
+    onSelect(next, descriptor) {
+      const reasoning = descriptor.reasoning?.efforts?.some(item => item.id === fields.reasoning.value) ? fields.reasoning.value : 'default';
+      updateDshChoices(next.provider, next.model, reasoning); changed();
+    },
+    onEffort(reasoning) {
+      updateDshChoices(fields.endpoint.value, fields.model.value, reasoning); changed();
+    },
+    async onRefresh() {
+      jarvis.state.models = await jarvis.api('/api/models/refresh', 'POST', { force: true });
+      document.dispatchEvent(new Event('jarvis:catalog-updated'));
+    },
+  });
   const key = byId('setting-key');
   const tabs = [...form.querySelectorAll('[role="tab"]')];
   const defaults = { protocol: 'chat-completions', endpoint: '', model: '', sampling: 'default', temperature: '', topP: '', maxTokens: '', reasoning: 'default', timeout: '120', retries: '2', stream: true };
@@ -156,6 +204,7 @@
       byId('settings-stay').focus(); return;
     }
     if (open && !wasOpen) { loadSaved(); loadBasic(); selectTab(0); }
+    if (!modelPage && catalogPicker?.isOpen) catalogPicker.close(false);
     if (open && organization) organizationReturnRoute=requested;
     currentRoute=requested; byId('settings-unsaved').hidden=true;
     page.hidden=!open; conversation.hidden=open||logsOpen;
@@ -179,12 +228,12 @@
     if(open)byId(titleId)?.focus();else {key.value='';hideKey();if(logsOpen)byId('operation-logs-title')?.focus();else if(wasOpen)byId('settings-open').focus();}
   }
   function validate(draft) {
-    if (!draft.endpoint) return ['endpoint', '请输入服务地址', 0];
+    if (!draft.endpoint) return ['endpoint', dsh ? '请选择模型来源和模型' : '请输入服务地址', 0];
     if (!dsh) try {
       const url = new URL(draft.endpoint);
       if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return ['endpoint', '服务地址须为 HTTP(S) 地址，且不包含凭据、查询参数或片段', 0];
     } catch { return ['endpoint', '请输入有效的服务地址', 0]; }
-    if (!draft.model) return ['model', '请输入模型标识', 0];
+    if (!draft.model) return ['model', dsh ? '请选择模型' : '请输入模型标识', 0];
     const rules = [
       ['temperature', 0, 2, false, 1, dsh ? draft.temperature !== '' : draft.sampling === 'temperature'],
       ['topP', Number.MIN_VALUE, 1, false, 1, !dsh && draft.sampling === 'topP'],
@@ -208,12 +257,10 @@
     setFeedback(isModelDirty() ? '有未保存的修改' : '无未保存的修改');
   }
   function updateDshChoices(provider, model, reasoning) {
-    const group = jarvis.state.models.groups.find(item => item.id === provider);
-    byId('dsh-model-list').replaceChildren(...(group?.models || []).map(item => new Option(item.name, item.id)));
-    const efforts = group?.models.find(item => item.id === model)?.reasoning?.efforts || [];
-    fields.reasoning.replaceChildren(new Option('跟随模型默认', 'default'), ...efforts.map(item => new Option(item.name, item.id)));
-    if (reasoning !== 'default' && !efforts.some(item => item.id === reasoning)) fields.reasoning.add(new Option(reasoning + ' · 当前配置', reasoning));
+    fields.endpoint.value = provider;
+    fields.model.value = model;
     fields.reasoning.value = reasoning;
+    catalogPicker.update(jarvis.state.models, { provider, model, reasoningEffort: reasoning });
   }
   if (dsh) {
     fields.endpoint.addEventListener('change', () => { fields.model.value = ''; updateDshChoices(fields.endpoint.value, '', 'default'); changed(); });
@@ -302,6 +349,7 @@
       if (fields[name].type === 'checkbox') fields[name].checked = defaults[name];
       else fields[name].value = defaults[name];
     }
+    if (dsh) updateDshChoices(fields.endpoint.value, fields.model.value, fields.reasoning.value);
     changed();
   });
   form.addEventListener('submit', async event => {
@@ -311,7 +359,8 @@
     if (error) {
       const [name, message, tab] = error;
       selectTab(tab); fields[name].setAttribute('aria-invalid', 'true');
-      fields[name].focus(); setFeedback(message, true); return;
+      if (dsh && ['endpoint', 'model'].includes(name)) catalogPicker.focus(); else fields[name].focus();
+      setFeedback(message, true); return;
     }
     form.inert = true; saving=true;
     setFeedback('正在保存…');
@@ -332,5 +381,6 @@
   applyAssistantName(jarvis.state.basic.value.assistantName);
   loadSaved();
   loadBasic();
+  if (organizationStartup) selectTab(0);
   renderRoute();
 })();

@@ -133,10 +133,10 @@ const capabilityConflict = message => Object.assign(new Error(message), { status
 
 /** DSH owns this manager; each configured business runtime has its own OS process and durable state. */
 export class ProcessManager {
-  constructor(ctx, config, { conversationModel, preset,
+  constructor(ctx, config, { conversationModel, modelCatalog, preset,
     bridgeFactory = (instance, tool) => new DshBridge(ctx, instance, tool,
       { preset, ...(instance.instanceId === 'root' ? { conversationModel } : {}) }),
-    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, options), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {} } = {}) {
+    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, { ...options, modelCatalog }), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {} } = {}) {
     this.ctx = ctx; this.rootDir = directory(config.rootDir); this.bridgeFactory = bridgeFactory; this.nativeFactory = nativeFactory; this.entry = entry;
     this.instances = configuration(config.instances ?? [], this.rootDir); this.closing = false; this.reconfiguring = false;
     this.capabilityHolds = new Map(); this.foregroundRequests = new Map(); this.capabilitySnapshots = new Map(); this.capabilityOwnerId = randomUUID(); this.capabilityStopsStarted = new Set();

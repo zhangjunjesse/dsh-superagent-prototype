@@ -1,6 +1,7 @@
 import { UserError, parseName } from '../config.mjs';
 import { Store } from '../store.mjs';
 import { ModelDiscovery } from './model-discovery.mjs';
+import { DesktopModels } from './desktop-model-client.mjs';
 import { JarvisGateway, currentInputSource, gatewayToolNames } from './gateway.mjs';
 import { JarvisPrompts } from './prompts.mjs';
 import { brainDirectToolNames, isBrainDirectTool, readCapabilityDefinitions, executeReadCapability } from './read-capabilities.mjs';
@@ -44,7 +45,8 @@ export class JarvisRuntime {
     this.nativeSessionIds = new Set(); this.nativeSessionAgents = new Set(); this.nativeRoots = new Set(); this.nativeSessionRoots = new Map(); this.missingNativeServices = new Set();
     this.nativeUnknownJobs = new Map();
     if (this.lifecycleManaged) this.installNativeServices();
-    this.modelDiscovery = new ModelDiscovery(ctx, config.modelDiscovery);
+    this.desktopModels = config.desktopModels === true ? new DesktopModels(ctx) : undefined;
+    this.modelDiscovery = this.desktopModels ?? new ModelDiscovery(ctx, config.modelDiscovery);
     this.store = new Store(config.dataFile);
     const insert = this.store.db.prepare('INSERT OR IGNORE INTO settings VALUES (?, 0, ?)');
     insert.run('dsh-model', JSON.stringify(defaults));
@@ -423,7 +425,7 @@ export class JarvisRuntime {
     held(); return this.capabilityActivity();
   }
   async ready() {
-    const catalog = await this.ctx.sessionController.modelCatalog();
+    const catalog = this.desktopModels ? await this.desktopModels.start() : await this.ctx.sessionController.modelCatalog();
     const setting = this.model();
     if (!setting.value.endpoint && this.config.initialModel) {
       this.store.save('dsh-model', setting.revision, parseDshModel(this.config.initialModel));
@@ -619,6 +621,10 @@ export class JarvisRuntime {
     return this.store.save('dsh-model', input.revision, value);
   }
   async refreshModels(force = false) {
+    if (this.desktopModels) {
+      await this.desktopModels.refresh(force);
+      return this.desktopModels.catalog();
+    }
     this.idle();
     this.changing = true;
     try { await this.modelDiscovery.refresh(force); return await this.modelDiscovery.catalog(); }
@@ -801,6 +807,7 @@ export class JarvisRuntime {
     await active?.done;
     if (this.agent) await this.agent.whenIdle();
     await this.ctx.sessionPersistence.flush();
+    this.desktopModels?.close();
     this.detach(); this.disposers.reverse().forEach(dispose => dispose()); this.store.close(); this.closed = true;
   }
 }

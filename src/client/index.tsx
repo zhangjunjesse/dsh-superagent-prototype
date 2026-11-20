@@ -14,9 +14,12 @@ import { openKnownSession, SessionNavigationError } from '../navigation.ts'
 import { App } from './app.tsx'
 import { PluginConfig, usePageForm } from './deployment.tsx'
 import { en, zh } from './locales.ts'
+import { ModelPickerContext, type MountModelPicker } from './settings-kit.tsx'
 import type { T } from './text.ts'
+import '../../jarvis/public/model-catalog.js'
 
 type ClientContext = Context & { sessions: ISessions }
+declare global { interface Window { jarvisModels: { mount: MountModelPicker } } }
 const NS = 'dshSuperagent'
 const PANEL_ID = 'dsh-superagent' as MainPanelId
 const ENTRY = 'dsh-superagent'
@@ -42,7 +45,13 @@ function Mounted({ ctx, t }: { ctx: ClientContext; t: T }) {
     }
   }, [ctx, t])
   const form = usePageForm(ctx.get('configForms')?.get<Record<string, unknown>>(ENTRY))
-  return <App t={t} openSession={openSession} deploymentForm={form} />
+  const mountModelPicker = useCallback<MountModelPicker>((host, options) => {
+    const shared = window.jarvisModels
+    return shared.mount(host, Object.assign({ locale: t('lang') }, options))
+  }, [t])
+  return <ModelPickerContext.Provider value={mountModelPicker}>
+    <App t={t} openSession={openSession} deploymentForm={form} />
+  </ModelPickerContext.Provider>
 }
 
 export const inject = ['slots', 'locale', 'sessions', 'uiWorkspace']

@@ -37,7 +37,7 @@ test('live DOM: separate settings, persistence, real message events, context, st
     w.fetch = (url, options) => fetch(new URL(url, origin), options);
     w.TextDecoder = TextDecoder;
     w.matchMedia = () => ({ matches: false });
-    for (const name of ['identity', 'layout', 'model-picker', 'capabilities', 'settings', 'chat']) { const script = w.document.createElement('script'); script.textContent = readFileSync(new URL(name + '.js', root), 'utf8'); w.document.body.append(script); }
+    for (const name of ['identity', 'layout', 'model-catalog', 'model-picker', 'capabilities', 'settings', 'chat']) { const script = w.document.createElement('script'); script.textContent = readFileSync(new URL(name + '.js', root), 'utf8'); w.document.body.append(script); }
     const byId = id => w.document.getElementById(id);
     const input = (name, value) => { const field = byId('setting-' + name); field.value = value; field.dispatchEvent(new w.Event('input', { bubbles: true })); field.dispatchEvent(new w.Event('change', { bubbles: true })); };
     const submit = id => byId(id).dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));

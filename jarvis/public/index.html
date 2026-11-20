@@ -34,18 +34,10 @@
             <label class="sr-only" for="input" id="composer-label">给贾维斯发消息</label>
             <div class="composer-box">
               <textarea id="input" rows="1" placeholder="给贾维斯发消息"></textarea>
-              <section class="model-picker" id="model-picker" role="dialog" aria-labelledby="model-picker-title" hidden>
-                <header><h2 id="model-picker-title">模型与思考</h2><button type="button" class="icon-button" id="model-picker-close" aria-label="关闭模型选择">×</button></header>
-                <label class="quick-model-field" for="quick-model">模型<select id="quick-model"></select></label>
-                <div class="quick-effort-heading" id="quick-effort-title">思考级别</div>
-                <div class="quick-efforts" id="quick-efforts" role="group" aria-labelledby="quick-effort-title"></div>
-                <p class="quick-efforts-empty" id="quick-efforts-empty" hidden>此模型未提供可选级别</p>
-                <p class="model-picker-status" id="model-picker-status" role="status"></p>
-                <footer><button type="button" id="model-picker-settings">完整模型设置 <span aria-hidden="true">↗</span></button><button type="button" id="model-picker-refresh">刷新可选项</button></footer>
-              </section>
+              <div id="quick-model-catalog" hidden></div>
               <div class="composer-actions">
-                <button class="model-indicator" id="composer-model" type="button" title="切换模型与思考级别" aria-haspopup="dialog" aria-expanded="false" aria-controls="model-picker"><span class="model-dot" aria-hidden="true"></span><span id="composer-model-label">选择模型</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>
                 <span class="composer-hint" aria-hidden="true">Shift + Enter 换行</span>
+                <button class="model-indicator" id="composer-model" type="button" title="切换模型与推理等级" aria-haspopup="menu" aria-expanded="false" aria-controls="quick-model-panel"><span id="composer-model-label">选择模型</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
                 <button class="composer-button" id="stop-generation" type="button" aria-label="停止当前回复" title="停止当前回复" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg></button>
                 <button class="composer-button" id="send-message" type="submit" aria-label="发送消息" title="发送消息" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button>
               </div>
@@ -163,6 +155,7 @@
 
 <script src="/identity.js"></script>
 <script src="/layout.js"></script>
+<script src="/model-catalog.js"></script>
 <script src="/model-picker.js"></script>
 <script src="/capabilities.js"></script>
 <script src="/composition.js"></script>

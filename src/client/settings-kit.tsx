@@ -69,11 +69,60 @@ function SwitchRow({ label, hint, checked,
   </div>
 }
 type RoleModel = Settings['eval']['model']
+type Catalog = ApiResponse<'GET models'>
+type ModelChoice = { provider: string; model: string }
+interface ModelPicker {
+  update(catalog: Catalog | undefined, selection: RoleModel): void
+  destroy(): void
+}
+export type MountModelPicker = (host: HTMLElement, options: {
+  id: string; label: string
+  onSelect(choice: ModelChoice, model: Catalog['groups'][number]['models'][number]): void
+  onEffort(id: string): void; onRefresh(): Promise<void>
+}) => ModelPicker
+export const ModelPickerContext = createContext<MountModelPicker | undefined>(undefined)
+
+function CatalogModelField({ id, mount, value, catalog, onChange, refresh }: {
+  id: string; mount: MountModelPicker; value: RoleModel; catalog?: Catalog
+  onChange: (value: RoleModel) => void; refresh: () => Promise<void>
+}) {
+  const { t } = usePanel()
+  const label = t('modelName'), host = useRef<HTMLDivElement>(null), picker = useRef<ModelPicker>()
+  const selected = value ?? catalog?.default ?? null
+  const callbacks = useRef({ selected, onChange, refresh })
+  useLayoutEffect(() => { callbacks.current = { selected, onChange, refresh } }, [selected, onChange, refresh])
+  useLayoutEffect(() => {
+    if (!host.current) return
+    picker.current = mount(host.current, {
+      id, label,
+      onSelect(choice, model) {
+        const { selected, onChange } = callbacks.current
+        const effort = selected?.reasoningEffort
+        onChange(effort && model.reasoning?.efforts.some(item => item.id === effort) ? { ...choice, reasoningEffort: effort } : choice)
+      },
+      onEffort(effort) {
+        const { selected, onChange } = callbacks.current
+        if (!selected) return
+        const choice = { provider: selected.provider, model: selected.model }
+        onChange(effort === 'default' ? choice : { ...choice, reasoningEffort: effort })
+      },
+      onRefresh: () => callbacks.current.refresh(),
+    })
+    return () => { picker.current?.destroy(); picker.current = undefined }
+  }, [id, mount, label])
+  useLayoutEffect(() => { picker.current?.update(catalog, selected) }, [id, mount, label, catalog, selected])
+  return <><div ref={host} />{value && <Button size="sm" onClick={() => onChange(null)}>{t('modelInherit')}</Button>}</>
+}
 export function ModelField({ id, value, onChange }: { id: string; value: RoleModel; onChange: (next: RoleModel) => void }) {
   const { t, call } = usePanel()
+  const mount = useContext(ModelPickerContext)
   const [catalog, setCatalog] = useState<ApiResponse<'GET models'>>()
   const [error, setError] = useState<string>()
-  useEffect(() => { call('GET models').then(setCatalog, failure => setError(errorText(failure))) }, [call])
+  useEffect(() => {
+    let active = true
+    call('GET models').then(data => { if (active) { setCatalog(data); setError(undefined) } }, failure => { if (active) setError(errorText(failure)) })
+    return () => { active = false }
+  }, [call])
   const current = { provider: value?.provider ?? '', model: value?.model ?? '', effort: value?.reasoningEffort ?? '' }
   const set = (next: Partial<typeof current>) => {
     const { provider, model, effort } = { ...current, ...next }
@@ -81,25 +130,31 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
   }
   const models = catalog?.groups.find(group => group.id === current.provider.trim())?.models ?? []
   const fallback = catalog?.default
+  const listPrefix = mount ? id + '-manual' : id
   const input = (name: keyof typeof current, label: string, placeholder: string) => <Field label={label}>
-    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
+    <Input list={`${listPrefix}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
       onChange={event => set({ [name]: event.target.value })} />
   </Field>
-  return <div className="dt-model">
-    <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
-      ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
-    {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
+  const manual = <>
     <div className="dt-grid3">
       {input('provider', t('modelProvider'), t('modelInherit'))}{input('model', t('modelName'), t('modelInherit'))}{input('effort',
         t('modelEffort'), t('modelEffortDefault'))}
     </div>
-    <datalist id={`${id}-providers`}>{catalog?.groups.map(group => <option key={group.id}
+    <datalist id={`${listPrefix}-providers`}>{catalog?.groups.map(group => <option key={group.id}
       value={group.id}>{group.name}</option>)}</datalist>
-    <datalist id={`${id}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
-    <datalist id={`${id}-efforts`}>
+    <datalist id={`${listPrefix}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
+    <datalist id={`${listPrefix}-efforts`}>
       {(models.find(model => model.id === current.model.trim())?.reasoning?.efforts ?? []).map(effort => <option key={effort.id}
         value={effort.id}>{effort.name}</option>)}
     </datalist>
+  </>
+  return <div className="dt-model">
+    <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
+      ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
+    {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
+    {mount ? <><CatalogModelField id={id} mount={mount} catalog={catalog} value={value} onChange={onChange}
+      refresh={async () => { setCatalog(await call('GET models')); setError(undefined) }} />
+      <details><summary>{t('modelManualEntry')}</summary>{manual}</details></> : manual}
   </div>
 }
 

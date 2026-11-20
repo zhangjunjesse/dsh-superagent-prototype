@@ -1,5 +1,11 @@
 # SuperJarvis 项目约束与协作依据
 
+## 桌面入口与模型目录（2026-11-20）
+
+日常 DSH 桌面通过 `jarvis/dsh/desktop-entry/` 打开已有的 4318 服务。桌面入口的 `shareModels: true` 与 4318 Jarvis 的 `desktopModels: true` 配合使用。可选模型读取桌面官方 `sessionController.modelCatalog()`。4318 保存独立的桌面来源键，推理交回该桌面的 DSH 模型服务；历史 4318 模型继续由原服务处理。配置方法见 [DSH 接入记录](jarvis/DSH-INTEGRATION.md)。
+
+组织图可通过只读的 `GET /jarvis/api/system?view=topology` 先读取组织及进程状态，完整设置沿用原管理接口。相关专项为 `node --test jarvis/organization-loading.test.mjs jarvis/model-catalog.test.mjs jarvis/dsh/desktop-model-client.test.mjs`。具体部署版本以两个宿主的实际回执为准。
+
 更新日期：2026-11-18（北京时间）。本文件记录用户已确认的方向、由本轮授权固化的协作原则及已核实的项目事实。后续明确决策应同步更新对应条目，不把推测记录成事实。
 
 ## 用户硬约束：禁止一切简化（2026-11-16）

@@ -6,6 +6,7 @@ import { zh, en } from './locales.ts'
 import { PanelProvider, usePanel, usePanelData, type DraftActivity } from './provider.tsx'
 import { SETTINGS_GROUPS, type Route, type SettingsGroup } from './route.ts'
 import { SettingsPage } from './settings.tsx'
+import { ModelPickerContext, type MountModelPicker } from './settings-kit.tsx'
 import type { T } from './text.ts'
 import { LoadState, SessionButton } from './widgets.tsx'
 import { WorkerCapabilities } from './worker-capabilities.tsx'
@@ -16,6 +17,7 @@ export interface OrganizationSettingsOptions {
   onNavigate: (location: OrganizationSettingsLocation) => void
   onDraftStateChange?: (activity: { dirty: boolean; busy: boolean }) => void
   openSession?: (id: string) => Promise<void>; locale?: 'zh' | 'en'
+  mountModelPicker?: MountModelPicker
 }
 export interface OrganizationSettingsController {
   update: (location: OrganizationSettingsLocation) => void
@@ -60,7 +62,9 @@ export function mountSuperagentSettings(container: HTMLElement, options: Organiz
   const render = (location: OrganizationSettingsLocation) => {
     if (!mounted || !SETTINGS_GROUPS.includes(location.group)) return
     root.render(<PanelProvider t={t} apiScope={apiScope} navigate={navigate} openSession={openSession} portalRoot={portals}
-      onDraftStateChange={changed}><OrganizationPage location={{ ...location }} /></PanelProvider>)
+      onDraftStateChange={changed}><ModelPickerContext.Provider value={options.mountModelPicker}>
+        <OrganizationPage location={{ ...location }} />
+      </ModelPickerContext.Provider></PanelProvider>)
   }
   render(options.location)
   return { update: render, isDirty: () => activity.dirty, isBusy: () => activity.busy,

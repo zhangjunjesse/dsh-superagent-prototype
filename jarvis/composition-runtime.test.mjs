@@ -6,7 +6,7 @@ import { JSDOM } from 'jsdom';
 
 const publicRoot=new URL('./public/',import.meta.url);
 const html=readFileSync(new URL('index.html',publicRoot),'utf8');
-const source=readFileSync(new URL('composition.js',publicRoot),'utf8');
+const source=['model-catalog.js','composition.js'].map(file=>readFileSync(new URL(file,publicRoot),'utf8')).join('\n');
 const storageKey='superjarvis.composition.draft.v1';
 const model={provider:'fixture-provider',model:'fixture-model',reasoningEffort:'max'};
 const instance=(id='root',parent=null)=>({id,parent,kind:parent?'instance':'root',name:id==='root'?'真实根实例':id,brainName:'贾维斯',description:id+' 的职责',capabilities:'只读分析',concurrency:3,workerTools:['read','glob','grep'],workspace:'D:/fixture/'+id,redelegate:!parent,model:{...model}});

@@ -491,3 +491,128 @@ test('a no-catalog control validates only the currently saved host model and pre
   writeFileSync(control.file, saved);
   const reopened = new SystemControl({}, config); await reopened.close();
 });
+
+test('topology snapshots read saved organizations and live process state without waking settings or capability inspection', async t => {
+  let catalogReads = 0, settingsReads = 0;
+  const control = new SystemControl({}, options({ capabilityCatalog: async () => {
+    catalogReads++; return { tools: ['read', 'glob', 'grep'].map(name => ({ name, available: true })), skills: [], complete: true };
+  } }));
+  t.after(() => control.close());
+  const saved = await setup(control), before = readFileSync(control.file, 'utf8');
+  for (const node of saved.nodes) {
+    const directory = control.stateDirectory(node.id); mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'orchestrator.sqlite'), 'fixture management authority');
+  }
+  control.manager.management = async () => { settingsReads++; throw new Error('Slow original settings are unavailable'); };
+  catalogReads = 0; control.catalogCache.clear();
+  const snapshot = await control.get({ view: 'topology' });
+  assert.equal(snapshot.view, 'topology');
+  assert.deepEqual(snapshot.nodes, saved.nodes.map(({ execution, executionError, ...node }) => node));
+  assert.deepEqual(snapshot.runtime, control.manager.status());
+  assert.equal(snapshot.revision, saved.revision);
+  assert.equal(snapshot.configured, true);
+  assert.equal(settingsReads, 0, 'opening topology must not start original management owners');
+  assert.equal(catalogReads, 0, 'opening topology must not scan tools and skills');
+  assert.deepEqual(snapshot.catalogs, {});
+  assert.equal(readFileSync(control.file, 'utf8'), before);
+});
+
+test('full organization reads overlap independent settings and share only concurrent read-only capability inspection', async t => {
+  let inspected = [], settings = [], slow = false, release;
+  const held = new Promise(resolve => { release = resolve; });
+  const control = new SystemControl({}, options({ capabilityCatalog: async directory => {
+    if (slow) { inspected.push(directory); await held; }
+    return { tools: ['read', 'glob', 'grep'].map(name => ({ name, available: true })), skills: [{ name: directory }], complete: true };
+  } }));
+  t.after(async () => { release(); await control.close(); });
+  const saved = await setup(control, [child(), child({ id: 'writing', name: '写作' })]);
+  for (const node of saved.nodes) {
+    const directory = control.stateDirectory(node.id); mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'orchestrator.sqlite'), 'fixture management authority');
+  }
+  control.manager.management = async id => {
+    settings.push(id);
+    await new Promise(resolve => setImmediate(resolve));
+    return { status: 200, body: { blocks: { eval: { revision: 2, value: { model: defaultModel } },
+      executor: { revision: 3, value: { model: defaultModel, maxWorkers: 5 } } },
+      environment: { root: saved.nodes.find(node => node.id === id).workspace } } };
+  };
+  slow = true; control.catalogCache.clear();
+  const first = control.get(), second = control.get();
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const expectedIds = saved.nodes.map(node => node.id);
+  assert.deepEqual([...new Set(settings)].sort(), [...expectedIds].sort(), 'slow first organization must not prevent reading the others');
+  assert.deepEqual(inspected.sort(), saved.nodes.map(node => node.workspace).sort(), 'two page readers share one in-flight scan per directory');
+  release();
+  const [left, right] = await Promise.all([first, second]);
+  assert.deepEqual(left, right);
+  assert.deepEqual(left.nodes.map(node => node.id), expectedIds, 'parallel completion preserves the configured organization order');
+  assert.ok(left.nodes.every(node => node.execution.maxWorkers === 5));
+  assert.equal(Object.keys(left.catalogs).length, expectedIds.length);
+  left.catalogs.root.skills.length = 0;
+  assert.equal(right.catalogs.root.skills.length, 1, 'shared scans never share mutable response objects');
+});
+
+test('save and start validate fresh capabilities even when a page read is pending or cached', async t => {
+  let mode = 'available', release;
+  const held = new Promise(resolve => { release = resolve; });
+  const control = new SystemControl({}, options({ capabilityCatalog: async () => {
+    const observed = mode;
+    if (observed === 'holding') await held;
+    return { tools: ['read', 'glob', 'grep'].map(name => ({ name, available: observed !== 'unavailable' })), skills: [], complete: true };
+  } }));
+  t.after(async () => { release(); await control.close(); });
+  const saved = await setup(control, []);
+  mode = 'holding'; control.catalogCache.clear();
+  const reading = control.get();
+  await new Promise(resolve => setImmediate(resolve));
+  mode = 'unavailable';
+  // Release even on a broken implementation so the test reports the authorization error instead of hanging.
+  const timer = setTimeout(release, 500);
+  try { await rejectsStatus(control.save({ revision: saved.revision, nodes: saved.nodes }), 400); }
+  finally { clearTimeout(timer); release(); }
+  await reading;
+  await rejectsStatus(control.action('root', 'start', saved.revision), 400);
+  assert.equal(control.revision, saved.revision);
+  assert.equal(control.manager.status().instances[0].pid, null);
+});
+
+test('a failed shared capability read remains retryable and never substitutes a fabricated catalog', async t => {
+  let failing = false;
+  const control = new SystemControl({}, options({ capabilityCatalog: async () => {
+    if (failing) throw new Error('private catalog failure');
+    return { tools: ['read', 'glob', 'grep'].map(name => ({ name, available: true })), skills: [{ name: 'actual-skill' }], complete: true };
+  } }));
+  t.after(() => control.close());
+  await setup(control, []); control.catalogCache.clear(); failing = true;
+  const unavailable = await control.get();
+  assert.equal(unavailable.catalogs.root.complete, false);
+  assert.deepEqual(unavailable.catalogs.root.tools, []);
+  assert.doesNotMatch(JSON.stringify(unavailable), /private catalog failure/);
+  failing = false;
+  const recovered = await control.get();
+  assert.equal(recovered.catalogs.root.complete, true);
+  assert.equal(recovered.catalogs.root.skills[0].name, 'actual-skill');
+});
+
+test('large graphs bound concurrent capability work while retaining every complete organization result', async t => {
+  let slow = false, active = 0, peak = 0, entered = 0, release;
+  const held = new Promise(resolve => { release = resolve; });
+  const control = new SystemControl({}, options({ capabilityCatalog: async () => {
+    if (slow) { active++; entered++; peak = Math.max(peak, active); try { await held; } finally { active--; } }
+    return { tools: ['read', 'glob', 'grep'].map(name => ({ name, available: true })), skills: [], complete: true };
+  } }));
+  t.after(async () => { release(); await control.close(); });
+  const saved = await setup(control, ['first', 'second', 'third', 'fourth', 'fifth'].map(id => child({ id, name: id })));
+  slow = true; control.catalogCache.clear();
+  const pending = control.get();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(entered, 4);
+  release();
+  const snapshot = await pending;
+  assert.equal(peak, 4);
+  assert.deepEqual(snapshot.nodes.map(node => node.id), saved.nodes.map(node => node.id));
+  assert.equal(Object.keys(snapshot.catalogs).length, saved.nodes.length);
+  assert.ok(Object.values(snapshot.catalogs).every(catalog => catalog.complete));
+});

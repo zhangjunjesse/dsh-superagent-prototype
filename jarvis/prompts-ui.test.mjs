@@ -52,7 +52,7 @@ async function open(t, { hash = route, runtime = 'dsh', capability = true, activ
   };
   w.addEventListener('error', event => { errors.push(String(event.error || event.message)); event.preventDefault(); });
   t.after(() => { w.jarvisPromptsUI?.leave(); w.operationLogsUI?.leave(); w.close(); assert.deepEqual(errors, []); });
-  for (const file of ['identity', 'layout', 'model-picker', 'capabilities', 'composition', 'dsh-tools', 'operation-logs', 'prompts', 'settings', 'chat']) {
+  for (const file of ['identity', 'layout', 'model-catalog', 'model-picker', 'capabilities', 'composition', 'dsh-tools', 'operation-logs', 'prompts', 'settings', 'chat']) {
     const script = d.createElement('script'); script.textContent = readFileSync(new URL(file + '.js', publicRoot), 'utf8'); d.body.append(script);
   }
   const id = name => d.getElementById(name);
@@ -89,10 +89,22 @@ test('only DSH with the explicit capability exposes the prompt tab; unsupported 
 });
 
 test('child and Router settings never expose or read root prompt management', async t => {
-  const ui = await open(t, { hash: '#settings/organization/child/router' });
-  await until(() => !ui.id('composition-page').hidden && ui.d.querySelector('#unit-form'), 'child settings');
-  assert.equal(ui.id('prompts-page').hidden, true); assert.equal(ui.promptRequests().length, 0);
-  assert.equal(ui.d.querySelector('#composition-main a[href="' + route + '"]'), null);
+  const ui = await open(t, { hash: '#settings/organization/child/jarvis' });
+  await until(() => !ui.id('composition-page').hidden && ui.id('brain-model-toggle'), 'child model settings');
+  const checkScope = () => {
+    assert.equal(ui.id('prompts-page').hidden, true); assert.equal(ui.promptRequests().length, 0);
+    assert.equal(ui.d.querySelector('#composition-main a[href="' + route + '"]'), null);
+  };
+  checkScope();
+  let engine;
+  ui.w.superagentSettings = { mountSuperagentSettings(_host, options) {
+    engine = options;
+    return { update() {}, isDirty: () => false, isBusy: () => false, discard() {}, unmount() {} };
+  } };
+  await ui.go('#settings/organization/child/router');
+  await until(() => engine?.instanceId === 'child' && engine.location.group === 'eval', 'child Router engine settings');
+  assert.equal(ui.id('superagent-engine-host').hidden, false);
+  checkScope();
 });
 
 test('saving preserves text exactly, sends its revision and CSRF and works during an active conversation', async t => {

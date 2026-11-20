@@ -9,7 +9,7 @@ import { createApp } from './server.mjs';
 
 const publicRoot = new URL('./public/', import.meta.url);
 const html = readFileSync(new URL('index.html', publicRoot), 'utf8');
-const files = ['identity', 'layout', 'model-picker', 'capabilities', 'composition', 'settings', 'chat'];
+const files = ['identity', 'layout', 'model-catalog', 'model-picker', 'capabilities', 'composition', 'settings', 'chat'];
 const scripts = files.map(file => readFileSync(new URL(file + '.js', publicRoot), 'utf8'));
 const legacyDraft = {version:1,nodes:[
   {id:'root',parent:null,kind:'root',name:'集团中枢',description:'统一接收目标，协调交付。',capabilities:'目标协调、结果交付',mode:'local',concurrency:3,depth:2,model:'follow',workspace:'',endpoint:'',credential:'',scope:'',redelegate:true,recovery:true,autostart:false},
@@ -279,11 +279,12 @@ test('new settings code continues to support an already-open index without compo
 
 const organizationRoute='#settings/organization';
 const engineFixture = prefix => ({prompts:Object.fromEntries(['router','worker','communication','scope','delivery'].map(key=>[key,prefix+' '+key+' guidance']))});
-async function openOrganization(t, hash='#settings/model', { systemUnavailable=false, engineAvailable=true, reorderedModel=false, workerTools=['read'], workerSkills=[], runtimeInstances=[], draft } = {}) {
+async function openOrganization(t, hash='#settings/model', { systemUnavailable=false, engineAvailable=true, reorderedModel=false, workerTools=['read'], workerSkills=[], runtimeInstances=[], draft, modelCatalog } = {}) {
   const roleModel={provider:'provider',model:'execution-model',reasoningEffort:'max'};
   const instance=(id,parent=null)=>({id,parent,kind:parent?'instance':'root',name:parent?'研发':'集团中枢',brainName:'旧名称',description:'组织职责',capabilities:'开发',concurrency:3,workerTools:[...workerTools],workerSkills:[...workerSkills],workspace:'D:/fixture/'+id,redelegate:!parent,model:{...roleModel},roleModels:{router:{...roleModel},worker:{...roleModel}},engine:engineFixture(id)});
   const backend={state:{runtime:'dsh',csrf:'fixture',basic:{revision:1,value:{assistantName:'贾维斯'}},model:{revision:2,hasKey:false,value:{endpoint:'provider',model:'chat-model',temperature:'',maxTokens:'',reasoning:'max',timeout:'120',stream:true}},models:{groups:[{id:'provider',name:'已连接服务',models:[{id:'chat-model',name:'对话模型',reasoning:{efforts:[{id:'max',name:'Max'},{id:'low',name:'Low'}]}},{id:'execution-model',name:'执行模型'}]}]},turns:[],active:null},system:{available:true,configured:true,revision:3,rootId:'root',nodes:[instance('root'),instance('child','root')],defaults:{model:{...roleModel},workerTools:['read']},catalogs:{root:{complete:true,tools:[{name:'read',label:'读取文件',available:true,group:'文件'}],skills:[{name:'review-code',description:'代码审查'}]}},runtime:{hostPid:100,instances:[]}},tools:{revision:1,tools:[{name:'read',description:'读取指定文件',parameters:{},allowed:true}]},hook:null};
   const dom=new JSDOM(html,{url:'http://organization.invalid/jarvis/'+hash,runScripts:'dangerously',pretendToBeVisual:true});
+  if(modelCatalog)backend.state.models=structuredClone(modelCatalog);
   backend.state.tasksAvailable=true;
   backend.system.runtime.instances=structuredClone(runtimeInstances);
   backend.systemUnavailable=systemUnavailable;
@@ -315,6 +316,7 @@ async function openOrganization(t, hash='#settings/model', { systemUnavailable=f
     if(path==='/api/system'&&backend.systemUnavailable)return Response.json({error:'运行服务暂不可用'},{status:503});
     if(backend.hook){const result=await backend.hook({path,method,body,query:new URL(url,w.location.href).searchParams});if(result)return result;}
     if(path==='/api/tasks')return Response.json({organizations:backend.system.nodes.map(n=>({instanceId:n.id,items:[],nextCursor:null,availability:'live'}))});
+    if(path==='/api/models/refresh'&&method==='POST')return Response.json(backend.state.models);
     const preview=/^\/api\/system\/([^/]+)\/prompts\/preview$/.exec(path);
     if(preview&&method==='POST'){
       assert.equal(body.revision,backend.system.revision);assert.ok(['router','worker'].includes(body.role));
@@ -333,7 +335,7 @@ async function openOrganization(t, hash='#settings/model', { systemUnavailable=f
   };
   w.addEventListener('error',event=>{errors.push(String(event.error||event.message));event.preventDefault();});
   t.after(()=>{w.close();assert.deepEqual(errors,[]);});
-  for(const file of ['identity','capabilities','composition','dsh-tools','settings']){
+  for(const file of ['identity','model-catalog','capabilities','composition','dsh-tools','settings']){
     const script=d.createElement('script');script.textContent=readFileSync(new URL(file+'.js',publicRoot),'utf8');d.body.append(script);
   }
   const id=name=>d.getElementById(name);
@@ -747,4 +749,65 @@ test('node metadata saves omit read-only execution projections and preserve init
   for(const item of saved.body.nodes){assert.equal(Object.hasOwn(item,'execution'),false);assert.equal(Object.hasOwn(item,'executionError'),false);}
   assert.equal(ui.backend.system.nodes[0].concurrency,original.concurrency);assert.deepEqual(ui.backend.system.nodes[0].roleModels,original.roleModels);
   assert.equal(ui.backend.execution.root.maxWorkers,7);assert.equal(ui.backend.system.nodes[0].name,'组织新名称');
+});
+
+const desktopModelCatalog=()=>({refreshable:true,groups:[
+  {id:'desktop:first-fixture',desktopProvider:'first-fixture',name:'订阅模型来源',models:[{id:'same-model',name:'相同显示名称',description:'原始模型说明',reasoning:{efforts:[{id:'low',name:'Low'},{id:'max',name:'Max'}]}}]},
+  {id:'desktop:second-fixture',desktopProvider:'second-fixture',name:'API 模型来源',models:[{id:'same-model',name:'相同显示名称',badge:{text:'API',tone:'info'},reasoning:{efforts:[{id:'low',name:'Low'}]}}]},
+  {id:'desktop:other',name:'其他来源',models:['a','b','c'].map(id=>({id,name:id}))},
+]});
+
+test('root Jarvis model picker searches desktop sources, saves the exact provider pair and retains other role settings',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/root/jarvis/model',{modelCatalog:desktopModelCatalog()});
+  const roles=structuredClone(ui.backend.system.nodes.map(node=>node.roleModels));
+  ui.id('setting-model-toggle').click();ui.id('setting-model-model-entry').click();
+  const picker=ui.id('setting-model-panel');
+  ui.input('setting-model-search','first-fixture');
+  assert.equal(ui.id('setting-model-results').querySelectorAll('[role="option"]').length,1);
+  assert.equal(ui.id('setting-model-results').querySelector('[role="option"]').dataset.provider,'desktop:first-fixture');
+  assert.equal(ui.id('settings-save').disabled,true,'search is not a configuration edit');
+  ui.input('setting-model-search','');
+  picker.querySelector('[data-provider="desktop:second-fixture"]').click();
+  assert.equal(ui.id('setting-endpoint').value,'desktop:second-fixture');
+  assert.equal(ui.id('setting-model').value,'same-model');
+  assert.equal(ui.id('setting-reasoning').value,'default','an unsupported old level is not copied to the other provider');
+  ui.id('setting-model-toggle').click();ui.id('setting-model-effort-entry').click();
+  picker.querySelector('[data-effort="low"]').click();
+  assert.equal(ui.id('setting-reasoning').value,'low');
+  assert.equal(ui.backend.state.model.value.endpoint,'provider','selection remains a draft until Save');
+  ui.input('setting-timeout','150');ui.submit('settings-form');
+  await until(()=>ui.backend.state.model.revision===3&&!ui.id('settings-form').inert,'desktop model saved');
+  assert.equal(ui.backend.state.model.value.endpoint,'desktop:second-fixture');
+  assert.equal(ui.backend.state.model.value.reasoning,'low');
+  assert.equal(ui.backend.state.model.value.model,'same-model');assert.equal(ui.backend.state.model.value.timeout,'150');
+  assert.deepEqual(ui.backend.system.nodes.map(node=>node.roleModels),roles);
+  assert.doesNotMatch(picker.textContent,/desktop:/,'internal routing prefixes are not model source labels');
+  ui.input('setting-timeout','180');ui.backend.state.models={groups:[],available:false,refreshable:true,status:'桌面暂未连接'};
+  if(ui.id('setting-model-panel').hidden)ui.id('setting-model-toggle').click();
+  ui.id('setting-model-model-entry').click();
+  picker.querySelector('.model-catalog-refresh').click();
+  await until(()=>picker.querySelector('.model-catalog-feedback').textContent==='桌面暂未连接','offline catalog read');
+  assert.equal(ui.id('setting-model-results').querySelectorAll('[role="option"]').length,0);
+  assert.match(picker.querySelector('.model-catalog-warning').textContent,/保留当前配置/);
+  assert.equal(ui.id('setting-endpoint').value,'desktop:second-fixture');assert.equal(ui.id('setting-model').value,'same-model');
+  assert.equal(ui.id('setting-timeout').value,'180','a catalog refresh preserves unrelated form drafts');
+  assert.equal(ui.backend.state.model.value.timeout,'150');
+});
+
+test('child Jarvis model search does not dirty the organization and its saved desktop selection stays isolated from Router, Worker and chat',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/child/jarvis',{modelCatalog:desktopModelCatalog()});
+  await until(()=>ui.id('brain-model-toggle'),'child model picker');
+  const original=structuredClone(ui.backend.system.nodes.find(node=>node.id==='child'));
+  const chat=structuredClone(ui.backend.state.model);
+  ui.id('brain-model-toggle').click();ui.id('brain-model-model-entry').click();ui.input('brain-model-search','相同显示名称');
+  assert.equal(ui.w.compositionUI.isDirty(),false);
+  const picker=ui.id('brain-model-panel');assert.equal(ui.id('brain-model-results').querySelectorAll('[role="option"]').length,2);
+  picker.querySelector('[data-provider="desktop:first-fixture"]').click();
+  assert.equal(ui.w.compositionUI.isDirty(),true);
+  assert.equal(ui.id('field-brainModelProvider').value,'desktop:first-fixture');assert.equal(ui.id('field-brainModelId').value,'same-model');
+  assert.equal(ui.id('field-brainReasoningEffort').value,'max','the supported level stays exact');
+  ui.submit('unit-form');await until(()=>ui.backend.system.revision===4&&!ui.id('unit-form'),'child model saved');
+  const saved=ui.backend.system.nodes.find(node=>node.id==='child');
+  assert.deepEqual(saved.model,{provider:'desktop:first-fixture',model:'same-model',reasoningEffort:'max'});
+  assert.deepEqual(saved.roleModels,original.roleModels);assert.deepEqual(ui.backend.state.model,chat);
 });

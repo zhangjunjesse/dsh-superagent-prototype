@@ -1,5 +1,28 @@
 # Jarvis DSH 接入记录
 
+## 日常桌面入口（2026-11-20）
+
+桌面导航插件源码位于 `jarvis/dsh/desktop-entry/`。入口面向带原生浏览器服务的官方 DeepSeek Harness Desktop，在主工作区显示「贾维斯」。点击入口时，桌面宿主检查既有 4318 服务及进程身份，通过短时、一次性的本机跳转完成 DSH 登录。桌面切换面板时保留页面和草稿。需要新窗口或下载时，点击「在浏览器打开」，在网页侧栏选择「贾维斯」。
+
+模型、会话、集团和下级工单继续使用 4318 的原有数据。服务离线时先启动原有 Jarvis 服务，再点入口中的「重试连接」。
+
+在其他电脑安装入口时，先在日常 `desktop` profile 下建 `local-plugins/superjarvis-desktop-entry/`，把源码目录里的 `package.json`、`index.mjs`、`client.js`、`model-host.mjs` 和 `model-protocol.mjs` 复制进去。将下面这项追加到该 profile 的 `cordis.patch.yml`，把 `homePath` 换成那台电脑现有 Jarvis 服务的 DSH_HOME 绝对路径。下次打开桌面时会加载插件。
+
+```yaml
+- insert:
+    - id: superjarvis-desktop-entry
+      name: ./local-plugins/superjarvis-desktop-entry/index.mjs
+      config:
+        shareModels: true
+        homePath: D:/Documents/ChatGPT/SuperJarvis/dsh-superagent-prototype/.artifacts/jarvis-dsh/home
+```
+
+使用桌面模型时，在 4318 的 Jarvis 插件配置中设置 `desktopModels: true`。桌面通过 DSH 的模型目录提供分组、模型和推理强度，实际请求也由该桌面的模型服务执行。模型更改后可以在贾维斯里刷新。相同名字、不同来源的模型可以分别选择。原有 4318 模型配置保留，已使用这些模型的历史会话和组织可以继续使用原来的路由。
+
+在聊天输入框的发送键旁点击当前模型，可以打开「模型」和「推理等级」菜单。模型按 DSH 来源分组，目录超过四项时可搜索；勾选表示当前来源下选中的模型。聊天里的选择从下一条消息生效。集团、下级贾维斯和任务引擎的评估、执行设置使用相同的菜单，点击对应表单的保存按钮后生效。
+
+使用桌面模型的任务需要桌面 DSH 运行。两端在本机通信，模型提供商的密钥由桌面保管。关闭桌面后，模型选择器会提示重新连接。Windows 下机器本地的连接登记位于当前用户的 LocalAppData 下，切换电脑时由新的桌面进程重新建立。
+
 ## 当前状态（2026-11-13）
 
 本机独立 4318 DSH Web profile 已从最初的 Jarvis 会话接入扩展为完整 superagent／Gateway／Jarvis 部署。侧栏“贾维斯”仍是用户入口，Jarvis 使用独立用户 Session，通过高层工具交办和只读查询，后台结果通过同一对话返回。包内 Gateway、Jarvis 后端、预设和面板仍默认关闭；新环境必须显式配置并完成底座 Setup 与来源授权。
@@ -61,7 +84,7 @@ node jarvis/dsh/setup-local.mjs <新的绝对DSH_HOME> <已安装的DSH包目录
 
 侧栏通过 `sidebar.panellist` 注册，主工作区使用 `main` 扩展槽。DSH 在切换主面板时卸载 `main` 内容，因此同源 iframe 放在宿主持续存在的 `shell.overlay` 槽中，跟随 `main` 占位元素的实际尺寸，离开时隐藏。首次打开才加载；切换不会卸载页面、重发请求或丢失未保存草稿。关闭/刷新整个 DSH 页面仍会卸载 iframe；未保存草稿不承诺跨整页刷新保留，已保存设置和对话由后端恢复。
 
-仅验证 DSH Web 宿主，日常桌面 DSH 尚未安装。桌面 file/IPC 宿主若不提供同源 HTTP 服务，需要另核对其承载接口，不能把当前 Web 接入声明为已完成桌面兼容。
+2026-11-12 的验收范围是 DSH Web 宿主。后续日常桌面使用单独的导航插件，见文首「日常桌面入口」。
 
 启动配置读取改用已安装 DSH 的 `entryListSchema`。原因是 DSH 可以将原 JSON 配置保存为 YAML；只调用 `JSON.parse` 会使后续启动失败。解析不执行 `!!js`，端点与凭据绑定仍在启动前检查。独立 profile 转为 YAML 后实际重启通过，记录为 `navigation-yaml-restart.json`。
 

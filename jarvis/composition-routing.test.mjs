@@ -8,7 +8,7 @@ import { createApp } from './server.mjs';
 import { apply } from './dsh/index.mjs';
 
 const publicRoot = new URL('./public/', import.meta.url);
-const assetTypes = { 'composition.html': 'text/html', 'composition.css': 'text/css', 'composition.js': 'text/javascript' };
+const assetTypes = { 'composition.html': 'text/html', 'composition.css': 'text/css', 'composition.js': 'text/javascript', 'model-catalog.js': 'text/javascript' };
 const temporaryState = () => mkdtempSync(join(tmpdir(), 'jarvis-composition-route-'));
 function removeState(directory) {
   assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
@@ -34,6 +34,9 @@ function assertNavigation(html, pageUrl) {
     const compositionIndex = scripts.findIndex(path => path.endsWith('/composition.js'));
     assert.ok(compositionIndex >= 0 && compositionIndex < scripts.findIndex(path => path.endsWith('/settings.js')),
       'the component API is available when the settings router initializes');
+    const catalogIndex = scripts.findIndex(path => path.endsWith('/model-catalog.js'));
+    assert.ok(catalogIndex >= 0 && catalogIndex < compositionIndex && catalogIndex < scripts.findIndex(path => path.endsWith('/model-picker.js')),
+      'the shared catalog is loaded before conversation and organization model pickers');
   } finally { dom.window.close(); }
 }
 

@@ -1,6 +1,6 @@
 # Jarvis
 
-当前入口在 DSH 主界面：打开 `./jarvis/dsh/start.ps1` 输出的本地认证地址，点击侧栏“贾维斯”。已认证浏览器可直接访问 `http://127.0.0.1:4318/`；`/jarvis/` 是被主工作区嵌入的页面。配置映射、工具权限与安装见 [DSH 接入记录](./DSH-INTEGRATION.md)。当前独立 DSH Web profile 已部署完整 superagent、Gateway 和 Jarvis，未改日常桌面配置。
+桌面 DSH 的「贾维斯」入口连接本机现有的 4318 服务，沿用同一套组织、对话、工单与交付文件。服务启动后，点击桌面侧栏即可进入。也可在浏览器打开 `./jarvis/dsh/start.ps1` 输出的本地认证地址，从网页侧栏进入。桌面入口和部署方式见 [DSH 接入记录](./DSH-INTEGRATION.md)。
 
 DSH 插件版支持真实设置、对话、工具管理，以及通过 `jarvis_work_submit`／`jarvis_work_query` 异步交办、查询和接收后台反馈。首期受控完整宿主验收及一次真实模型公开仓库只读试用已完成；后者不证明私库凭据或写入能力，具体范围见 [Gateway 实施记录](../docs/jarvis-gateway-progress.md)。技能管理尚未接入。`jarvis-demo/` 保留早期设计稿。
 

@@ -71,7 +71,7 @@ async function open(t, { hash = '#logs', runtime = 'dsh', rows = [event(3), even
   };
   w.addEventListener('error', e => { errors.push(String(e.error || e.message)); e.preventDefault(); });
   t.after(() => { w.operationLogsUI?.leave(); w.close(); assert.deepEqual(errors, [], 'page scripts remain usable'); });
-  for (const file of ['identity', 'layout', 'model-picker', 'capabilities', 'composition', 'operation-logs', 'settings', 'chat']) {
+  for (const file of ['identity', 'layout', 'model-catalog', 'model-picker', 'capabilities', 'composition', 'operation-logs', 'settings', 'chat']) {
     const script = d.createElement('script'); script.textContent = readFileSync(new URL(file + '.js', publicRoot), 'utf8'); d.body.append(script);
   }
   await until(() => !id('settings-form').inert, 'workspace ready');

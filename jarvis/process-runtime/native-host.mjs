@@ -127,8 +127,9 @@ export function installNativeLifecycleGuard(ctx, instances) {
 }
 
 export class NativeHost {
-  constructor(ctx, config, peer, { managementOnly = false, isCurrent = () => true, adoption, capabilityHold } = {}) {
+  constructor(ctx, config, peer, { managementOnly = false, isCurrent = () => true, adoption, capabilityHold, modelCatalog } = {}) {
     this.ctx = ctx; this.config = config; this.managementOnly = managementOnly; this.isCurrent = isCurrent;
+    this.modelCatalog = modelCatalog;
     this.bindings = new Map(); this.closed = false; this.closing = false; this.attached = false; this.cursor = 0;
     this.ensuring = new Map();
     this.executionTasks = new Set();
@@ -776,7 +777,7 @@ export class NativeHost {
       this.lifecycleAdmission(); signal = AbortSignal.any([signal, this.lifetime.signal].filter(Boolean));
     }
     if (this.lifecycleStopping && method === 'delegate' && !['query', 'stop'].includes(input?.operation)) this.lifecycleAdmission();
-    if (method === 'modelCatalog') return this.ctx.sessionController.modelCatalog();
+    if (method === 'modelCatalog') return this.modelCatalog ? this.modelCatalog() : this.ctx.sessionController.modelCatalog();
     if (method === 'resolveModel') return original.resolveRoleModel(this.ctx, input.model);
     if (method === 'probe') return this.trackExecution(() => original.runAsWorker(this.ctx.subprocess, input.argv, input.cwd, signal, decodeEnvironment(input.environment)));
     if (method === 'flush') return this.ctx.sessionPersistence.flush();

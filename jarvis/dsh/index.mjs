@@ -19,7 +19,7 @@ export const inject = ['agents', 'agentPresets', 'sessionController', 'sessionPe
   'subprocess', 'permissionPresets', 'workspaceRegistry'];
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 const organizationBundle = fileURLToPath(new URL('../../lib/organization.js', import.meta.url));
-const files = new Set(['index.html', 'identity.js', 'model-picker.js', 'layout.js', 'settings.js', 'chat.js', 'capabilities.js', 'capabilities.css', 'ui.css', 'dsh-tools.js', 'composition.html', 'composition.css', 'composition.js', 'operation-logs.js', 'operation-logs.css', 'prompts.js', 'prompts.css']);
+const files = new Set(['index.html', 'identity.js', 'model-catalog.js', 'model-picker.js', 'layout.js', 'settings.js', 'chat.js', 'capabilities.js', 'capabilities.css', 'ui.css', 'dsh-tools.js', 'composition.html', 'composition.css', 'composition.js', 'operation-logs.js', 'operation-logs.css', 'prompts.js', 'prompts.css']);
 const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
 async function body(req, limit = 100000) {
   if (!req.headers['content-type']?.startsWith('application/json')) throw new UserError('请求格式不正确', 415);
@@ -50,6 +50,7 @@ export async function apply(ctx, config) {
       capabilityCatalog: workspace => workerCatalog(ctx, workspace, config.workspace, config.preset || 'jarvis'),
       // Daily conversation settings are captured per user turn, independently of instance execution models.
       managerOptions: { preset: config.preset || 'jarvis', conversationModel: () => captureConversationModel(runtime.store),
+        modelCatalog: runtime.desktopModels ? () => runtime.desktopModels.catalog() : undefined,
         lifecycleParticipants: { root: runtime } },
       defaultModel: () => {
         const value = runtime.model().value;
@@ -141,7 +142,10 @@ export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, l
         }
         if (await handleArtifactRequest({ path, req, res, system })) return;
         if (await handleConversationRequest({ path, req, res, system, readBody: body })) return;
-        if (path === '/api/system' && req.method === 'GET') return json(res, 200, await system.get());
+        if (path === '/api/system' && req.method === 'GET') {
+          const view = new URL(req.url, `http://${host}`).searchParams.get('view');
+          return json(res, 200, await system.get(view === 'topology' ? { view } : undefined));
+        }
         if (path === '/api/system' && req.method === 'PUT') return json(res, 200, await system.save(await body(req, 400000)));
         const promptPreview = /^\/api\/system\/([a-z][a-z0-9-]{0,47})\/prompts\/preview$/.exec(path);
         if (promptPreview && req.method === 'POST') return json(res, 200, await system.previewPrompts(promptPreview[1], await body(req, 400000)));

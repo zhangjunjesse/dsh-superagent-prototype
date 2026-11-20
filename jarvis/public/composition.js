@@ -57,8 +57,10 @@
   const taskRequests = new Map();
   let editor = null, editorTab = 'basic', engineTab = 'source', editorReturn = 'overview', pendingDestination = null, toastTimer;
   let engineMount = null, engineMountEpoch = 0, engineQuery = {};
+  const modelPickers = new Map();
   let savedWindowDraft; try { savedWindowDraft=sessionStorage.getItem(STORAGE); } catch { /* unavailable browser storage remains a recoverable save error */ }
-  const service = { phase:'idle', snapshot:null, error:'', busy:false, details:new Map(), pollTimer:null, request:null, conflict:null, epoch:0, draftRevision:null };
+  const service = { phase:'idle', snapshot:null, error:'', busy:false, details:new Map(), pollTimer:null, request:null, conflict:null, epoch:0, draftRevision:null,
+    clientReady:false, readiness:null, readinessError:'' };
   const page = document.getElementById('composition-page');
   const main = document.getElementById('composition-main');
   if (!page || !main) return;
@@ -74,7 +76,8 @@
   const tile = n => `<span class="icon-tile ${n.kind}">${icon(symbolOf(n))}</span>`;
   const apiClient = () => window.jarvis || (typeof jarvis === 'undefined' ? null : jarvis);
   const connected = () => !!service.snapshot;
-  const organizationMode = () => apiClient()?.state?.runtime === 'dsh';
+  const settingsPending = () => connected() && (!service.clientReady || service.snapshot.view === 'topology');
+  const organizationMode = () => apiClient()?.state?.runtime === 'dsh' || (apiClient()?.state === null && location.pathname.startsWith('/jarvis/'));
   const organizationBase = '#settings/organization';
   const savedConfigurationText = () => organizationMode()?'组织配置已保存':'系统配置已保存';
   const rolePaths = { basic:'organization', brain:'jarvis', router:'engine/eval', access:'engine/execution', workspace:'engine/execution', prompts:'engine/prompts', connections:'connections', runtime:'runtime' };
@@ -131,8 +134,13 @@
   }
   function serviceNotice() {
     if (!connected()) return `<div class="system-service-note" role="status"><span>运行服务不可用 · 当前为此窗口的配置草稿</span>${apiClient()?button('重新连接','system-retry','','quiet'):''}</div>`;
-    const status = service.error ? '运行服务连接中断 · 已保留最近一次配置' : service.snapshot.configured ? savedConfigurationText() : '尚未注册实例 · 保存配置后可启动';
-    return `<div class="system-service-note${service.error?' error':''}" role="status"><span data-system-service-message>${escape(status)}</span><div>${savedWindowDraft?button('查看此窗口草稿','draft-review','','quiet'):''}${service.error?button('重新连接','system-retry','','quiet'):''}</div></div>`;
+    const status = serviceMessage(), issue=service.error || service.readinessError;
+    return `<div class="system-service-note${issue?' error':''}" role="status"><span data-system-service-message>${escape(status)}</span><div>${savedWindowDraft?button('查看此窗口草稿','draft-review','','quiet'):''}${issue?button('重新连接','system-retry','','quiet'):''}</div></div>`;
+  }
+  function serviceMessage() {
+    return service.readinessError || (service.error ? '运行服务连接中断 · 已保留最近一次配置'
+      : !service.clientReady ? '组织配置已读取 · 工作区正在连接，暂不能修改。' : settingsPending() ? '组织配置已读取 · 正在读取执行设置…'
+      : service.snapshot.configured ? savedConfigurationText() : '尚未注册实例 · 保存配置后可启动');
   }
   function installSnapshot(snapshot, updateConfiguration = true) {
     if (!snapshot?.available || !Array.isArray(snapshot.nodes) || !Number.isInteger(snapshot.revision) || !snapshot.nodes.some(item => item.id === snapshot.rootId)) throw new Error('系统配置响应无效，请重试。');
@@ -148,19 +156,38 @@
     if (!visible() || !connected() || service.busy) return;
     service.pollTimer = setTimeout(() => refreshService(), 5000);
   }
+  function clientReadiness(client) {
+    if (!service.readiness) service.readiness = Promise.resolve(client.ready).then(() => {
+      service.clientReady=true; return true;
+    }, () => {
+      service.readinessError='组织配置仍可查看 · 工作区加载失败，刷新页面后才能修改。';
+      return false;
+    });
+    return service.readiness;
+  }
   async function refreshService(initial = false) {
     if (service.request) return service.request;
     const client = apiClient(); if (!client) { service.phase='unavailable'; return; }
+    const readiness=clientReadiness(client);
     const epoch=service.epoch;
     service.request = (async () => {
       try {
-        await client.ready;
-        const snapshot = await client.api('/api/system');
+        if (!organizationMode() && !await readiness) return;
+        let snapshot = await client.api(organizationMode() && (initial || !service.clientReady) ? '/api/system?view=topology' : '/api/system');
         if (epoch!==service.epoch) return;
+        if (snapshot?.view === 'topology' || !service.clientReady) {
+          installSnapshot(snapshot, !editor);
+          if (!editor) render(); else updateRuntimeStatus();
+          if (!await readiness || epoch!==service.epoch) { updateRuntimeStatus(); return; }
+          // Older hosts return the full response for the query; only new topology snapshots need hydration.
+          if (snapshot.view === 'topology') snapshot = await client.api('/api/system');
+        }
+        if (epoch!==service.epoch) return;
+        const hydrated = settingsPending();
         const changed = snapshot.revision !== service.snapshot?.revision;
         const focusedField = main.contains(document.activeElement) && document.activeElement.matches('input,textarea,select');
         installSnapshot(snapshot, !editor && !focusedField);
-        if (initial && !editor) render();
+        if ((initial || hydrated) && !editor) render();
         else if (changed && !editor && !focusedField && currentView !== 'draft-review' && visible()) render();
         else updateRuntimeStatus();
         await refreshDetail();
@@ -175,7 +202,7 @@
     return service.request;
   }
   async function refreshDetail() {
-    if (!visible() || !connected() || !service.snapshot.configured || !['runtime','workers'].includes(currentView)) return;
+    if (!visible() || !connected() || settingsPending() || !service.snapshot.configured || !['runtime','workers'].includes(currentView)) return;
     const id = currentInstanceId;
     const epoch=service.epoch;
     try {
@@ -220,6 +247,12 @@
     if (service.phase === 'loading') { page.classList.remove('topology-mode'); main.innerHTML=`<div class="empty-state" role="status"><h1 id="composition-title" tabindex="-1">${organizationMode()?'组织架构管理':'系统管理'}</h1><p>正在读取系统配置…</p></div>`; return; }
     if (organizationMode() && !connected()) { page.classList.remove('topology-mode'); main.innerHTML=`<div class="empty-state" role="status"><h1 id="composition-title" tabindex="-1">暂时无法读取组织配置</h1><p>${escape(service.error || '请重新连接后再试。')}</p>${button('重新连接','system-retry','','secondary')}</div>`; return; }
     if (connected() && !editor) { state={version:1,nodes:structuredClone(service.snapshot.nodes)}; if (!node(currentInstanceId)) currentInstanceId=rootId(); }
+    if (requestedEditorRoute && settingsPending()) {
+      page.classList.remove('topology-mode');
+      const issue=service.error || service.readinessError;
+      main.innerHTML=`<div class="empty-state" role="status"><h1 id="composition-title" tabindex="-1">组织架构管理</h1><p>${escape(issue || (!service.clientReady?'工作区正在连接，暂不能修改。':'正在读取执行设置…'))}</p>${issue?button('重新连接','system-retry','','secondary'):''}</div>`;
+      return;
+    }
     if (requestedEditorRoute && connected()) {
       const {id,tab,section}=requestedEditorRoute; requestedEditorRoute=null;
       if (node(id) && node(id).kind!=='worker') {
@@ -369,7 +402,7 @@
     return {instanceId:id,items,nextCursor:list.nextCursor,availability:'stored',fromLogs:true};
   }
   async function refreshTopologyTasks() {
-    if (!visible() || currentView !== 'overview' || !organizationMode() || !service.snapshot?.configured) return;
+    if (!visible() || currentView !== 'overview' || !organizationMode() || !service.clientReady || !service.snapshot?.configured) return;
     const groups = new Map(), revision = service.snapshot.revision;
     const elements = [...main.querySelectorAll('[data-task-organization]')];
     const fromLogs = apiClient().state?.tasksAvailable !== true;
@@ -540,11 +573,12 @@
     for (const tasks of main.querySelectorAll('[data-task-organization]')) paintTaskPage(tasks);
     const notice=main.querySelector('.system-service-note'), message=notice?.querySelector('[data-system-service-message]');
     if (message) {
-      message.textContent=service.error?'运行服务连接中断 · 已保留最近一次配置':service.snapshot.configured?savedConfigurationText():'尚未注册实例 · 保存配置后可启动';
-      notice.classList.toggle('error',!!service.error);
+      const issue=service.error || service.readinessError;
+      message.textContent=serviceMessage();
+      notice.classList.toggle('error',!!issue);
       const retry=notice.querySelector('[data-action="system-retry"]');
-      if (service.error && !retry) notice.querySelector('div').insertAdjacentHTML('beforeend',button('重新连接','system-retry','','quiet'));
-      else if (!service.error) retry?.remove();
+      if (issue && !retry) notice.querySelector('div').insertAdjacentHTML('beforeend',button('重新连接','system-retry','','quiet'));
+      else if (!issue) retry?.remove();
     }
     for (const label of main.querySelectorAll('[data-brain-runtime]')) label.textContent='大脑 · '+runtimeLabel(label.dataset.brainRuntime);
     for (const label of main.querySelectorAll('[data-worker-status]')) label.textContent=workerStatus(label.dataset.workerStatus);
@@ -554,6 +588,7 @@
       const text = runtimeLabel(label.dataset.runtimeLabel);
       if (label.textContent !== text) label.textContent=text;
     }
+    for (const control of main.querySelectorAll('[data-action="add-instance"], [data-action="edit"], [data-action="topology-config"], [data-action="topology-worker-config"], [data-action="runtime-config"]')) control.disabled=settingsPending();
     const panel = main.querySelector('[data-runtime-instance]');
     if (!panel) return;
     const id = panel.dataset.runtimeInstance, runtime = runtimeOf(id), detail = service.details.get(id);
@@ -570,7 +605,7 @@
     const query=panel.querySelector('[data-runtime-query]');
     query.textContent=unavailable?service.error:detail?.queryError||''; query.hidden=!query.textContent;
     const phase=runtime?.phase, transitional=['starting','stopping'].includes(phase);
-    const running=['ready','running'].includes(phase), blocked=service.busy || transitional || unavailable || !service.snapshot.configured;
+    const running=['ready','running'].includes(phase), blocked=service.busy || transitional || unavailable || settingsPending() || !service.snapshot.configured;
     for (const control of panel.querySelectorAll('[data-action^="runtime-"]')) {
       const action=control.dataset.action; if (action==='runtime-config') continue;
       control.disabled=blocked || (action==='runtime-start'?(running||!!runtime?.cleanupPending):action==='runtime-stop'?!runtime?.pid&&!runtime?.cleanupPending:!runtime?.pid);
@@ -583,7 +618,7 @@
     if (lifecycle.innerHTML!==markup) lifecycle.innerHTML=markup;
   }
   async function controlRuntime(action,id) {
-    if (!connected() || service.busy || id!==currentInstanceId || !service.snapshot.configured) return;
+    if (!connected() || settingsPending() || service.busy || id!==currentInstanceId || !service.snapshot.configured) return;
     service.busy=true; service.epoch++; service.controlError=''; clearTimeout(service.pollTimer); updateRuntimeStatus();
     try {
       const snapshot=await apiClient().api('/api/system/'+encodeURIComponent(id)+'/'+action,'POST',{revision:service.snapshot.revision});
@@ -620,10 +655,10 @@
   function renderDraftReview() {
     let draft; try { draft=JSON.parse(savedWindowDraft); } catch { /* keep unreadable contents untouched */ }
     const problems=draftProblems(draft);
-    main.innerHTML=`${heading()}<div class="page-content"><section class="window-draft-review"><div class="section-title"><div><h2>核对此窗口草稿</h2><p>保存将替换系统的实例配置；原草稿继续保留在此窗口。</p></div>${button('返回系统配置','draft-close','','secondary')}</div>${problems.length?`<div class="field-error" role="alert">${problems.map(message=>`<p>${escape(message)}</p>`).join('')}<p>尚不支持的内容不会被自动删除或应用。</p></div>`:''}<div class="draft-node-list">${(Array.isArray(draft?.nodes)?draft.nodes:[]).map(n=>`<article><strong>${escape(n?.name)} · ${escape(n?.id)}</strong><pre>${escape(JSON.stringify(n,null,2))}</pre></article>`).join('')}</div><p id="draft-import-error" class="field-error" role="alert" hidden></p><button class="btn primary" type="button" data-action="draft-save"${problems.length?' disabled':''}>保存草稿到系统</button></section></div>`;
+    main.innerHTML=`${heading()}<div class="page-content"><section class="window-draft-review"><div class="section-title"><div><h2>核对此窗口草稿</h2><p>保存将替换系统的实例配置；原草稿继续保留在此窗口。</p></div>${button('返回系统配置','draft-close','','secondary')}</div>${problems.length?`<div class="field-error" role="alert">${problems.map(message=>`<p>${escape(message)}</p>`).join('')}<p>尚不支持的内容不会被自动删除或应用。</p></div>`:''}<div class="draft-node-list">${(Array.isArray(draft?.nodes)?draft.nodes:[]).map(n=>`<article><strong>${escape(n?.name)} · ${escape(n?.id)}</strong><pre>${escape(JSON.stringify(n,null,2))}</pre></article>`).join('')}</div><p id="draft-import-error" class="field-error" role="alert" hidden></p><button class="btn primary" type="button" data-action="draft-save"${problems.length||settingsPending()?' disabled':''}>保存草稿到系统</button></section></div>`;
   }
   async function saveWindowDraft() {
-    if (!connected() || service.busy) return;
+    if (!connected() || settingsPending() || service.busy) return;
     let draft; try { draft=JSON.parse(savedWindowDraft); } catch { return; }
     if (draftProblems(draft).length) return;
     service.busy=true; service.epoch++;
@@ -638,7 +673,7 @@
     return { id: `unit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`, parent, kind: 'instance', name: '', brainName:'贾维斯', description: '', capabilities: '', mode: 'local', concurrency: 2, model: 'follow', workspace: '', endpoint: '', credential: '', scope: '', recovery: true, autostart: false };
   }
   function openEditor(id, isNew = false, tab = 'basic', section = 'source') {
-    if (service.busy) return;
+    if (service.busy || settingsPending()) return;
     if (connected() && !editor) state={version:1,nodes:structuredClone(service.snapshot.nodes)};
     if (!node(id) || node(id).kind === 'worker') return;
     if (isNew && connected() && id!==rootId()) { announce('当前仅支持添加根实例的直属下级。'); return; }
@@ -667,6 +702,8 @@
     return [['basic','组织与大脑'],['access','Worker 设置'],['runtime','部署与运行']];
   }
   function unmountEngine() {
+    for (const picker of modelPickers.values()) picker.destroy();
+    modelPickers.clear();
     engineMountEpoch++;
     engineMount?.controller?.unmount(); engineMount=null;
   }
@@ -701,7 +738,7 @@
       ? Promise.resolve(window.superagentSettings) : import(apiClient().url('/organization.js'));
     load.then(module=>{
       if (epoch!==engineMountEpoch || !target.isConnected || editor?.value.id!==identity || editorTab!=='engine') return;
-      engineMount.controller=module.mountSuperagentSettings(target,{instanceId:identity,csrf:apiClient().state.csrf,
+      engineMount.controller=module.mountSuperagentSettings(target,{instanceId:identity,csrf:apiClient().state.csrf,mountModelPicker:jarvisModels.mount,
         location:engineLocation(),openSession:openEngineSession,onNavigate:location=>{
           if (engineBusy() || editor?.value.id!==identity) return;
           const query=new URLSearchParams();
@@ -726,6 +763,7 @@
     const content=embedded?'<div class="editor-content superagent-engine-host" id="superagent-engine-host"><p role="status">正在读取完整任务引擎设置…</p></div>':`<form class="editor-content" id="unit-form" novalidate><div class="editor-form-body">${editorFields(n)}<p class="field-error" id="form-error" role="alert" hidden></p><div id="system-conflict-review" hidden></div></div><div class="form-footer"><div class="save-scope"><span id="draft-indicator">${editor.dirty?'有未保存的更改':connected()?(organizationMode()?'保存当前实例配置':'保存到系统'):'保存到此窗口'}</span><small>${saveNote}</small></div><div>${button('取消','cancel-edit','','secondary')}<button class="btn primary" type="submit">${icon('check')}<span>${editor.isNew?'保存并添加':'保存配置'}</span></button></div></div></form>`;
     main.innerHTML = `<div class="editor-header" data-current-instance="${escape(currentInstanceId)}"><div class="editor-context">${breadcrumb()}<h1 id="composition-title" tabindex="-1">${escape(title)}</h1></div><button class="back-link" type="button" data-action="cancel-edit">${icon('back')}<span>返回${{overview:'概览',children:'下级实例',workers:'普通 Worker',runtime:'运行状态'}[editorReturn]}</span></button></div><div class="editor-layout"><nav class="editor-nav" aria-label="配置分区">${tabs.map(([id,label])=>`<button type="button" class="${editorTab===id?'active':''}" data-action="editor-tab" data-id="${id}"${editorTab===id?' aria-current="page"':''}>${label}</button>`).join('')}</nav>${content}</div>`;
     if (embedded) mountEngine(n,byId('superagent-engine-host'));
+    mountModelPickers();
     if (service.conflict) showConflictReview(service.conflict);
   }
   function editorFields(n) {
@@ -747,25 +785,41 @@
     if (connected()) return section('Worker 模型','负责调用工具和技能完成任务；本实例的普通 Worker 共用此模型。',modelFields(n,'worker'))+workerCapabilityFields(n)+section('任务并发','',`<div class="field-grid">${field('同时执行的任务数','concurrency',n.concurrency,{type:'number',max:16,help:'达到上限后，其余任务排队等待。'})}</div>`);
     return section('','',`<div class="field-grid">${field('任务并发上限','concurrency',n.concurrency,{type:'number',max:20,help:'本实例普通 Worker 同时执行的任务总数上限；其余任务排队等待。'})}${configFact('模型来源','使用本实例的模型配置','模型参数在该实例的模型配置中管理。','model')}${field('资源范围说明','scope',n.scope,{wide:true,multiline:true,placeholder:'例如：只处理指定仓库，不修改部署环境',help:'记录工作边界；此说明不授予访问权限，实际权限仍由工具与运行环境控制。'})}</div>`);
   }
-  function modelChoices(n, role = 'brain') {
-    const groups=apiClient()?.state?.models?.groups||[], model=(role==='brain'?n.model:n.roleModels?.[role]??n.model)||{};
-    const providers=groups.map(group=>[group.id,group.name]);
-    if (!providers.some(([id])=>id===model.provider)) providers.push([model.provider||'',model.provider||'选择模型服务']);
-    const models=groups.find(group=>group.id===model.provider)?.models||[];
-    const efforts=models.find(item=>item.id===model.model)?.reasoning?.efforts||[];
-    const levels=[['','跟随模型默认'],...efforts.map(item=>[item.id,item.name||item.id])];
-    if (model.reasoningEffort && !levels.some(([id])=>id===model.reasoningEffort)) levels.push([model.reasoningEffort,model.reasoningEffort+' · 当前配置']);
-    return {providers,models,levels};
-  }
   function modelFields(n,role='brain') {
-    const {providers,models,levels}=modelChoices(n,role), model=(role==='brain'?n.model:n.roleModels?.[role]??n.model)||{};
-    return `<div class="field-grid instance-model-fields" data-model-role="${role}">${selectField('模型服务',role+'ModelProvider',model.provider,providers)}${field('模型',role+'ModelId',model.model,{required:true,list:role+'-model-options',help:'使用当前 DSH 宿主已配置的模型。'})}<datalist id="${role}-model-options">${models.map(item=>`<option value="${escape(item.id)}">${escape(item.name||item.id)}</option>`).join('')}</datalist>${selectField('思考级别',role+'ReasoningEffort',model.reasoningEffort||'',levels)}</div>`;
+    const model=(role==='brain'?n.model:n.roleModels?.[role]??n.model)||{};
+    const inputs=[['ModelProvider',model.provider],['ModelId',model.model],['ReasoningEffort',model.reasoningEffort]];
+    return `<div class="instance-model-fields" data-model-role="${role}">${inputs.map(([suffix,value])=>`<input type="hidden" name="${role+suffix}" id="field-${role+suffix}" value="${escape(value||'')}">`).join('')}<div class="instance-model-catalog" id="${role}-model-catalog"></div></div>`;
+  }
+  function mountModelPickers() {
+    if (!connected() || !editor) return;
+    for (const role of ['brain','router','worker']) {
+      const target=byId(role+'-model-catalog');if(!target)continue;
+      const picker=jarvisModels.mount(target, {id:role+'-model',label:({brain:'贾维斯',router:'Router',worker:'Worker'})[role]+'模型',
+        onSelect(next,descriptor) {
+          const provider=byId('field-'+role+'ModelProvider'), model=byId('field-'+role+'ModelId'), effort=byId('field-'+role+'ReasoningEffort');
+          provider.value=next.provider;model.value=next.model;
+          if (!descriptor.reasoning?.efforts?.some(item=>item.id===effort.value)) effort.value='';
+          model.dispatchEvent(new Event('change',{bubbles:true}));
+        },
+        onEffort(value) {
+          const effort=byId('field-'+role+'ReasoningEffort');
+          effort.value=value==='default'?'':value;
+          effort.dispatchEvent(new Event('change',{bubbles:true}));
+        },
+        async onRefresh() {
+          apiClient().state.models=await apiClient().api('/api/models/refresh','POST',{force:true});
+          document.dispatchEvent(new Event('jarvis:catalog-updated'));
+        },
+      });
+      const model=role==='brain'?editor.value.model:editor.value.roleModels?.[role];
+      picker.update(apiClient().state.models,model);modelPickers.set(role,picker);
+    }
   }
   function brainModelFields(n) {
     if (n.kind!=='root') return section('贾维斯模型','负责接收上级交办，理解任务要求。',modelFields(n));
     const model=apiClient()?.state?.model?.value??{}, groups=apiClient()?.state?.models?.groups??[];
-    const provider=groups.find(group=>group.id===model.endpoint)?.name||model.endpoint;
-    const selected=model.model?[provider,model.model,model.reasoning&&model.reasoning!=='default'?model.reasoning:null].filter(Boolean).join(' · '):'尚未配置';
+    const provider=jarvisModels.providerName({groups},model.endpoint), descriptor=jarvisModels.find({groups},{provider:model.endpoint,model:model.model});
+    const selected=model.model?[provider,descriptor?.name||model.model,model.reasoning&&model.reasoning!=='default'?model.reasoning:null].filter(Boolean).join(' · '):'尚未配置';
     return section('贾维斯模型','负责与你对话、理解目标和反馈进展。',configFact('当前模型',selected)+
       '<a class="btn secondary" href="#settings/model">设置贾维斯模型</a>');
   }
@@ -785,12 +839,8 @@
   function syncModelChoices() {
     if (!connected() || !editor) return;
     captureForm();
-    for(const role of ['brain','router','worker']) {
-      const select=byId('field-'+role+'ReasoningEffort');if(!select)continue;
-      const {models,levels}=modelChoices(editor.value,role),model=role==='brain'?editor.value.model:editor.value.roleModels?.[role];
-      select.replaceChildren(...levels.map(([value,label])=>new Option(label,value)));select.value=model?.reasoningEffort||'';
-      byId(role+'-model-options').replaceChildren(...models.map(item=>new Option(item.name||item.id,item.id)));
-    }
+    for(const [role,picker] of modelPickers)
+      picker.update(apiClient().state.models,role==='brain'?editor.value.model:editor.value.roleModels?.[role]);
   }
   function deploymentFields(n) {
     if (connected() && organizationMode()) return section('部署与运行','启停操作和运行记录在当前组织的运行状态中管理。',configFact('实例状态',runtimeLabel(n.id))+(editor.isNew?'<p>保存组织后，可以管理任务引擎部署参数及工作空间。</p>':`<div class="runtime-link-row"><a class="btn secondary" href="${organizationBase}/${encodeURIComponent(n.id)}/engine/deployment">任务引擎部署参数</a><a class="btn secondary" href="${editorRoute(n.id,'workspace')}">工作空间与交付</a><button class="btn secondary" type="button" data-view="runtime" data-instance-id="${escape(n.id)}">${icon('activity')}<span>查看运行状态</span></button></div>`));
@@ -848,15 +898,20 @@
     if (/^(sk-|gh[pousr]_|github_pat_|Bearer\s)/i.test((n.credential || '').trim())) return ['runtime','这里填写凭据名称，请勿输入密钥。','credential'];
     return null;
   }
+  function focusInvalidField(name) {
+    const role=/^(brain|router|worker)(?:ModelProvider|ModelId)$/.exec(name)?.[1];
+    const control=role ? modelPickers.get(role)?.trigger : byId('field-'+name);
+    control?.setAttribute('aria-invalid','true'); control?.focus();
+  }
   function saveEditor(event) {
-    event.preventDefault(); if (!editor || service.busy) return; captureForm(); const value=structuredClone(editor.value);
+    event.preventDefault(); if (!editor || service.busy || settingsPending()) return; captureForm(); const value=structuredClone(editor.value);
     // Organization relationships define routing; obsolete draft controls are no longer saved.
     delete value.redelegate; delete value.depth;
     if (connected()) { saveConnectedEditor(value); return; }
     if (value.mode!=='connect') { value.endpoint=''; value.credential=''; }
     value.endpoint=value.endpoint.trim(); value.credential=value.credential.trim();
     const error=validate(value);
-    if (error) { selectEditorTab(error[0]); renderEditor(); const el=byId('form-error'); el.hidden=false; el.textContent=error[1]; const input=byId('field-'+error[2]); input?.setAttribute('aria-invalid','true'); input?.focus(); return; }
+    if (error) { selectEditorTab(error[0]); renderEditor(); const el=byId('form-error'); el.hidden=false; el.textContent=error[1]; focusInvalidField(error[2]); return; }
     value.name=value.name.trim(); const existing=state.nodes.findIndex(n=>n.id===value.id);
     value.brainName=value.brainName.trim();
     const previousNodes=state.nodes; state.nodes=[...state.nodes];
@@ -876,6 +931,7 @@
     area.innerHTML=`<div class="system-conflict-panel"><h2>配置已在其他位置更新</h2><p>当前编辑内容已保留。核对后采用最新系统版本，再保存当前实例；其他实例使用最新配置。</p><div class="configuration-comparison"><section><h3>系统中的当前配置</h3><pre>${escape(latest?JSON.stringify(latest,null,2):removed?'此实例已被移除，请返回系统重新选择。':'尚未添加此实例')}</pre></section><section><h3>当前编辑内容</h3><pre>${escape(JSON.stringify(editor.value,null,2))}</pre></section></div><button type="button" class="btn secondary" data-action="accept-latest"${removed?' disabled':''}>保留更改并采用最新版本</button></div>`;
   }
   async function saveConnectedEditor(value) {
+    if (settingsPending()) return;
     if (organizationMode() && !editor.isNew) {
       // The original settings APIs own executor, eval, prompts and Worker authorization. A metadata edit must not resave their stale mirrors.
       const base=state.nodes.find(item=>item.id===value.id);
@@ -884,7 +940,7 @@
     }
     value=configurationNode(value);
     const error=validate(value);
-    if (error) { selectEditorTab(error[0]); renderEditor(); showEditorError(error[1]); const input=byId('field-'+error[2]); input?.setAttribute('aria-invalid','true'); input?.focus(); return; }
+    if (error) { selectEditorTab(error[0]); renderEditor(); showEditorError(error[1]); focusInvalidField(error[2]); return; }
     value.name=value.name.trim(); value.brainName=value.brainName.trim(); value.workspace=value.workspace.trim();
     const nodes=structuredClone(state.nodes).map(configurationNode), index=nodes.findIndex(n=>n.id===value.id);
     if (index<0) nodes.push(value); else nodes[index]=value;
@@ -989,7 +1045,7 @@
   page.addEventListener('change', event=> {
     if (!editor || !event.target.closest('#unit-form')) return;
     editor.dirty=true; byId('draft-indicator').textContent='有未保存的更改';
-    if (connected() && /^(brain|router|worker)Model(Provider|Id)$/.test(event.target.name)) syncModelChoices();
+    if (connected() && /^(brain|router|worker)(ModelProvider|ModelId|ReasoningEffort)$/.test(event.target.name)) syncModelChoices();
   });
   page.addEventListener('submit', event=> { if(event.target.id==='unit-form') saveEditor(event); });
   window.addEventListener('beforeunload', event=> { if(editor?.dirty || engineDirty() || engineBusy()) { event.preventDefault(); event.returnValue=''; } });
@@ -1016,7 +1072,7 @@
     isBusy: () => service.busy || engineBusy(),
     render(hash) {
       captureForm();
-      if (organizationMode() && hash===organizationBase && hash!==lastRequestedRoute) { editor=null; currentInstanceId=rootId(); currentView='overview'; }
+      if (organizationMode() && hash===organizationBase && hash!==lastRequestedRoute) { editor=null; requestedEditorRoute=null; currentInstanceId=rootId(); currentView='overview'; }
       lastRequestedRoute=hash;
       const [path,search='']=(hash||'').split('?'), query=new URLSearchParams(search);
       engineQuery={}; for (const key of ['source','version']) if (query.has(key)) engineQuery[key]=query.get(key);
