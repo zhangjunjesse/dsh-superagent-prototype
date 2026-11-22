@@ -204,13 +204,16 @@ test('an older host that still rejects a pending capability hold remains authori
   assert.equal(ui.backend.chats, 0);
 });
 
-test('a 503 chat rejection refreshes authoritative lifecycle and keeps an unaccepted draft', async t => {
+test('a 503 response refreshes authoritative lifecycle and keeps the message visibly unconfirmed', async t => {
   const ui = await open(t); ui.input('尚未接收的消息');
   ui.backend.chatResponse = async () => { ui.backend.state.instance = instance('stopped'); return new Response(JSON.stringify({ error: '实例已停止' }), { status: 503 }); };
   ui.submit();
   await until(() => ui.byId('instance-status').textContent.includes('实例已停止'), '503 state refresh');
   assert.equal(ui.byId('send-message').disabled, true);
-  assert.equal(ui.byId('input').value, '尚未接收的消息');
+  assert.equal(ui.byId('input').value, '');
+  assert.match(ui.byId('thread').textContent, /尚未接收的消息/);
+  assert.equal([...ui.byId('thread').querySelectorAll('.send-status')].find(node => !node.hidden).textContent, '发送状态待确认');
+  assert.doesNotMatch(ui.byId('thread').textContent, /已发送/);
   assert.equal(ui.backend.chats, 1);
 });
 

@@ -687,8 +687,8 @@
         const user = message('user', turn.user);
         user.article.dataset.turnId = turn.id;
         delivery = document.createElement('span'); delivery.className = 'send-status'; delivery.setAttribute('role', 'status');
-        delivery.textContent = turn.pending ? ({ sending: '发送中…', uncertain: '发送状态待确认', failed: '发送失败', cancelled: '已取消发送' })[turn.pending.phase]
-          : '已发送，等待回复';
+        delivery.textContent = turn.pending ? turn.pending.cancelled ? '已取消，发送状态待确认' : ({ sending: '发送中…', uncertain: '发送状态待确认', failed: '发送失败', cancelled: '已取消，发送状态待确认' })[turn.pending.phase]
+          : turn.status === 'streaming' && !turn.assistant ? '已发送，等待回复' : '';
         delivery.hidden = !turn.pending && (turn.status !== 'streaming' || Boolean(turn.assistant));
         user.body.append(delivery);
         if (turn.pending && turn.pending.phase !== 'sending' && !busy && canChat()) {
@@ -978,7 +978,7 @@
           turn.assistant = event.type === 'replace' ? event.text : turn.assistant + event.text;
           const node = nodes.get(turn.id);
           renderReply(node.content, turn.assistant);
-          if (node.delivery) node.delivery.hidden = Boolean(turn.assistant);
+          if (node.delivery) { node.delivery.hidden = Boolean(turn.assistant); node.delivery.textContent = turn.assistant ? '' : '已发送，等待回复'; }
           if (bottom) thread.scrollTop = thread.scrollHeight;
         }
         if (event.type === 'done') {
@@ -1020,8 +1020,11 @@
         await refreshChatState(); synchronized = true;
       } catch {}
       if (stream.scope === sendScope() && outbox.get(payload.id) === entry) {
-        entry.phase = synchronized && activeId !== payload.id && (error.status || stream.cancelled) ? stream.cancelled ? 'cancelled' : 'failed' : 'uncertain'; saveOutbox();
-        if ((error.status || stream.cancelled) && consumeDraft && draftRevision === originalDraftRevision && selectionRevision === submittedSelectionRevision && !input.value && !selection) {
+        // A timeout, disconnect, conflict or server failure can follow admission. An absent snapshot is not a rejection receipt.
+        const rejected = [400, 401, 403, 404, 405, 413, 415, 422].includes(error.status);
+        entry.phase = rejected && synchronized && activeId !== payload.id ? 'failed' : 'uncertain';
+        entry.cancelled = Boolean(stream.cancelled); saveOutbox();
+        if (rejected && consumeDraft && draftRevision === originalDraftRevision && selectionRevision === submittedSelectionRevision && !input.value && !selection) {
           input.value = originalText;
           if (originalSelection) selectWork({ workRef: originalSelection.selectedWorkRef, questionId: originalSelection.selectedQuestionId });
           restoredDraftId = payload.id;

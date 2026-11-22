@@ -145,7 +145,7 @@ test('cancelling before acceptance aborts only that send and preserves the follo
   ui.input('尚未收到回执的消息'); ui.enter();
   assert.equal(ui.byId('stop-generation').disabled, false);
   ui.input('取消时写好的下一条'); ui.byId('stop-generation').click();
-  await until(() => ui.status()[0]?.textContent === '已取消发送' && ui.byId('conversation-page').dataset.busy === 'false', 'unaccepted send cancelled');
+  await until(() => ui.status()[0]?.textContent === '已取消，发送状态待确认' && ui.byId('conversation-page').dataset.busy === 'false', 'unconfirmed send cancelled locally');
   assert.equal(aborted, true);
   assert.equal(ui.byId('input').value, '取消时写好的下一条');
   assert.doesNotMatch(ui.byId('thread').textContent, /已发送/);
@@ -249,6 +249,8 @@ test('a 503 with ambiguous regeneration keeps the same attempt ID through old sn
   };
   ui.button('重新生成').click();
   await until(() => ui.button('重试发送'), 'ambiguous retry control');
+  assert.equal(ui.status()[0].textContent, '发送状态待确认');
+  assert.equal(ui.byId('input').value, '', 'an ambiguous receipt must not restore a draft that may already have been admitted');
   assert.equal(ui.button('重新生成'), undefined, 'an unresolved attempt cannot start a fresh regeneration');
   assert.doesNotMatch(ui.byId('thread').textContent, /已发送/);
   await ui.poll();
@@ -258,6 +260,25 @@ test('a 503 with ambiguous regeneration keeps the same attempt ID through old sn
   assert.equal(executions, 1);
   assert.deepEqual(ui.calls[1], ui.calls[0]);
   assert.equal(ui.byId('input').value, '保留下一条草稿');
+});
+
+for (const status of [503, 500, 408]) test(`HTTP ${status} stays unconfirmed after an absent snapshot and keeps polling for its durable receipt`, async t => {
+  const backend = { state: stateFor('root'), respond: async () => new Response(JSON.stringify({ error: '回执暂不可用' }), { status }) };
+  const ui = await open(t, { entryPoint: 'root', backend });
+  ui.input('可能已受理，不能重新交办'); ui.enter();
+  await until(() => ui.button('重试发送'), 'ambiguous receipt retained');
+  assert.equal(ui.status()[0].textContent, '发送状态待确认');
+  assert.equal(ui.byId('input').value, '');
+  assert.doesNotMatch(ui.byId('thread').textContent, /已发送|发送失败/);
+  await ui.poll();
+  assert.equal(ui.status()[0].textContent, '发送状态待确认', 'an absent fresh snapshot still cannot prove non-admission');
+  ui.input('后续新草稿');
+  backend.state.turns = [persisted(ui.calls[0], { status: 'complete', assistant: '原消息已经处理' })];
+  await ui.poll();
+  assert.match(ui.byId('thread').textContent, /原消息已经处理/);
+  assert.equal(ui.status().length, 0);
+  assert.equal(ui.byId('input').value, '后续新草稿');
+  assert.equal(ui.calls.length, 1, 'reconciliation never sends another model request');
 });
 
 test('an in-flight older state snapshot cannot restore a sent draft or remove its local bubble', async t => {
