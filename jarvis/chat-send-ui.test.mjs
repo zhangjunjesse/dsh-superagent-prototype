@@ -294,3 +294,52 @@ test('an in-flight older state snapshot cannot restore a sent draft or remove it
   stream.emit({ type: 'done', turn }); stream.end();
   await until(() => ui.byId('conversation-page').dataset.busy === 'false', 'newer reply retained');
 });
+
+for (const entryPoint of ['root', 'organization']) for (const readFails of [false, true]) {
+  test(`${entryPoint}: stale-poll before acceptance cannot erase a confirmed reply after EOF${readFails ? ' when fresh reads fail' : ''}`, async t => {
+    const ui = await open(t, { entryPoint }), oldSnapshot = deferred(), freshSnapshot = deferred(), stream = responseStream();
+    const empty = structuredClone(ui.backend.state);
+    let reads = 0;
+    ui.backend.readState = () => {
+      reads++;
+      if (reads === 1) return oldSnapshot.promise;
+      if (reads === 2) return freshSnapshot.promise;
+      throw new Error('fresh read remains unavailable');
+    };
+    ui.backend.respond = () => stream.response;
+    ui.input('已持久化的消息不能被旧空快照抹掉'); ui.enter();
+    const polling = ui.poll();
+    await until(() => reads === 1, 'pre-admission snapshot in flight');
+    const turn = persisted(ui.calls[0]);
+    ui.backend.state.turns = [turn]; ui.backend.state.active = turn.id;
+    stream.emit({ type: 'start', turn });
+    await until(() => ui.status()[0]?.textContent === '已发送，等待回复', 'durable stream receipt');
+    stream.emit({ type: 'delta', text: '已确认的部分回复' });
+    await until(() => ui.byId('thread').textContent.includes('已确认的部分回复'), 'partial reply visible');
+    ui.input('断流期间保留的后续草稿'); stream.end();
+    try {
+      await delay(10); oldSnapshot.resolve(empty); await polling; await delay(10);
+      assert.match(ui.byId('thread').textContent, /已持久化的消息不能被旧空快照抹掉/);
+      assert.match(ui.byId('thread').textContent, /已确认的部分回复/);
+      assert.ok(reads >= 2, 'EOF reconciliation must start a new request rather than reuse a pre-admission poll');
+      assert.equal(JSON.parse(ui.stored()).length, 0, 'the durable receipt already retired the optimistic outbox');
+      if (readFails) {
+        freshSnapshot.reject(new Error('fresh read unavailable'));
+        await until(() => reads >= 3, 'failed recovery completes its bounded retry'); await delay(10);
+        assert.match(ui.byId('thread').textContent, /已持久化的消息不能被旧空快照抹掉.*已确认的部分回复/);
+        assert.equal(ui.byId('conversation-page').dataset.busy, 'true', 'a failed read cannot invent an idle chat and stop standalone polling');
+      }
+      const final = { ...turn, status: 'complete', assistant: '新快照中的最终回复' };
+      ui.backend.state.turns = [final]; ui.backend.state.active = null;
+      if (readFails) { ui.backend.readState = null; await ui.poll(); }
+      else freshSnapshot.resolve(structuredClone(ui.backend.state));
+      await until(() => ui.byId('conversation-page').dataset.busy === 'false', 'authoritative completion recovered');
+      assert.match(ui.byId('thread').textContent, /新快照中的最终回复/);
+      assert.equal(ui.byId('thread').querySelectorAll('.message.user').length, 1);
+      assert.equal(ui.byId('input').value, '断流期间保留的后续草稿');
+      assert.equal(ui.calls.length, 1, 'recovery never resubmits an accepted message');
+    } finally {
+      oldSnapshot.resolve(empty); freshSnapshot.resolve(structuredClone(ui.backend.state)); await delay(10);
+    }
+  });
+}

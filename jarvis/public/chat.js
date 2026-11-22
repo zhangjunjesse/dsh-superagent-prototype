@@ -10,6 +10,7 @@
   const instanceStartError = byId('instance-start-error');
   let turns = [], activeId = null, busy = false, pollTimer, notificationTimer, notificationCursor = 0, selection = null, viewRevision = 0;
   let instance = null, startingInstance = false, startError = '', stateSyncError = false, stateRequest = null, activeStream = null;
+  let chatRevision = 0;
   let draftRevision = 0, selectionRevision = 0, restoredDraftId = null;
   const outbox = new Map(), outboxKey = 'jarvis.chat.outbox:' + location.pathname;
   const nodes = new Map();
@@ -888,6 +889,7 @@
     input.style.overflowY = contentHeight > maximum ? 'auto' : 'hidden';
   }
   function replaceTurn(turn) {
+    chatRevision++;
     const index = turns.findIndex(item => item.id === turn.id);
     if (index < 0) turns.push(turn); else turns[index] = turn;
   }
@@ -896,6 +898,7 @@
     if (document.visibilityState !== 'hidden' && (instance || busy || visiblePending().some(entry => entry.phase === 'uncertain'))) pollTimer = setTimeout(followActive, busy ? 1200 : 5000);
   }
   function syncState(state) {
+    chatRevision++;
     const availableBefore = canChat(), busyBefore = busy;
     const taskContextChanged = syncTaskContext(state);
     instance = state.instance || null;
@@ -927,13 +930,18 @@
     controls();
     if (changed || busyBefore !== busy || availableBefore !== canChat()) render();
   }
-  async function refreshChatState() {
-    if (stateRequest?.revision === viewRevision) return stateRequest.promise;
-    const request = { revision: viewRevision };
+  async function refreshChatState({ fresh = false } = {}) {
+    if (!fresh && stateRequest?.revision === viewRevision && stateRequest.chatRevision === chatRevision) return stateRequest.promise;
+    const request = { revision: viewRevision, chatRevision };
     stateRequest = request;
+    const current = () => stateRequest === request && request.revision === viewRevision && request.chatRevision === chatRevision;
     request.promise = (async () => {
-      const state = await jarvis.api('/api/state');
-      if (request.revision === viewRevision) syncState(state);
+      let state;
+      try { state = await jarvis.api('/api/state'); }
+      catch (error) { if (!current()) return false; throw error; }
+      // A stream receipt, newer text or another applied snapshot supersedes this read.
+      if (!current()) return false;
+      syncState(state); return true;
     })();
     try { return await request.promise; }
     finally { if (stateRequest === request) stateRequest = null; }
@@ -975,6 +983,7 @@
           const turn = turns.find(item => item.id === activeId);
           if (!turn) continue;
           const bottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+          chatRevision++;
           turn.assistant = event.type === 'replace' ? event.text : turn.assistant + event.text;
           const node = nodes.get(turn.id);
           renderReply(node.content, turn.assistant);
@@ -1017,7 +1026,7 @@
       const failureText = stream.cancelled ? '已取消发送' : error.message || '回复失败，请重试';
       stream.interrupted = true;
       try {
-        await refreshChatState(); synchronized = true;
+        synchronized = await refreshChatState({ fresh: true });
       } catch {}
       if (stream.scope === sendScope() && outbox.get(payload.id) === entry) {
         // A timeout, disconnect, conflict or server failure can follow admission. An absent snapshot is not a rejection receipt.
@@ -1037,7 +1046,7 @@
       if (activeStream === stream && stream.revision === viewRevision) {
         stream.interrupted = true;
         if (!synchronized && (instance || activeId || !gotDone)) {
-          try { await refreshChatState(); } catch { if (activeStream === stream && stream.revision === viewRevision) stateSyncError = true; }
+          try { await refreshChatState({ fresh: true }); } catch { if (activeStream === stream && stream.revision === viewRevision) stateSyncError = true; }
         }
         if (activeStream === stream && stream.revision === viewRevision) {
           activeStream = null;
