@@ -10,6 +10,7 @@ import { withoutDirectory, workerBin } from '../infra/environment.ts'
 import { createGithubConnection, GithubCredentialError, managedGithubDirectory, managedGithubExecutable, removeGithubConnection }
   from '../infra/github-credentials.ts'
 import { GithubProcessError, runGithubProcess } from '../infra/github-process.ts'
+import { verifiedPortableGithubCli } from '../infra/github-portable.ts'
 import { SettingsConflict } from './settings.ts'
 
 export interface GithubConnectionInput {
@@ -49,7 +50,7 @@ export interface GithubConnectionDependencies {
   settings: ConnectionSettings
   lifetime: AbortSignal
   runner?: GithubConnectionRunner
-  discover?: (preferred: string, real: boolean) => Promise<string | undefined>
+  discover?: (preferred: string, real: boolean, prepare?: boolean, signal?: AbortSignal) => Promise<string | undefined>
   credentials?: {
     supported: boolean
     create: typeof createGithubConnection
@@ -108,8 +109,29 @@ export function normalizeGithubRepository(input: string): string {
   return `${owner}/${repository}`
 }
 
-/** File discovery only: never signs in, executes a CLI, or selects an account. */
-export async function discoverGithubCli(stateDir: string, preferred = '', real = false): Promise<string | undefined> {
+/** Only inspect named tool locations in registered DSH workspaces. The registry supplies locations, not trust. */
+async function* workspaceGithubCandidates(): AsyncGenerator<string> {
+  const homes = new Set([process.env.DSH_HOME, join(homedir(), '.dsh')])
+  const seen = new Set<string>()
+  for (const home of homes) {
+    if (!home || !/^[A-Za-z]:[\\/]/.test(home)) continue
+    try {
+      const registry = JSON.parse(await readFile(join(home, 'storages', 'workspace.json'), 'utf8'))
+      if (!Array.isArray(registry?.global?.workspaceIds)) continue
+      for (const id of registry.global.workspaceIds) {
+        const path = typeof id === 'string' && registry.tables?.workspaces?.[id]?.path
+        if (typeof path !== 'string' || !/^[A-Za-z]:[\\/]/.test(path)) continue
+        const candidate = join(path, 'tools', 'bin', 'gh.exe')
+        if (seen.has(candidate.toLowerCase())) continue
+        seen.add(candidate.toLowerCase())
+        yield candidate
+      }
+    } catch { /* An absent or unreadable registry must not hide tools from other installations. */ }
+  }
+}
+
+/** A status read never runs a candidate. Connecting pins a verified portable binary outside its writable workspace. */
+export async function discoverGithubCli(stateDir: string, preferred = '', real = false, prepare = false, signal?: AbortSignal): Promise<string | undefined> {
   const original = preferred && real ? await managedGithubExecutable(stateDir, preferred) ?? preferred : preferred
   const common = process.platform === 'win32'
     ? [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, 'Programs')]
@@ -123,6 +145,27 @@ export async function discoverGithubCli(stateDir: string, preferred = '', real =
       if (real && managed !== '..' && !managed.startsWith('..\\') && !managed.startsWith('../') && !/^(?:[A-Za-z]:|[/\\])/.test(managed)) continue
       return file
     } catch { /* Continue to PATH and standard installation directories. */ }
+  }
+  if (!original && process.platform === 'win32') {
+    const deadline = AbortSignal.timeout(prepare ? 30_000 : 10_000)
+    const budget = signal ? AbortSignal.any([signal, deadline]) : deadline
+    if (budget.aborted) return undefined
+    let end!: () => void
+    const expired = new Promise<undefined>(done => { end = () => done(undefined) })
+    budget.addEventListener('abort', end, { once: true })
+    try {
+      for await (const candidate of workspaceGithubCandidates()) {
+        if (budget.aborted) return undefined
+        try {
+          const file = executable(candidate, path, workerBin(stateDir))
+          if (!sameCli(file, candidate)) continue
+          const trusted = await Promise.race([verifiedPortableGithubCli(file, stateDir, prepare), expired])
+          if (trusted) return trusted
+        } catch { /* Try the next registered workspace. */ }
+      }
+    } finally {
+      budget.removeEventListener('abort', end)
+    }
   }
   return undefined
 }
@@ -142,7 +185,7 @@ export class GithubConnection {
     this.file = join(host.stateDir, 'github-connection.json')
     this.credentials = host.credentials ?? { supported: process.platform === 'win32', create: createGithubConnection,
       remove: removeGithubConnection, executable: managedGithubExecutable }
-    this.discover = host.discover ?? ((preferred, real) => discoverGithubCli(host.stateDir, preferred, real))
+    this.discover = host.discover ?? ((preferred, real, prepare, signal) => discoverGithubCli(host.stateDir, preferred, real, prepare, signal))
     this.runner = host.runner ?? ((cli, args, signal) => this.runCli(cli, args, signal))
   }
   /** Local projection only; source registration may happen after construction. */
@@ -284,7 +327,7 @@ export class GithubConnection {
       const before = this.block()
       if (!before || before.revision !== input.revision) throw new ConnectionFailure('settings-conflict')
       const preferred = input.cli?.trim() || String(before.value.config.cli ?? '')
-      const cli = await this.discover(preferred, input.method === 'token')
+      const cli = await this.discover(preferred, input.method === 'token', true, signal)
       signal.throwIfAborted()
       if (!cli) throw new ConnectionFailure('cli-missing')
       if (input.method === 'token') {

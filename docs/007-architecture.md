@@ -363,6 +363,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/command-line.ts` | Platform command resolution, literal PowerShell arguments and prepare commands, explicit exit propagation, and refusal of Windows batch CLIs |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/github-credentials.ts` | Immutable profile-scoped GitHub CLI wrappers and Windows CurrentUser DPAPI credential storage, with candidate cleanup and account isolation |
+| `src/infra/github-portable.ts` | Verifies signed portable GitHub CLI binaries discovered on Windows and copies them into the owning profile |
 | `src/infra/github-process.ts` | Bounded GitHub version/API subprocesses, safe errors, and Windows wrapper/native-child process-tree cancellation |
 | `src/infra/host-paths.ts` | Host absolute-path validation, including fully qualified Windows drives and UNC shares |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -465,6 +466,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/github-connection.spec.ts` | Connection validation, immutable account replacement, optimistic saves, cancellation, persisted attempts, restart recovery and CLI discovery |
+| `tests/github-portable.spec.ts` | Trust checks and profile isolation for automatically discovered GitHub CLI executables |
 | `tests/github-credentials.spec.ts` | Windows DPAPI and wrapper isolation through Commands, worker shims and Git credential helpers; argument/stdin/exit propagation and process-tree cancellation |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
