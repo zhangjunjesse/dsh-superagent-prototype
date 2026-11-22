@@ -261,6 +261,7 @@ const TEXT = {
   githubConnectionCreateToken: ['在 GitHub 创建 Token', 'Create a token on GitHub'],
   githubConnectionExistingHint: ['使用这台电脑上 GitHub CLI 已登录的账号。连接的账号将用于读取通知、推送代码和更新 GitHub。', 'Use the account signed in to GitHub CLI on this computer. It will read notifications, push code, and update GitHub.'],
   githubConnectionCliFound: ['已找到 GitHub CLI：{cli}', 'GitHub CLI found: {cli}'],
+  githubConnectionCliRetry: ['上次验证未能使用 GitHub CLI。当前已检测到候选路径，请重新验证。也可以在高级设置中选择其他 CLI。', 'The last attempt could not use GitHub CLI. A candidate path is now available. Verify again or select a different CLI in advanced settings.'],
   githubConnectionCliMissing: ['尚未找到 GitHub CLI；可在高级设置指定位置。', 'GitHub CLI was not found. Specify its location in advanced settings.'],
   githubConnectionAdvanced: ['高级：GitHub CLI', 'Advanced: GitHub CLI'],
   githubConnectionCliLabel: ['智能体的 GitHub CLI', 'Agent GitHub CLI'],

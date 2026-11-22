@@ -6,6 +6,7 @@ import { discoverGithubCli, GithubConnection, normalizeGithubRepository, type Gi
   type GithubConnectionInput, type GithubConnectionRunner } from '../src/app/github-connection.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import { powershellQuote } from '../src/infra/command-line.ts'
+import * as portable from '../src/infra/github-portable.ts'
 
 const TOKEN = 'ghp_connection_test_secret_DO_NOT_PERSIST'
 const CANDIDATE_ID = '35ef1bfe-2249-4c25-9a96-895f48ebaa9b'
@@ -114,7 +115,7 @@ it('keeps the selected managed account when existing CLI connection is requested
   f.state.value.config.cli = f.candidate.cli
   await f.service.start(f.input({ method: 'existing', token: undefined }))
   expect((await f.finish()).job?.status).toBe('connected')
-  expect(f.discover).toHaveBeenCalledWith(f.candidate.cli, false)
+  expect(f.discover).toHaveBeenCalledWith(f.candidate.cli, false, true, expect.any(AbortSignal))
   expect(f.runner.mock.calls.every(([cli]) => cli === f.candidate.cli)).toBe(true)
   expect(f.credentials.create).not.toHaveBeenCalled()
   expect(f.state.value.config.cli).toBe(f.candidate.cli)
@@ -341,4 +342,51 @@ it('discovers a real executable outside worker shims and never substitutes anoth
   expect(await discoverGithubCli(f.stateDir, actual)).toBe(actual)
   expect(await discoverGithubCli(f.stateDir, join(f.stateDir, 'missing account.exe'))).toBeUndefined()
   expect(await discoverGithubCli(f.stateDir, join(shims, name))).toBeUndefined()
+})
+
+it.skipIf(process.platform !== 'win32')('finds a signed CLI in the desktop registry for both connection methods when the service registry is empty', async () => {
+  const f = fixture()
+  vi.stubEnv('PATH', '')
+  vi.stubEnv('ProgramFiles', f.stateDir)
+  vi.stubEnv('ProgramFiles(x86)', f.stateDir)
+  vi.stubEnv('LOCALAPPDATA', f.stateDir)
+  vi.stubEnv('USERPROFILE', f.stateDir)
+  vi.stubEnv('DSH_HOME', join(f.stateDir, 'service-home'))
+  const roots = ['unregistered', 'unsigned', 'renamed-workspace'].map(name => join(f.stateDir, name))
+  for (const root of roots) {
+    const bin = join(root, 'tools', 'bin')
+    mkdirSync(bin, { recursive: true })
+    writeFileSync(join(bin, 'gh.exe'), 'fixture')
+  }
+  const registry = join(f.stateDir, '.dsh', 'storages')
+  mkdirSync(registry, { recursive: true })
+  writeFileSync(join(registry, 'workspace.json'), JSON.stringify({
+    global: { workspaceIds: ['missing', 'unsigned', 'portable'] },
+    tables: { workspaces: { unused: { path: roots[0] }, unsigned: { path: roots[1] }, portable: { path: roots[2] } } },
+  }))
+  const installed = join(roots[2]!, 'tools', 'bin', 'gh.exe')
+  const verify = vi.spyOn(portable, 'verifiedPortableGithubCli').mockImplementation(async (file, _state, prepare) =>
+    file === installed ? prepare ? f.realCli : installed : undefined)
+  onTestFinished(() => verify.mockRestore())
+  expect(await discoverGithubCli(f.stateDir)).toBe(installed)
+  expect(verify.mock.calls.map(([file]) => file)).toEqual([join(roots[1]!, 'tools', 'bin', 'gh.exe'), installed])
+  for (const method of ['existing', 'token'] as const) {
+    f.state.value.config.cli = ''
+    f.credentials.create.mockClear()
+    f.runner.mockClear()
+    const service = new GithubConnection({ ...f.dependencies, discover: undefined })
+    await service.start(f.input({ revision: f.state.revision, method }))
+    await service.drain()
+    expect((await service.read()).job?.status).toBe('connected')
+    expect(verify).toHaveBeenCalledWith(installed, f.stateDir, true)
+    if (method === 'token') expect(f.credentials.create).toHaveBeenCalledWith(expect.objectContaining({ executable: f.realCli }), expect.any(AbortSignal))
+    else expect(f.runner.mock.calls[0]?.[0]).toBe(f.realCli)
+  }
+  const controller = new AbortController()
+  const started = deferred<void>()
+  verify.mockImplementation(async () => { started.resolve(); return new Promise(() => {}) })
+  const pending = discoverGithubCli(f.stateDir, '', false, false, controller.signal)
+  await started.promise
+  controller.abort()
+  expect(await pending).toBeUndefined()
 })

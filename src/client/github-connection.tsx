@@ -77,7 +77,8 @@ function ConnectionStatus({ source, view, error, refresh }: {
   const ready = !!connection?.login && setup?.accounts?.agent === connection.login
     && setup.accounts.repository === connection.repository && !setup.problem
   const job = view?.job
-  const detail = job?.errorCode ? t(`githubConnectionError.${job.errorCode}`) : undefined
+  const detail = job?.errorCode === 'cli-missing' && view?.cli ? t('githubConnectionCliRetry')
+    : job?.errorCode ? t(`githubConnectionError.${job.errorCode}`) : undefined
   return <div className="dt-github-status" data-state={error && !view ? 'error' : mark.state} aria-live="polite">
     <div className="dt-github-status-title"><StateDot state={error && !view ? 'error' : mark.state} />
       <strong>{t(error && !view ? 'githubConnectionStatus.unavailable' : `githubConnectionStatus.${mark.status}`)}</strong>
@@ -134,7 +135,7 @@ function ConnectionMethod({ method, setMethod, token, setToken, cli, setCli, vie
     </div> : <div className="dt-github-auth">
       <Hint>{t('githubConnectionExistingHint')}</Hint>
     </div>}
-    {view && ((!view.cli && method === 'token') || (method === 'existing' && !view.connection.configured))
+    {view && (!view.connection.configured || method === 'token' && !view.cli)
       && <p className="dt-hint">{view.cli ? t('githubConnectionCliFound', { cli: view.cli }) : t('githubConnectionCliMissing')}</p>}
     <DisclosureRow icon={<Icon name="settings" />} title={t('githubConnectionAdvanced')} open={advanced}
       onToggle={() => setAdvanced(!advanced)}>

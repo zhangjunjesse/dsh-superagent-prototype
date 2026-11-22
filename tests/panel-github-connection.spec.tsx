@@ -40,6 +40,16 @@ it('starts an unconfigured repository with a neutral Token form and preserves re
   expect(card().textContent).not.toMatch(/OAuth|浏览器登录|Demo|演示/)
 })
 
+it('shows the discovered CLI in Token mode after a previous missing-CLI failure', async () => {
+  server.settings.sources.github = { ...source(), config: { repository: '', cli: '' } }
+  server.githubConnection = connection({ job: { id: 'previous', status: 'failed', errorCode: 'cli-missing', message: '' } })
+  await open()
+  expect(card().textContent).toContain('/usr/bin/gh')
+  expect(card().textContent).toContain('重新验证')
+  expect(card().textContent).not.toContain(zh['githubConnectionError.cli-missing'])
+  expect(card().textContent).not.toContain(zh['githubConnectionStatus.connected'])
+})
+
 it('submits a repository URL and Token only through the connection API, clearing it before the request completes', async () => {
   await open()
   await click(find(zh.githubConnectionToken, '[role="tab"]'))
