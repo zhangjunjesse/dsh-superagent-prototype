@@ -1,9 +1,12 @@
 // Brain-owned read capabilities. This module never evaluates code or starts a process.
-export const brainDirectToolNames = Object.freeze(['read', 'read_image', 'glob', 'grep', 'current_time', 'calculate', 'web_search', 'web_fetch']);
+export const organizationDirectoryName = 'jarvis_organization_directory';
+export const brainDirectToolNames = Object.freeze(['read', 'read_image', 'glob', 'grep', 'current_time', 'calculate', 'web_search', 'web_fetch', organizationDirectoryName]);
 const directNames = new Set(brainDirectToolNames);
 export const isBrainDirectTool = name => directNames.has(name);
 
 export const readCapabilityDefinitions = Object.freeze([
+  { name: organizationDirectoryName, description: '查询集团已保存的组织层级、部门名称、大脑名称、职责与能力标签，以及当前能否作为集团 Router 的委派候选。查询分工时使用，停止的部门仍可负责相应工作。',
+    parameters: { type: 'object', additionalProperties: false, properties: {} } },
   { name: 'current_time', description: '读取真实当前时间，可指定 IANA 时区；不修改系统时间。',
     parameters: { type: 'object', additionalProperties: false, properties: {
       timeZone: { type: 'string', description: '可选 IANA 时区，例如 Asia/Shanghai、UTC、America/New_York。省略时使用组织时区。' },
@@ -148,6 +151,10 @@ function currentTime(args, options) {
 
 // Caller-supplied clock makes verification repeatable; production always uses the real clock.
 export function executeReadCapability(name, args, options = {}) {
+  if (name === organizationDirectoryName) {
+    fields(args, []);
+    return options.readOrganizationDirectory();
+  }
   if (name === 'current_time') return currentTime(args, options);
   if (name !== 'calculate') invalid('未知的只读工具');
   fields(args, ['operation', 'expression', 'value', 'from', 'to', 'start', 'end', 'date', 'amount', 'unit'], ['operation']);

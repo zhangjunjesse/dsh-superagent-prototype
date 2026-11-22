@@ -35,15 +35,19 @@ export async function apply(ctx, config) {
   const rootStateDir = join(config.systemManagement?.rootDir ?? join(config.stateDir, 'superjarvis'), 'instances', 'root', 'state');
   const adoption = config.systemManagement !== false ? readOriginalAdoption(rootStateDir) : undefined;
   const gatewayOptions = adoption ? { adoptedRoot: { stateDir: rootStateDir, identity: adoption.identity } } : {};
+  let system, systemError;
+  const readOrganizationDirectory = config.systemManagement === false ? undefined : () => {
+    if (!system) throw new UserError('组织目录暂不可用，请检查实例管理状态', 503);
+    return system.organizationDirectory();
+  };
   const runtime = new JarvisRuntime(ctx, { ...config, lifecycleManaged: config.systemManagement !== false,
-    dataFile: join(config.stateDir, 'jarvis-dsh.sqlite') });
+    dataFile: join(config.stateDir, 'jarvis-dsh.sqlite') }, { readOrganizationDirectory });
   const csrf = randomBytes(32).toString('hex');
   // Session-switch recovery needs its durable notification ledgers before optional engine management initializes.
   try {
     if (config.systemManagement !== false) runtime.gateway.connectOrganization(undefined, join(config.stateDir, 'organization-gateway.sqlite'), gatewayOptions);
     await runtime.ready();
   } catch (error) { await runtime.close(); throw error; }
-  let system, systemError;
   try {
     if (config.systemManagement !== false) system = new SystemControl(ctx, {
       rootDir: config.systemManagement?.rootDir ?? join(config.stateDir, 'superjarvis'),

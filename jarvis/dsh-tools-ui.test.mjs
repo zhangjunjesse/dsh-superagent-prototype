@@ -93,13 +93,14 @@ test('search includes disabled names, captions and descriptions while counts des
 });
 
 test('only offered eligible read capabilities appear, and task controls have their own group', async t => {
-  const extra = ['current_time', 'calculate', 'jarvis_work_query', 'jarvis_work_submit', 'write', 'edit', 'pwsh', 'job_kill', 'unknown'].map(name => ({ name, allowed: true, description: 'Offered ' + name, parameters: {} }));
+  const extra = ['current_time', 'calculate', 'jarvis_organization_directory', 'jarvis_work_query', 'jarvis_work_submit', 'write', 'edit', 'pwsh', 'job_kill', 'unknown'].map(name => ({ name, allowed: true, description: 'Offered ' + name, parameters: {} }));
   const f = fixture(t, { revision: 7, tools: [...initial().tools, ...extra] }); await f.render();
-  assert.deepEqual(f.names(), ['read', 'glob', 'grep', 'read_image', 'current_time', 'calculate', 'jarvis_work_query', 'jarvis_work_submit']);
+  assert.deepEqual(f.names(), ['read', 'glob', 'grep', 'read_image', 'current_time', 'calculate', 'jarvis_organization_directory', 'jarvis_work_query', 'jarvis_work_submit']);
   const groups = [...f.host.querySelectorAll('section[aria-label]')];
   assert.deepEqual(groups.map(group => group.getAttribute('aria-label')), ['读取、查询与计算', '任务控制']);
   assert.deepEqual([...groups[1].querySelectorAll('[data-dsh-tool]')].map(button => button.dataset.dshTool), ['jarvis_work_query', 'jarvis_work_submit']);
-  assert.equal(f.host.querySelector('#dsh-tool-feedback').textContent, '5 个已允许 · 8 个已提供');
+  assert.equal(f.host.querySelector('#dsh-tool-feedback').textContent, '6 个已允许 · 9 个已提供');
+  f.search('组织架构'); assert.deepEqual(f.names(), ['jarvis_organization_directory']);
   f.search('当前时间'); assert.deepEqual(f.names(), ['current_time']);
   f.button('current_time').click(); await settle();
   assert.equal(f.button('current_time').getAttribute('aria-checked'), 'false');

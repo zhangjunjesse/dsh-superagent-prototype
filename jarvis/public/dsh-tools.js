@@ -7,7 +7,7 @@
   const toolRoute = name => rootTools+(name?'/'+encodeURIComponent(name):'');
   const legacyRoute = hash => hash.replace('#settings/organization/root/jarvis/','#settings/');
   const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-  const captions = { read: '读取文件', read_image: '查看图片', glob: '查找文件', grep: '搜索内容', current_time: '查看当前时间', calculate: '计算与单位、日期换算', web_search: '搜索网页', web_fetch: '读取网页', jarvis_work_query: '查询已交办任务', jarvis_work_submit: '交办任务与传递用户决定' };
+  const captions = { read: '读取文件', read_image: '查看图片', glob: '查找文件', grep: '搜索内容', current_time: '查看当前时间', calculate: '计算与单位、日期换算', web_search: '搜索网页', web_fetch: '读取网页', jarvis_organization_directory: '查询组织架构与职责', jarvis_work_query: '查询已交办任务', jarvis_work_submit: '交办任务与传递用户决定' };
   const taskControls = new Set(['jarvis_work_query', 'jarvis_work_submit']);
   const eligible = tool => Object.hasOwn(captions, tool.name);
   const isTools = () => /^#settings\/tools(?:\/.*)?$/.test(legacyRoute(location.hash));

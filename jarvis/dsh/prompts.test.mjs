@@ -143,7 +143,8 @@ test('installed DSH composes the sole role with official read guidance, tool sch
   // The copied package resolves exactly the host's peer instances; no live host is imported or connected.
   symlinkSync(join(host, 'node_modules'), join(directory, 'node_modules'), 'junction');
   symlinkSync(new URL('../../lib/', import.meta.url), join(directory, 'lib'), 'junction');
-  for (const name of ['dsh/runtime.mjs', 'dsh/read-capabilities.mjs', 'dsh/prompts.mjs', 'dsh/prompts/jarvis.md', 'dsh/gateway.mjs', 'dsh/organization-gateway.mjs', 'dsh/gateway-delivery.mjs', 'dsh/model-discovery.mjs', 'store.mjs', 'config.mjs']) {
+  for (const name of ['dsh/runtime.mjs', 'dsh/read-capabilities.mjs', 'dsh/prompts.mjs', 'dsh/prompts/jarvis.md', 'dsh/gateway.mjs', 'dsh/organization-gateway.mjs', 'dsh/gateway-delivery.mjs', 'dsh/model-discovery.mjs',
+    'dsh/desktop-model-client.mjs', 'dsh/desktop-entry/model-protocol.mjs', 'store.mjs', 'config.mjs']) {
     const target = join(directory, 'jarvis', name); mkdirSync(dirname(target), { recursive: true }); copyFileSync(new URL('../' + name, import.meta.url), target);
   }
   const { JarvisRuntime: HostRuntime } = await import(pathToFileURL(join(directory, 'jarvis/dsh/runtime.mjs')));

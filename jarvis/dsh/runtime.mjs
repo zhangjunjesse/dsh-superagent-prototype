@@ -4,7 +4,7 @@ import { ModelDiscovery } from './model-discovery.mjs';
 import { DesktopModels } from './desktop-model-client.mjs';
 import { JarvisGateway, currentInputSource, gatewayToolNames } from './gateway.mjs';
 import { JarvisPrompts } from './prompts.mjs';
-import { brainDirectToolNames, isBrainDirectTool, readCapabilityDefinitions, executeReadCapability } from './read-capabilities.mjs';
+import { brainDirectToolNames, isBrainDirectTool, readCapabilityDefinitions, executeReadCapability, organizationDirectoryName } from './read-capabilities.mjs';
 import { createHash } from 'node:crypto';
 
 export const defaults = { endpoint: '', model: '', temperature: '', maxTokens: '', reasoning: 'default', timeout: '120', stream: true };
@@ -38,7 +38,8 @@ export function parseDshModel(value) {
 
 // SQLite contains UI projections and Jarvis preferences; the DSH session owns model/tool history.
 export class JarvisRuntime {
-  constructor(ctx, config) {
+  constructor(ctx, config, { readOrganizationDirectory } = {}) {
+    this.readOrganizationDirectory = readOrganizationDirectory;
     this.ctx = ctx; this.config = config; this.active = null; this.agent = null; this.disposers = []; this.bindings = []; this.gatewayToolDisposers = []; this.readToolDisposers = [];
     this.lifecycleManaged = config.lifecycleManaged === true; this.nativeWork = new Map(); this.nativeTurns = new WeakMap(); this.sessionGuardAgents = new WeakSet(); this.retiredSessionIds = new Set(); this.capabilitySnapshots = new Map(); this.nativeSequence = 0;
     this.nativeServices = new Map(); this.nativeServiceHistory = new Map(); this.nativeServiceIds = new WeakMap(); this.nativeServiceSequence = 0;
@@ -467,13 +468,15 @@ export class JarvisRuntime {
     this.detach();
     this.agent = agent;
     this.rememberNativeAgent(agent, true);
-    if (typeof agent.ctx.tools.register === 'function') this.readToolDisposers.push(...readCapabilityDefinitions.map(definition => agent.ctx.tools.register({ ...definition,
+    const definitions = readCapabilityDefinitions.filter(tool => this.providesBrainTool(tool.name));
+    if (typeof agent.ctx.tools.register === 'function') this.readToolDisposers.push(...definitions.map(definition => agent.ctx.tools.register({ ...definition,
       output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
       isConcurrencySafe: () => true,
       execute: async (args, execution) => {
         execution?.signal?.throwIfAborted(); const lease = this.nativeWork.get(execution)?.lease ?? this.nativeLease(agent);
         this.assertLease(lease);
-        const result = await executeReadCapability(definition.name, args, { timeZone: this.config.timeZone });
+        const result = await executeReadCapability(definition.name, args, { timeZone: this.config.timeZone,
+          readOrganizationDirectory: () => this.queryOrganizationDirectory(agent, execution) });
         this.assertLease(lease); return result;
       },
     })));
@@ -493,7 +496,8 @@ export class JarvisRuntime {
       const lease = context.signal ? this.nativeLease(agent) : undefined;
       const assembly = await next();
       if (context.signal) { this.assertLease(lease); context.signal.throwIfAborted(); }
-      return { ...assembly, tools: assembly.tools.filter(tool => this.allowed(tool.name)) };
+      const showDirectory = context.scope === agent && this.active?.kind !== 'background' && (!context.signal || this.active?.kind === 'user');
+      return { ...assembly, tools: assembly.tools.filter(tool => this.allowed(tool.name) && (tool.name !== organizationDirectoryName || showDirectory)) };
     }, { prepend: true }));
     this.bindings.push(agent.ctx.systemPrompt.section({ name: 'jarvis-role', order: 9999, complete: true, interpolate: false,
       text: () => (this.active?.promptSnapshot ?? this.promptSettings.snapshot()).effectiveText }));
@@ -579,7 +583,7 @@ export class JarvisRuntime {
     // Sample the provided tools without our own deny mask; preserve all host restrictions.
     this.liftRestriction?.(); this.liftRestriction = null;
     try {
-      this.catalog = this.agent.ctx.tools.schemas(this.agent).filter(tool => isBrainDirectTool(tool.name) || gatewayToolNames.has(tool.name));
+      this.catalog = this.agent.ctx.tools.schemas(this.agent).filter(tool => this.providesBrainTool(tool.name));
     } finally {
       // Restore policy synchronously, including when catalog discovery fails.
       this.restrict();
@@ -589,8 +593,25 @@ export class JarvisRuntime {
     if (this.active || this.changing || this.preempting || this.closing || this.lifecycleManaged && (this.nativeWork.size || this.agent?.status && this.agent.status !== 'idle')) throw new UserError('请等待当前操作结束', 409);
     if (!allowSwitch && this.store.sessionBinding().status !== 'ready') throw new UserError('会话正在恢复切换，请重试清空或重新连接', 409);
   }
+  providesBrainTool(name) {
+    if (name === organizationDirectoryName) return typeof this.readOrganizationDirectory === 'function';
+    return isBrainDirectTool(name) || gatewayToolNames.has(name);
+  }
+  async queryOrganizationDirectory(agent, execution) {
+    const turn = this.active;
+    const checkAccess = () => {
+      execution?.signal?.throwIfAborted();
+      if (execution?.agent !== agent || this.agent !== agent || this.active !== turn || !this.allowed(organizationDirectoryName) || !this.gateway.origin(agent)) {
+        throw new UserError('组织目录仅供当前集团贾维斯在用户对话中查询', 403);
+      }
+    };
+    checkAccess();
+    const result = await this.readOrganizationDirectory();
+    checkAccess();
+    return result;
+  }
   allowed(name) {
-    if (!isBrainDirectTool(name) && !gatewayToolNames.has(name)) return false;
+    if (!this.providesBrainTool(name)) return false;
     return Object.hasOwn(this.policy.value, name) ? this.policy.value[name] === true : initiallyAllowed.has(name);
   }
   restrict() {

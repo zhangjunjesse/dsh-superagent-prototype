@@ -6,9 +6,9 @@ const calculate = args => executeReadCapability('calculate', args);
 const arithmetic = expression => calculate({ operation: 'arithmetic', expression }).result;
 
 test('brain direct allowlist excludes every execution/mutation tool and unknown name', () => {
-  assert.deepEqual(brainDirectToolNames, ['read', 'read_image', 'glob', 'grep', 'current_time', 'calculate', 'web_search', 'web_fetch']);
+  assert.deepEqual(brainDirectToolNames, ['read', 'read_image', 'glob', 'grep', 'current_time', 'calculate', 'web_search', 'web_fetch', 'jarvis_organization_directory']);
   for (const name of ['write', 'edit', 'bash', 'pwsh', 'working_directory', 'job_kill', 'skill', 'subagent', 'run_code', 'jarvis_work_submit', 'unknown']) assert.equal(isBrainDirectTool(name), false);
-  assert.deepEqual(readCapabilityDefinitions.map(tool => tool.name), ['current_time', 'calculate']);
+  assert.deepEqual(readCapabilityDefinitions.map(tool => tool.name), ['jarvis_organization_directory', 'current_time', 'calculate']);
   assert.throws(() => executeReadCapability('unknown', {}), /未知/);
 });
 
