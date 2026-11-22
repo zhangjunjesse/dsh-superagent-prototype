@@ -22,13 +22,14 @@ async function open(t,{initial=snapshot(),draft,ready=Promise.resolve(),wait=tru
   w.HTMLElement.prototype.scrollIntoView=()=>{}; w.HTMLElement.prototype.scrollTo=()=>{};
   if (draft!==undefined) w.sessionStorage.setItem(storageKey,typeof draft==='string'?draft:JSON.stringify(draft));
   const realTimeout=w.setTimeout.bind(w),realClear=w.clearTimeout.bind(w);let nextPoll=-1;
-  w.setTimeout=(fn,ms,...args)=>{if(ms===5000){const id=nextPoll--;polls.set(id,()=>fn(...args));return id;}return realTimeout(fn,ms,...args);};
+  w.setTimeout=(fn,ms,...args)=>{if(ms===5000||ms===500){const id=nextPoll--;polls.set(id,()=>fn(...args));return id;}return realTimeout(fn,ms,...args);};
   w.clearTimeout=id=>{polls.delete(id);realClear(id);};
   const copy=value=>structuredClone(value);
   const client={ready,state:{model:{value:{endpoint:'ordinary-provider',model:'ordinary-model'}},models:{groups:[{id:model.provider,name:'已配置服务',models:[{id:model.model,name:'实例模型',reasoning:{efforts:[{id:'low',name:'低'},{id:'max',name:'最高'}]}}]}]}},async api(path,method='GET',body){
     const request={path,method,body:copy(body)};requests.push(request);
     if(backend.hook){const result=await backend.hook(request);if(result!==undefined)return copy(result);}
     if(path==='/api/system'&&method==='GET'){if(backend.getError)throw new Error(backend.getError);return copy(backend.snapshot);}
+    if(path==='/api/system?view=topology'&&method==='GET'){if(backend.getError)throw new Error(backend.getError);return {...copy(backend.snapshot),view:'topology'};}
     if(path==='/api/system'&&method==='PUT'){
       if(body.revision!==backend.snapshot.revision)throw Object.assign(new Error('系统配置版本已更新'),{status:409});
       backend.snapshot.nodes=copy(body.nodes).map(n=>({...n,workspace:n.workspace||'D:/managed/'+n.id}));
@@ -254,6 +255,79 @@ test('visible polling updates runtime in place, stops when hidden and marks disc
   ui.backend.getError='服务连接中断';await ui.poll();assert.equal(ui.query('[data-runtime-phase]').textContent,'状态未同步');assert.equal(ui.query('[data-runtime-pid]').textContent,'—');assert.equal(control.disabled,true);
   ui.page.hidden=true;await until(()=>ui.polls.size===0,'poll suspension');const before=ui.requests.length;await delay(15);assert.equal(ui.requests.length,before);
   ui.backend.getError='';ui.page.hidden=false;await until(()=>ui.requests.length>before,'poll resume');
+});
+
+const startup=(state='starting',stage='github')=>({id:'fixture-start',generation:1,state,stage,elapsedMs:1200,
+  stages:[{stage:'process',status:'complete',durationMs:100},{stage:'github',status:state==='blocked'?'blocked':'running',durationMs:1100}]});
+
+test('a new request waits for confirmed backend progress instead of displaying a previous generation as ready',async t=>{
+  const initial=snapshot();initial.runtime.instances=[{instanceId:'root',pid:null,phase:'stopped',generation:1,startup:startup('ready')}];
+  const ui=await open(t,{initial}),precheck=deferred();ui.nav('runtime');
+  ui.backend.hook=request=>{if(request.method==='POST')return precheck.promise;};
+  ui.action('runtime-start','root').click();
+  assert.match(ui.query('[data-runtime-startup]').textContent,/已请求启动，等待确认.*已等待/);
+  assert.doesNotMatch(ui.query('[data-runtime-startup]').textContent,/已就绪/);
+  await ui.poll();assert.match(ui.query('[data-runtime-startup]').textContent,/已请求启动，等待确认/);
+  ui.backend.snapshot.runtime.instances[0]={instanceId:'root',pid:501,phase:'starting',generation:2,startup:{...startup(),id:'confirmed-new-start'}};
+  await ui.poll();assert.match(ui.query('[data-runtime-startup]').textContent,/GitHub 连接检查 · 进行中/);
+  precheck.reject(new Error('预检后启动失败'));await until(()=>!ui.w.compositionUI.isBusy(),'request finished');
+});
+
+test('startup progress polls the status path while its POST is still pending and never announces early readiness',async t=>{
+  const ui=await open(t),pending=deferred();ui.nav('runtime');
+  ui.backend.hook=request=>{if(request.method==='POST'){
+    ui.backend.snapshot.runtime.instances=[{instanceId:'root',pid:500,phase:'starting',generation:1,startup:startup()}];
+    return pending.promise;
+  }};
+  ui.action('runtime-start','root').click();await until(()=>ui.requests.some(r=>r.method==='POST'),'startup POST');
+  await ui.poll();assert.equal(ui.query('[data-runtime-phase]').textContent,'启动中');
+  assert.match(ui.query('[data-startup-stage="github"]').textContent,/GitHub 连接检查 · 进行中/);
+  assert.match(ui.query('[data-startup-stage="environment"]').textContent,/等待/);
+  assert.equal(ui.query('[data-runtime-pid]').textContent,'500');
+  assert.doesNotMatch(ui.query('#composition-toast').textContent,/实例已启动/);
+  const live=ui.backend.snapshot.runtime.instances[0];live.startup.stage='environment';live.startup.elapsedMs=2200;
+  live.startup.stages[1].status='complete';live.startup.stages.push({stage:'environment',status:'running',durationMs:1000});
+  await ui.poll();assert.match(ui.query('[data-startup-stage="environment"]').textContent,/准备执行环境 · 进行中/);
+  assert.equal(ui.w.compositionUI.isBusy(),true,'the real POST has not completed');
+  assert.ok(ui.requests.filter(r=>r.method==='GET'&&r.path.includes('?view=topology')).length>=2);
+  live.phase='running';live.startup.state='ready';live.startup.stages.at(-1).status='complete';
+  pending.resolve(ui.backend.snapshot);await until(()=>!ui.w.compositionUI.isBusy(),'startup acknowledged');
+  assert.match(ui.query('[data-runtime-startup]').textContent,/已就绪/);assert.match(ui.query('#composition-toast').textContent,/实例已启动/);
+});
+
+test('a late progress poll cannot overwrite the startup POST final result',async t=>{
+  const ui=await open(t),post=deferred(),get=deferred();ui.nav('runtime');
+  ui.backend.hook=request=>{
+    if(request.method==='POST')return post.promise;
+    if(request.path==='/api/system?view=topology')return get.promise;
+  };
+  ui.action('runtime-start','root').click();const waitingPoll=ui.poll();
+  await until(()=>ui.requests.some(r=>r.path==='/api/system?view=topology'),'held progress GET');
+  const old=structuredClone(ui.backend.snapshot);old.runtime.instances=[{instanceId:'root',pid:500,phase:'starting',generation:1,startup:startup()}];
+  ui.backend.snapshot.runtime.instances=[{instanceId:'root',pid:500,phase:'running',generation:1,startup:{...startup('ready'),stage:'finalizing'}}];
+  post.resolve(ui.backend.snapshot);await until(()=>!ui.w.compositionUI.isBusy(),'final POST installed');
+  get.resolve(old);await waitingPoll;
+  assert.equal(ui.query('[data-runtime-phase]').textContent,'运行中');assert.match(ui.query('[data-runtime-startup]').textContent,/已就绪/);
+});
+
+test('a process awaiting real setup displays the refusal and does not announce readiness',async t=>{
+  const ui=await open(t);ui.nav('runtime');
+  ui.backend.hook=request=>{if(request.method==='POST'){
+    ui.backend.snapshot.runtime.instances=[{instanceId:'root',pid:500,phase:'running',generation:1,startup:startup('blocked')}];
+    return ui.backend.snapshot;
+  }};
+  ui.action('runtime-start','root').click();await until(()=>!ui.w.compositionUI.isBusy(),'blocked startup acknowledged');
+  assert.equal(ui.query('[data-runtime-phase]').textContent,'等待设置');
+  assert.match(ui.query('[data-runtime-startup]').textContent,/GitHub 连接检查 · 等待设置/);
+  assert.match(ui.query('#composition-toast').textContent,/等待设置/);assert.doesNotMatch(ui.query('#composition-toast').textContent,/实例已启动/);
+});
+
+test('persisted cancellation and interruption remain visible when the process is stopped',async t=>{
+  for(const [state,label] of [['cancelled','启动已取消'],['interrupted','启动已中断'],['failed','启动失败']]){
+    const initial=snapshot();initial.runtime.instances=[{instanceId:'root',pid:null,phase:'stopped',generation:1,startup:startup(state)}];
+    const ui=await open(t,{initial});ui.nav('runtime');assert.match(ui.query('[data-runtime-startup]').textContent,new RegExp(label));
+    assert.equal(ui.query('[data-runtime-pid]').textContent,'—');assert.equal(ui.action('runtime-start','root').disabled,false);
+  }
 });
 
 test('legacy or unsupported draft fields are reviewed explicitly and rejected without mutating the original draft',async t=>{

@@ -5,7 +5,7 @@ import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, credentialHelper, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
-import { SetupError, type SetupProblem } from '../setup.ts'
+import { SetupError, type SetupProblem, type StartupObserver } from '../setup.ts'
 import type { DeploymentNativePort } from './runtime-ports.ts'
 
 export interface SetupHost {
@@ -14,6 +14,7 @@ export interface SetupHost {
   readonly lifetime: AbortSignal
   readonly native?: Pick<DeploymentNativePort, 'probe'>
   readonly allowLocal?: boolean
+  readonly startup?: StartupObserver
   restart(): void
 }
 
@@ -57,6 +58,7 @@ export class Setup {
     catch (error) {
       if (!(error instanceof SetupError)) throw error
       this.problem = error.problem
+      await this.host.startup?.({ stage: error.place === 'github' ? 'github' : 'environment', status: 'blocked' })
       return false
     }
   }
@@ -89,18 +91,23 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
+    await this.host.startup?.({ stage: 'github', status: 'running' })
     const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe, this.path, this.host.allowLocal)
+    await this.host.startup?.({ stage: 'github', status: deployment.github ? 'complete' : 'skipped' })
+    await this.host.startup?.({ stage: 'sources', status: 'running' })
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
       context.logger.warn('dsh-superagent leaves Feishu out: %s', error.message)
       return undefined
     })
+    await this.host.startup?.({ stage: 'sources', status: this.feishuProblem ? 'failed' : feishu ? 'complete' : 'skipped' })
     const resolved = { ...deployment, ...(feishu ? { feishu } : {}) }
     const machineProblem = (error: unknown): never => {
       if (error instanceof SetupError) throw error
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
+    await this.host.startup?.({ stage: 'environment', status: 'running' })
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
     if (!this.host.native) this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
     const verified = this.host.native ? this.verifyNative(resolved) : verifyEnvironment(resolved, context.subprocess, lifetime)
@@ -108,6 +115,7 @@ export class Setup {
       this.restore()
       machineProblem(error)
     })
+    await this.host.startup?.({ stage: 'environment', status: 'complete' })
     return resolved
   }
   private async verifyNative(deployment: Deployment): Promise<void> {

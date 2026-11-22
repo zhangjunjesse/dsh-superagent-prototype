@@ -7,6 +7,7 @@ import { ProcessPeer, CONVERSATION_RPC_TIMEOUT_MS } from './ipc.mjs';
 import { DshBridge, installBridgeLifecycleGuard } from './dsh-bridge.mjs';
 import { NativeHost, installNativeLifecycleGuard } from './native-host.mjs';
 import { nativeHash } from './native-journal.mjs';
+import { beginStartup, cancelStartup, finishStartup, restoreStartup, startupSnapshot, updateStartup } from './startup-progress.mjs';
 import { readOriginalAdoption } from './original-adoption.mjs';
 import { lockSync } from 'proper-lockfile';
 import { DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normalizeEngineConfig } from '../../lib/process-runtime.js';
@@ -171,6 +172,7 @@ export class ProcessManager {
         participant.setCapabilityHold?.(this.capabilityHolds.get(id));
       }
       for (const item of this.instances.values()) if (this.cleanupIntent(item)?.pending) { item.cleanupPending = true; item.phase = 'failed'; }
+      this.restoreStartups();
       this.record();
     } catch (error) { this.releaseLock(); throw error; }
     this.initialization = Promise.resolve().then(async () => { await this.recoverCleanup(); await this.recoverRestarts(); });
@@ -198,6 +200,7 @@ export class ProcessManager {
   }
   beginStop(item, reason) {
     item.phase = 'stopping'; item.cleanupPending = true;
+    if (cancelStartup(item.startup)) this.event(item, 'startup-cancelling', { attemptId: item.startup.id, stage: item.startup.stage, elapsedMs: item.startup.elapsedMs });
     this.suspendParticipant(item, reason);
     item.native?.setLifecycleStopping?.(true);
     item.bridge?.setLifecycleStopping?.(true);
@@ -211,6 +214,7 @@ export class ProcessManager {
   status() {
     return { hostPid: process.pid, instances: [...this.instances.values()].map(item => ({ instanceId: item.config.instanceId,
       pid: item.child?.pid ?? null, phase: item.phase, generation: item.generation,
+      ...(item.startup ? { startup: startupSnapshot(item.startup) } : {}),
       ...(item.management ? { managementPid: item.management.ended ? null : item.management.child.pid, managementPhase: item.management.phase } : {}),
       ...(metadataPending(item) ? { metadataPending: true } : {}),
       ...(this.capabilityHolds.has(item.config.instanceId) ? { capabilityHold: { ...this.capabilityHolds.get(item.config.instanceId) } } : {}),
@@ -546,6 +550,21 @@ export class ProcessManager {
     writeFileSync(temporary, JSON.stringify({ at: new Date().toISOString(), ...this.status() }, null, 2));
     replaceAtomic(temporary, file);
   }
+  restoreStartups() {
+    let previous;
+    try { previous = JSON.parse(readFileSync(join(this.rootDir, 'processes.json'), 'utf8')); } catch { return; }
+    if (!Array.isArray(previous?.instances)) return;
+    for (const item of this.instances.values()) {
+      const saved = previous.instances.find(row => row.instanceId === item.config.instanceId)?.startup;
+      item.startup = restoreStartup(saved);
+      if (['starting','cancelling'].includes(saved?.state) && item.startup) this.event(item, 'startup-interrupted', { generation: item.startup.generation,
+        attemptId: item.startup.id, stage: item.startup.stage, elapsedMs: item.startup.elapsedMs });
+    }
+  }
+  finishStartup(item, state) {
+    if (finishStartup(item.startup, state)) this.event(item, `startup-${state}`, { attemptId: item.startup.id,
+      stage: item.startup.stage, elapsedMs: item.startup.elapsedMs });
+  }
   event(item, event, extra = {}) {
     appendFileSync(join(item.config.stateDir, 'lifecycle.jsonl'), JSON.stringify({ at: new Date().toISOString(), instanceId: item.config.instanceId,
       generation: item.generation, hostPid: process.pid, pid: item.child?.pid ?? null, event, ...extra }) + '\n');
@@ -576,13 +595,16 @@ export class ProcessManager {
     if (item.stopEpoch !== stopEpoch) throw new Error('Instance start was superseded by an explicit stop');
     item.phase = 'starting'; item.error = undefined; item.generation++;
     item.runtimeMetadata = metadata(item.config);
+    item.startup = beginStartup(item.generation);
     const generation = item.generation;
     this.saveCleanupIntent(item, true);
-    const stdout = openSync(join(item.config.stateDir, 'stdout.log'), 'a'), stderr = openSync(join(item.config.stateDir, 'stderr.log'), 'a');
-    let child;
-    try { child = fork(this.entry, [], { cwd: item.config.workspace, execPath: process.execPath, execArgv: [],
+    let child, stdout, stderr;
+    try {
+      stdout = openSync(join(item.config.stateDir, 'stdout.log'), 'a'); stderr = openSync(join(item.config.stateDir, 'stderr.log'), 'a');
+      child = fork(this.entry, [], { cwd: item.config.workspace, execPath: process.execPath, execArgv: [],
       windowsHide: true, stdio: ['ignore', stdout, stderr, 'ipc'], serialization: 'json', env: childEnvironment() }); }
-    finally { closeSync(stdout); closeSync(stderr); }
+    catch (error) { item.phase = 'failed'; item.error = error.message; this.finishStartup(item, 'failed'); throw error; }
+    finally { if (stdout !== undefined) closeSync(stdout); if (stderr !== undefined) closeSync(stderr); }
     item.child = child;
     let bridge;
     try { bridge = item.bridge = this.bridgeFactory(item.config, input => {
@@ -590,6 +612,7 @@ export class ProcessManager {
       return item.peer.call('tool', input, 30000);
     }); } catch (error) {
       child.on('error', () => {}); child.kill(); item.child = null; item.phase = 'failed';
+      this.finishStartup(item, 'failed');
       item.error = error.message; this.event(item, 'initialization-failed'); throw error;
     }
     bridge.setCapabilityHold?.(this.capabilityHolds.get(item.config.instanceId));
@@ -607,6 +630,11 @@ export class ProcessManager {
       'delegation.catalog': () => this.delegationCatalog(item, generation),
       'delegation.send': input => this.delegate(item, generation, input),
       'runtime.restart': () => this.requestRestart(item, generation),
+      'runtime.startup': update => {
+        if (item.generation !== generation || item.child !== child || item.phase !== 'starting') throw new Error('Startup generation is no longer active');
+        this.event(item, 'startup-progress', updateStartup(item.startup, update));
+        return { recorded: true };
+      },
     });
     try {
       const adoption = readOriginalAdoption(item.config.stateDir, item.config.instanceId);
@@ -615,6 +643,7 @@ export class ProcessManager {
         isCurrent: () => item.generation === generation && item.child === child && ['starting', 'running', 'stopping'].includes(item.phase) });
     } catch (error) {
       item.peer.close(); child.on('error', () => {}); child.kill(); item.child = null; item.phase = 'failed';
+      item.error = error.message; this.finishStartup(item, 'failed');
       await Promise.resolve(bridge.close()).catch(() => {}); item.bridge = null; throw error;
     }
     child.once('error', error => { item.error = error.message; });
@@ -627,6 +656,7 @@ export class ProcessManager {
         // Invalidate all model/tool callbacks before allowing another generation to start.
         if (item.child === child) {
           if (item.phase !== 'stopping') { item.phase = 'failed'; item.error = `Instance exited (${code ?? signal ?? 'unknown'})`; }
+          if (item.phase !== 'stopping') this.finishStartup(item, 'failed');
           item.cleanupPending = true;
         }
         const native = item.native;
@@ -655,17 +685,20 @@ export class ProcessManager {
       const hold = this.capabilityHolds.get(item.config.instanceId);
       const result = await item.peer.call('initialize', { ...item.config, ...(hold ? { capabilityHold: { ...hold } } : {}) }, 240000);
       if (this.closing || item.child !== child || item.generation !== generation || item.phase !== 'starting' || result?.pid !== child.pid || result?.instanceId !== item.config.instanceId || child.exitCode !== null) throw new Error('Instance initialization identity mismatch');
-      item.phase = 'running'; this.event(item, 'ready');
+      item.phase = 'running'; this.record();
       const participant = this.lifecycleParticipants.get(item.config.instanceId);
       if (participant) {
         const isCurrent = () => this.instances.get(item.config.instanceId) === item && item.generation === generation && item.child === child && item.phase === 'running' && !item.cleanupPending && !this.closing;
         await participant.resumeInstance({ runtimeId: this.lifecycleOwnerId, generation, isCurrent });
         if (!isCurrent()) throw new Error('Instance changed while resuming its lifecycle participant');
       }
+      this.finishStartup(item, result.ready === false ? 'blocked' : 'ready');
+      if (result.ready !== false) this.event(item, 'ready');
       this.completeRestart(item);
       return this.status();
     } catch (error) {
       item.error = error.message;
+      if (item.startup?.state !== 'cancelling') this.finishStartup(item, 'failed');
       try { await this.stopInstance(item); } catch (cleanup) { error.message += `; Cleanup pending: ${cleanup.message}`; }
       item.phase = 'failed'; this.record(); throw error;
     }
@@ -979,9 +1012,11 @@ export class ProcessManager {
     if (failures.length || item.child || item.bridge || item.native || item.management) {
       item.phase = 'failed'; item.cleanupPending = true;
       item.error = `Instance cleanup pending: ${failures.map(error => error.message).join('; ') || 'An owner remains active'}`;
+      this.finishStartup(item, 'failed');
       this.record(); throw new Error(item.error);
     }
     item.phase = 'stopped'; item.cleanupPending = false; item.error = undefined;
+    this.finishStartup(item, 'cancelled');
     if (this.cleanupIntent(item)?.pending) this.saveCleanupIntent(item, false);
     this.record();
   }

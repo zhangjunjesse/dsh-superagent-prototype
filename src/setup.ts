@@ -1,6 +1,13 @@
 /** Structured startup and configuration errors with the settings location where the operator can fix them. */
 import { fill } from './infra/text.ts'
 
+/** Stage-only startup observations; no command output, settings, paths or credentials cross this boundary. */
+export interface StartupProgress {
+  stage: 'github' | 'sources' | 'environment' | 'sessions' | 'finalizing'
+  status: 'running' | 'complete' | 'skipped' | 'blocked' | 'failed'
+}
+export type StartupObserver = (progress: StartupProgress) => void | Promise<void>
+
 export type SetupPlace = 'deployment' | 'github' | 'feishu'
 export const SETUP_PROBLEMS = {
   foreignFile: ['deployment', '{file} was not written by dsh-superagent; move it, or choose another state directory.'],

@@ -110,13 +110,19 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!accounts.cli) throw new SetupError('agentCliUnset')
   let cli: string
   try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('agentCliMissing', { output: reason(error) }) }
-  const text = await probe([cli, 'api', 'user']).catch((error: unknown) => { throw new SetupError('agentCliSignedOut', { output: reason(error) }) })
-  const agent = parsed(GithubUser, text)
+  // Both REST reads use the same existing CLI identity and are independent. Wait
+  // for both so a failed repository read cannot become an unhandled rejection;
+  // interpret them in the original order to preserve setup's error priority.
+  const [identity, repositoryAccess] = await Promise.allSettled([
+    probe([cli, 'api', 'user']),
+    probe([cli, 'api', `repos/${remote}`, '--jq', '{name: .full_name, push: .permissions.push}']),
+  ])
+  if (identity.status === 'rejected') throw new SetupError('agentCliSignedOut', { output: reason(identity.reason) })
+  const agent = parsed(GithubUser, identity.value)
   if (!agent) throw new SetupError('agentCliNoAccount')
   // Use the canonical repository name returned by GitHub so renamed repositories match incoming notifications.
-  const access = parsed(RepositoryAccess, await probe([cli, 'api', `repos/${remote}`, '--jq', '{name: .full_name, push: .permissions.push}']).catch((error: unknown) => {
-    throw new SetupError('repositoryUnreadable', { account: agent.login, repository: remote, output: reason(error) })
-  }))
+  if (repositoryAccess.status === 'rejected') throw new SetupError('repositoryUnreadable', { account: agent.login, repository: remote, output: reason(repositoryAccess.reason) })
+  const access = parsed(RepositoryAccess, repositoryAccess.value)
   if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })

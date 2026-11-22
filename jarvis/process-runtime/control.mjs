@@ -81,10 +81,17 @@ function lifecycle(file, instanceId) {
   return lines.flatMap(line => {
     let row;
     try { row = JSON.parse(line); } catch { return []; }
-    if (!object(row) || row.instanceId !== instanceId || !['start', 'ready', 'stop', 'exit', 'initialization-failed'].includes(row.event)) return [];
+    if (!object(row) || row.instanceId !== instanceId || !['start', 'ready', 'stop', 'exit', 'initialization-failed', 'startup-progress',
+      'startup-ready', 'startup-blocked', 'startup-failed', 'startup-cancelling', 'startup-cancelled', 'startup-interrupted'].includes(row.event)) return [];
     return [{ at: typeof row.at === 'string' ? row.at.slice(0, 80) : null, event: row.event,
       generation: Number.isSafeInteger(row.generation) ? row.generation : null,
       pid: Number.isSafeInteger(row.pid) ? row.pid : null,
+      ...(row.event.startsWith('startup-') ? {
+        stage: ['process','github','sources','environment','sessions','finalizing'].includes(row.stage) ? row.stage : null,
+        status: ['running','complete','skipped','blocked','failed','cancelling','cancelled','interrupted'].includes(row.status) ? row.status : null,
+        elapsedMs: Number.isSafeInteger(row.elapsedMs) && row.elapsedMs >= 0 ? row.elapsedMs : null,
+        durationMs: Number.isSafeInteger(row.durationMs) && row.durationMs >= 0 ? row.durationMs : null,
+      } : {}),
       ...(row.event === 'exit' ? { code: Number.isSafeInteger(row.code) ? row.code : null,
         signal: typeof row.signal === 'string' && /^[A-Z0-9-]{1,30}$/i.test(row.signal) ? row.signal : null } : {}) }];
   }).slice(-50);

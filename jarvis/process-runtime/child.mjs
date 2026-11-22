@@ -13,6 +13,7 @@ async function initialize(config, managementOnly = false) {
     if (runtime || initializing || closing) throw new Error('Instance already initialized');
     initializing = true;
     try {
+      let startupReady = false;
       const { capabilityHold, ...businessConfig } = config;
       config = businessConfig;
       const adoption = readOriginalAdoption(config.stateDir, config.instanceId);
@@ -27,12 +28,16 @@ async function initialize(config, managementOnly = false) {
         delegate: input => managementOnly || closing ? peer.call('delegation.send', input) : native.wire.call('delegate', input),
         delegationCatalog: () => peer.call('delegation.catalog', {}, 15000),
       }, { native, managementOnly, adoption, capabilityHold,
+        startup: managementOnly ? undefined : async update => {
+          await peer.call('runtime.startup', update, 5000);
+          if (update.stage === 'finalizing' && update.status === 'complete') startupReady = true;
+        },
         restart: () => { void peer.call('runtime.restart').catch(error => { process.stderr.write(`Organization restart request failed: ${error.message}\n`); }); } });
       native.managementHandler = input => requireRuntime().management(input);
       native.delegationHandler = input => requireRuntime().delegation(input);
       native.stateHandler = () => requireRuntime().state();
       await runtime.ready;
-      return { pid: process.pid, instanceId: config.instanceId };
+      return { pid: process.pid, instanceId: config.instanceId, ready: managementOnly || startupReady };
     } catch (error) {
       try { await runtime?.close(); } finally { native?.close(); }
       throw error;
