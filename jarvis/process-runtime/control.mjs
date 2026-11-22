@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { ProcessManager } from './manager.mjs';
 import { CapabilityApplications } from './capability-applications.mjs';
 import { WORKER_TOOL_NAMES, WorkerSkillsSchema, effectiveWorkerTools, normalizeEngineConfig, defaultEngineConfig } from '../../lib/process-runtime.js';
@@ -14,6 +15,9 @@ const samePath = (first, second) => relative(first, second) === '';
 const idPattern = /^[a-z][a-z0-9-]{0,47}$/;
 const reservedId = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 const clone = value => structuredClone(value);
+const metadataKeys = ['name', 'brainName', 'description', 'capabilities'];
+const updateKeys = new Set([...metadataKeys, 'model']);
+const scopedKeys = new Set([...updateKeys, 'roleModels']);
 
 /** Expected management error whose status may be returned by the host's authenticated HTTP route. */
 export class SystemControlError extends Error {
@@ -338,14 +342,49 @@ export class SystemControl {
     if (node.workerSkills?.length && !catalog.complete) throw new SystemControlError(400, '技能目录尚未完整读取，请稍后再试');
     for (const name of node.workerSkills ?? []) if (!catalog.skills.some(skill => skill.name === name)) throw new SystemControlError(400, `Worker 技能 ${name} 在当前工作目录不可用`);
   }
+  saveNodes(input) {
+    if (!object(input) || Object.keys(input).some(key => !['revision', 'nodes', 'update'].includes(key))
+      || Object.hasOwn(input, 'nodes') === Object.hasOwn(input, 'update')) throw new SystemControlError(400, '系统配置请求格式无效');
+    if (!Object.hasOwn(input, 'update')) return input.nodes;
+    const update = input.update;
+    if (!object(update) || Object.keys(update).some(key => !['id', 'changes'].includes(key))
+      || typeof update.id !== 'string' || !object(update.changes)
+      || Object.keys(update.changes).some(key => !updateKeys.has(key))) throw new SystemControlError(400, '组织信息更新包含不支持的字段');
+    this.assertRevision(input.revision);
+    const current = this.nodes?.find(node => node.id === update.id);
+    if (!current) throw new SystemControlError(404, '请先保存当前组织');
+    if (Object.hasOwn(update.changes, 'model')) modelReference(update.changes.model);
+    // Merge on the server. A scoped edit cannot submit stale mirrors of original settings or another organization.
+    return this.nodes.map(node => node.id === update.id ? { ...clone(current), ...clone(update.changes) } : clone(node));
+  }
+  nodeChanges(nodes) {
+    return nodes.map(node => {
+      const previous = this.nodes?.find(item => item.id === node.id);
+      return { node, previous, keys: [...new Set([...Object.keys(previous ?? {}), ...Object.keys(node)])]
+        .filter(key => !previous || !isDeepStrictEqual(previous[key], node[key])) };
+    });
+  }
+  async checkChangedModels(changes) {
+    const checked = new Set();
+    for (const { node, previous, keys } of changes) {
+      const models = [];
+      if (keys.includes('model')) models.push(node.model);
+      for (const role of ['router', 'worker']) if (!isDeepStrictEqual(node.roleModels[role], previous?.roleModels[role])) models.push(node.roleModels[role]);
+      for (const model of models) {
+        const key = JSON.stringify(model);
+        if (!checked.has(key)) { await this.checkModel(model); checked.add(key); }
+      }
+    }
+  }
   async save(input) {
     await this.initialization;
-    if (!object(input) || Object.keys(input).some(key => !['revision', 'nodes'].includes(key))) throw new SystemControlError(400, '系统配置请求格式无效');
+    const proposed = this.saveNodes(input);
     this.assertRevision(input.revision);
     if (this.saving || this.actions.size) throw new SystemControlError(409, '系统配置保存或实例启停正在进行，请稍后重试');
     this.saving = true;
     try {
-      const nodes = this.normalizeNodes(input.nodes), identities = { ...this.identities };
+      const nodes = this.normalizeNodes(proposed), identities = { ...this.identities }, changes = this.nodeChanges(nodes);
+      const scoped = this.nodes?.length === nodes.length && changes.every(change => change.previous && change.keys.every(key => scopedKeys.has(key)));
       for (const node of nodes) {
         const stateDir = this.stateDirectory(node.id), hasState = existsSync(stateDir) && readdirSync(stateDir).length > 0;
         if (!Object.hasOwn(identities, node.id) && hasState) throw new SystemControlError(409, '该实例的状态目录已有未登记数据，请检查原配置，不能自动接管');
@@ -353,13 +392,24 @@ export class SystemControl {
           throw new SystemControlError(409, '该实例已有持久状态，不能改指其他工作目录');
         }
         identities[node.id] = node.workspace;
-        await this.checkExecution(node);
       }
+      // Select validation from the normalized difference, never a caller's claimed scope or read-only execution projection.
+      if (scoped) await this.checkChangedModels(changes);
+      else for (const change of changes) if (change.keys.length) await this.checkExecution(change.node);
       this.assertRevision(input.revision);
-      this.capabilities.assertUnrelated(this.manager.affectedInstances(this.runtimeConfig(nodes)));
+      const runtime = this.runtimeConfig(nodes);
+      this.capabilities.assertUnrelated(this.manager.affectedInstances(runtime));
       const revision = this.revision + 1;
-      await this.manager.reconfigureManaged(this.runtimeConfig(nodes), { persist: () => this.commitConfiguration({ revision, nodes, identities }) });
+      const persist = () => this.commitConfiguration({ revision, nodes, identities });
+      if (scoped) this.manager.reconfigureScoped(runtime, { persist });
+      else await this.manager.reconfigureManaged(runtime, { persist });
       this.nodes = nodes; this.identities = identities; this.revision = revision;
+      if (Object.hasOwn(input, 'update')) {
+        // This response acknowledges the atomic commit; it must not wait for unrelated management or capability reads.
+        return { ...await this.get({ view: 'topology' }), view: 'configuration',
+          saved: { instanceId: input.update.id, fields: changes.find(change => change.node.id === input.update.id).keys,
+            effect: 'next-start' } };
+      }
       return this.get();
     } catch (error) {
       if (error instanceof SystemControlError) throw error;

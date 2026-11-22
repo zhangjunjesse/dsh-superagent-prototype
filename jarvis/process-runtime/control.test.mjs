@@ -263,7 +263,8 @@ test('concurrent save and lifecycle requests cannot bypass the configuration rev
   const control = new SystemControl({}, options({ validateModel: async () => { if (blocked) { validating(); await held; } } }));
   try {
     const initial = await setup(control, []); blocked = true;
-    const saving = control.save({ revision: initial.revision, nodes: initial.nodes });
+    const changed=structuredClone(initial.nodes); changed[0].model={...defaultModel,model:'model-b'};
+    const saving = control.save({ revision: initial.revision, nodes: changed });
     await entered;
     await rejectsStatus(control.save({ revision: initial.revision, nodes: initial.nodes }), 409);
     await rejectsStatus(control.action('root', 'start', initial.revision), 409);
@@ -333,7 +334,7 @@ test('a stopped-only save preserves unchanged live instances and derived delegat
     let saved = await setup(control);
     await control.action('root', 'start', saved.revision); await control.action('research', 'start', saved.revision);
     const before = await control.get();
-    const changed = structuredClone(saved.nodes); changed[1].description = 'Changed directory capability';
+    const changed = structuredClone(saved.nodes); changed[1].concurrency = 6;
     await rejectsStatus(control.save({ revision: saved.revision, nodes: changed }), 409);
     saved = await control.save({ revision: saved.revision, nodes: saved.nodes });
     assert.equal(status(saved, 'root').pid, status(before, 'root').pid); assert.equal(status(saved, 'research').pid, status(before, 'research').pid);
@@ -472,11 +473,17 @@ test('original settings drive execution summaries, model validation and skill di
   assert.equal((await control.workerCapabilities('root')).catalog.skills[0].name,'actual-skill');
   assert.ok(requestedDirectories.includes(actualRoot));
   validatedModels.length=0;
+  const previousModels=structuredClone(saved.nodes[0].roleModels);
   saved.nodes[0].roleModels={router:{...defaultModel,model:'retired-model'},worker:{...defaultModel,model:'retired-model'}};
   saved.nodes[0].execution={maxWorkers:999,directory:'untrusted projection'};
   saved.nodes[0].executionError='untrusted error';
+  await rejectsStatus(control.save({revision:saved.revision,nodes:saved.nodes}),400);
+  assert.deepEqual(validatedModels,['retired-model'],'a forged projection cannot bypass validation of an explicitly changed model');
+  saved.nodes[0].roleModels=previousModels; saved.nodes[0].name='Metadata only'; validatedModels.length=0;
   saved=await control.save({revision:saved.revision,nodes:saved.nodes});
-  assert.deepEqual(validatedModels,['model-a','actual-eval']);
+  assert.deepEqual(validatedModels,[],'metadata does not revalidate unchanged initialization mirrors or unavailable execution models');
+  await control.checkExecution(control.nodes[0]);
+  assert.deepEqual(validatedModels,['model-a','actual-eval'],'start and capability validation still use the authoritative original models');
   assert.equal(saved.nodes[0].execution.maxWorkers,7);
   const disk=JSON.parse(readFileSync(control.file,'utf8'));
   assert.equal(Object.hasOwn(disk.nodes[0],'execution'),false);
@@ -490,6 +497,7 @@ test('original settings drive execution summaries, model validation and skill di
   const unavailable=await control.get();
   assert.equal(unavailable.nodes[0].execution,null);
   assert.equal(unavailable.catalogs.root.complete,false);
+  unavailable.nodes[0].concurrency=5;
   await rejectsStatus(control.save({revision:unavailable.revision,nodes:unavailable.nodes}),503);
 });
 
@@ -586,7 +594,8 @@ test('save and start validate fresh capabilities even when a page read is pendin
   mode = 'unavailable';
   // Release even on a broken implementation so the test reports the authorization error instead of hanging.
   const timer = setTimeout(release, 500);
-  try { await rejectsStatus(control.save({ revision: saved.revision, nodes: saved.nodes }), 400); }
+  const changed=structuredClone(saved.nodes); changed[0].workerTools=['read'];
+  try { await rejectsStatus(control.save({ revision: saved.revision, nodes: changed }), 400); }
   finally { clearTimeout(timer); release(); }
   await reading;
   await rejectsStatus(control.action('root', 'start', saved.revision), 400);

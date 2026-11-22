@@ -122,6 +122,12 @@
   const workerCapacity = n => maxWorkersOf(n)===undefined?'并发上限未同步':`并发上限 ${maxWorkersOf(n)}`;
   const workerCapacityDetail = n => maxWorkersOf(n)===undefined?'实际并发上限未同步':`按任务自动分配 · 最多同时执行 ${maxWorkersOf(n)} 个任务`;
   const configurationNode = value => { const {execution,executionError,...saved}=value; return saved; };
+  const organizationFields = ['name','brainName','description','capabilities','model'];
+  const sameField = (key, left, right) => key==='model'
+    ? ['provider','model','reasoningEffort'].every(part=>left?.[part]===right?.[part]) : left===right;
+  const organizationChanges = (value, original) => Object.fromEntries(organizationFields
+    .map(key=>[key,typeof value[key]==='string'?value[key].trim():value[key]])
+    .filter(([key,next])=>!sameField(key,next,original[key])));
   const pill = n => `<span class="status-pill ${connected()?'neutral':'pending'}" data-runtime-label="${escape(n.id)}"><i></i>${connected()?escape(runtimeLabel(n.id)):n.kind === 'root' ? '状态未同步' : '待连接'}</span>`;
   const button = (label, action, id = '', style = 'secondary', glyph = '') => `<button type="button" class="btn ${style}" data-action="${action}"${id ? ` data-id="${escape(id)}"` : ''}>${glyph ? icon(glyph) : ''}<span>${label}</span></button>`;
   function announce(message) {
@@ -144,6 +150,16 @@
   }
   function installSnapshot(snapshot, updateConfiguration = true) {
     if (!snapshot?.available || !Array.isArray(snapshot.nodes) || !Number.isInteger(snapshot.revision) || !snapshot.nodes.some(item => item.id === snapshot.rootId)) throw new Error('系统配置响应无效，请重试。');
+    if (snapshot.view==='configuration' && service.snapshot) {
+      const catalogs={};
+      snapshot={...snapshot,nodes:snapshot.nodes.map(value=>{
+        const previous=service.snapshot.nodes.find(item=>item.id===value.id);
+        // A scoped save/readback does not refresh original execution settings. Retain only unchanged organizations' read-only projections.
+        if (!previous || ['workspace','roleModels','concurrency','engine','workerTools','workerSkills'].some(key=>JSON.stringify(previous[key])!==JSON.stringify(value[key]))) return value;
+        if (service.snapshot.catalogs?.[value.id]) catalogs[value.id]=service.snapshot.catalogs[value.id];
+        return {...value,...Object.fromEntries(['execution','executionError'].filter(key=>Object.hasOwn(previous,key)).map(key=>[key,previous[key]]))};
+      }),catalogs};
+    }
     service.snapshot = snapshot; service.phase = 'connected'; service.error = '';
     if (updateConfiguration) {
       state = {version:1,nodes:structuredClone(snapshot.nodes)};
@@ -693,6 +709,7 @@
       for (const role of ['router','worker']) editor.value.roleModels[role] ??= structuredClone(editor.value.model ?? {});
       if (!editor.value.engine && service.snapshot.defaults.engine) editor.value.engine=structuredClone(service.snapshot.defaults.engine);
     }
+    editor.original=structuredClone(editor.value);
     selectEditorTab(tab,section); navigate('editor');
   }
   const field = (label, name, value, options = {}) => `<div class="field${options.wide?' full-width':''}"><label for="field-${name}">${label}${options.required?' <span class="required-dot">*</span>':''}</label>${options.multiline ? `<textarea id="field-${name}" name="${name}" rows="3" maxlength="${options.max||500}" placeholder="${escape(options.placeholder||'')}">${escape(value)}</textarea>` : `<input id="field-${name}" name="${name}" type="${options.type||'text'}" value="${escape(value)}" ${options.required?'required':''} ${options.readonly?'readonly':''} ${options.disabled?'disabled':''} ${options.list?`list="${escape(options.list)}"`:''} ${options.type==='number'?`min="${options.min??1}" max="${options.max??20}"`:`maxlength="${options.max||160}"`} placeholder="${escape(options.placeholder||'')}" autocomplete="off">`}${options.help?`<small>${options.help}</small>`:''}</div>`;
@@ -758,7 +775,7 @@
     const n = editor.value, tabs = editorTabs(n); if (!tabs.some(([id])=>id===editorTab)) editorTab = 'basic';
     const title = editor.isNew ? '添加下级 SuperJarvis' : organizationMode() ? n.name+' · 设置' : '实例配置';
     const embedded=organizationMode() && editorTab==='engine' && !editor.isNew;
-    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'修改前先停止实例；保存后重新启动当前组织生效':'修改运行中的实例前，请先停止该实例';
+    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'组织信息可在运行时保存，页面名称立即更新；大脑名称和路由说明在下次启动后生效。修改模型须先停止当前组织，保存后下次启动生效。':'修改运行中的实例前，请先停止该实例';
     if (embedded && engineMount?.id===n.id && engineMount.target.isConnected) {
       engineMount.controller?.update(engineLocation()); return;
     }
@@ -930,15 +947,18 @@
     service.conflict=snapshot;
     const area=byId('system-conflict-review'); if (!area || !editor) return;
     const latest=snapshot.nodes.find(n=>n.id===editor.value.id), removed=!latest&&!editor.isNew;
+    if (removed) showEditorError('此组织已在其他位置移除。当前草稿已保留，请返回组织架构核对。');
     area.hidden=false;
     area.innerHTML=`<div class="system-conflict-panel"><h2>配置已在其他位置更新</h2><p>当前编辑内容已保留。核对后采用最新系统版本，再保存当前实例；其他实例使用最新配置。</p><div class="configuration-comparison"><section><h3>系统中的当前配置</h3><pre>${escape(latest?JSON.stringify(latest,null,2):removed?'此实例已被移除，请返回系统重新选择。':'尚未添加此实例')}</pre></section><section><h3>当前编辑内容</h3><pre>${escape(JSON.stringify(editor.value,null,2))}</pre></section></div><button type="button" class="btn secondary" data-action="accept-latest"${removed?' disabled':''}>保留更改并采用最新版本</button></div>`;
   }
   async function saveConnectedEditor(value) {
     if (settingsPending()) return;
-    if (organizationMode() && !editor.isNew) {
+    const scoped=organizationMode() && !editor.isNew;
+    const changes=scoped?organizationChanges(value,editor.original):null;
+    if (scoped) {
       // The original settings APIs own executor, eval, prompts and Worker authorization. A metadata edit must not resave their stale mirrors.
       const base=state.nodes.find(item=>item.id===value.id);
-      if (base) value={...structuredClone(base),...Object.fromEntries(['name','brainName','description','capabilities','model'].map(key=>[key,value[key]]))};
+      if (base) value={...structuredClone(base),...changes};
       delete value.redelegate; delete value.depth;
     }
     value=configurationNode(value);
@@ -947,19 +967,36 @@
     value.name=value.name.trim(); value.brainName=value.brainName.trim(); value.workspace=value.workspace.trim();
     const nodes=structuredClone(state.nodes).map(configurationNode), index=nodes.findIndex(n=>n.id===value.id);
     if (index<0) nodes.push(value); else nodes[index]=value;
-    const form=byId('unit-form'), editing=editor; form.inert=true; service.busy=true; service.epoch++; clearTimeout(service.pollTimer);
+    const form=byId('unit-form'), editing=editor; let committed=false;
+    form.inert=true; service.busy=true; service.epoch++; clearTimeout(service.pollTimer);
     byId('draft-indicator').textContent='正在保存…';
     try {
-      const snapshot=await apiClient().api('/api/system','PUT',{revision:editing.revision,nodes});
+      const input=scoped?{revision:editing.revision,update:{id:value.id,changes}}:{revision:editing.revision,nodes};
+      let snapshot=await apiClient().api('/api/system','PUT',input);
+      if (scoped) {
+        const matches=actual=>actual?.available && Number.isSafeInteger(actual.revision) && actual.revision>=editing.revision+1
+          && actual.nodes?.some(item=>item.id===value.id && Object.entries(changes).every(([key,next])=>sameField(key,item[key],next)));
+        if (snapshot.revision!==editing.revision+1 || snapshot.saved?.instanceId!==value.id || snapshot.saved?.effect!=='next-start'
+          || !Array.isArray(snapshot.saved.fields) || JSON.stringify([...snapshot.saved.fields].sort())!==JSON.stringify(Object.keys(changes).sort())
+          || !matches(snapshot)) throw new Error('暂时无法确认保存结果，请重新读取后核对。');
+        committed=true;
+        snapshot=await apiClient().api('/api/system?view=topology');
+        if (!matches(snapshot)) throw new Error('保存后的组织配置已有变化，请重新读取后核对。');
+        snapshot={...snapshot,view:'configuration'};
+      }
       installSnapshot(snapshot); service.conflict=null;
       if (editor===editing) { editor=null; navigate(editorReturn); }
-      announce(editing.isNew?'下级 SuperJarvis 已添加，尚未启动；进入下级的运行状态，启动后即可接单。':savedConfigurationText());
+      announce(editing.isNew?'下级 SuperJarvis 已添加，尚未启动；进入下级的运行状态，启动后即可接单。':scoped
+        ?Object.hasOwn(changes,'model')?'组织模型已保存，下次启动后生效。':'组织信息已保存，页面已更新；运行中的大脑与路由信息下次启动后生效。':savedConfigurationText());
     } catch (error) {
       if (editor!==editing) { announce(error.message||'配置保存失败，请重试。'); return; }
-      editor.dirty=true; byId('draft-indicator').textContent='更改尚未保存'; showEditorError(error.message||'配置保存失败，请重试。');
+      const uncertain=scoped && (!error.status || error.status>=500);
+      editor.dirty=true; byId('draft-indicator').textContent=committed?'已保存，回读待确认':uncertain?'保存结果待核对':'更改尚未保存';
+      showEditorError(committed?'组织配置已保存，但未能回读确认。更改仍保留，请重新读取后核对。':error.message||'配置保存失败，请重试。');
       if (error.status===409) {
         try {
-          const latest=await apiClient().api('/api/system');
+          const latest=await apiClient().api(scoped?'/api/system?view=topology':'/api/system');
+          if (scoped) latest.view='configuration';
           if (latest.revision!==editing.revision) showConflictReview(latest);
           else { installSnapshot(latest,false); service.conflict=null; byId('system-conflict-review').hidden=true; updateRuntimeStatus(); }
         }
@@ -1011,8 +1048,13 @@
     if (action==='draft-save') { saveWindowDraft(); return; }
     if (action==='accept-latest') {
       if (!editor || !service.conflict) return;
-      captureForm(); const latest=service.conflict;
+      captureForm(); const latest=service.conflict, changes=organizationMode()&&!editor.isNew?organizationChanges(editor.value,editor.original):null;
+      if (!editor.isNew && !latest.nodes.some(item=>item.id===editor.value.id)) { showConflictReview(latest); return; }
       installSnapshot(latest,false); state={version:1,nodes:structuredClone(latest.nodes)};
+      if (changes) {
+        const base=structuredClone(state.nodes.find(item=>item.id===editor.value.id)); base.brainName=brainNameOf(base);
+        editor.original=structuredClone(base); editor.value={...base,...changes};
+      }
       editor.revision=latest.revision; editor.promptPreview=null; service.conflict=null; renderEditor(); announce('已采用最新系统版本，请确认后保存。'); return;
     }
     if (['runtime-start','runtime-stop','runtime-restart'].includes(action)) { controlRuntime(action.slice(8),id); return; }

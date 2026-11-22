@@ -329,7 +329,12 @@ async function openOrganization(t, hash='#settings/model', { systemUnavailable=f
       const field=path.slice('/api/'.length);assert.equal(body.revision,backend.state[field].revision);
       backend.state[field]={...backend.state[field],revision:body.revision+1,value:body.value};return Response.json(backend.state[field]);
     }
-    if(path==='/api/system'){assert.equal(body.revision,backend.system.revision);backend.system={...backend.system,revision:body.revision+1,nodes:body.nodes};return Response.json(systemView());}
+    if(path==='/api/system'){
+      assert.equal(body.revision,backend.system.revision);
+      const nodes=body.update?backend.system.nodes.map(node=>node.id===body.update.id?{...node,...body.update.changes}:node):body.nodes;
+      backend.system={...backend.system,revision:body.revision+1,nodes};
+      return Response.json({...systemView(),...body.update?{view:'configuration',saved:{instanceId:body.update.id,fields:Object.keys(body.update.changes),effect:'next-start'}}:{}});
+    }
     if(path==='/api/tools'){assert.equal(body.revision,backend.tools.revision);backend.tools.revision++;backend.tools.tools.find(tool=>tool.name===body.name).allowed=body.allowed;return Response.json(backend.tools);}
     throw Error('Unexpected request '+path);
   };
@@ -658,14 +663,14 @@ test('new child conflict retains its draft until review and preserves current se
   assert.equal(ui.w.sessionStorage.getItem('superjarvis.composition.draft.v1'),JSON.stringify(legacyDraft));
 });
 
-test('running existing organization edits retain the stop requirement and preserve refused drafts without stopping the group',async t=>{
+test('running metadata explains its save scope and transitional refusal preserves drafts without stopping the group',async t=>{
   const ui=await openOrganization(t,organizationRoute+'/child/organization',{runtimeInstances:[{instanceId:'root',pid:101,phase:'running',generation:6},{instanceId:'child',pid:102,phase:'running',generation:2}]});
   await until(()=>ui.id('field-name'),'existing organization');
-  assert.match(ui.id('unit-form').querySelector('.save-scope small').textContent,/修改前先停止实例.*重新启动当前组织/);
+  assert.match(ui.id('unit-form').querySelector('.save-scope small').textContent,/组织信息可在运行时保存.*页面名称立即更新.*下次启动后生效/);
   const before=structuredClone(ui.backend.system);ui.input('field-name','现有组织的未保存更改');
   ui.backend.hook=({path,method})=>path==='/api/system'&&method==='PUT'
-    ?Response.json({error:'请先停止受影响的实例，再保存配置。'},{status:409}):null;
-  ui.submit('unit-form');await until(()=>ui.id('form-error').textContent.includes('请先停止受影响的实例')&&!ui.id('unit-form').inert,'running edit refused');
+    ?Response.json({error:'相关组织正在启停或清理，请完成后再保存。'},{status:409}):null;
+  ui.submit('unit-form');await until(()=>ui.id('form-error').textContent.includes('正在启停或清理')&&!ui.id('unit-form').inert,'transitional edit refused');
   assert.equal(ui.id('field-name').value,'现有组织的未保存更改');assert.equal(ui.w.compositionUI.isDirty(),true);
   assert.equal(ui.id('system-conflict-review').hidden,true,'an unchanged revision remains a lifecycle refusal');
   assert.deepEqual(ui.backend.system,before);assert.equal(ui.requests.some(request=>request.method==='POST'),false);
@@ -746,9 +751,75 @@ test('node metadata saves omit read-only execution projections and preserve init
   const original=structuredClone(ui.backend.system.nodes[0]);ui.input('field-name','组织新名称');ui.submit('unit-form');
   await until(()=>ui.backend.system.revision===4&&!ui.id('unit-form'),'metadata saved');
   const saved=ui.requests.find(request=>request.method==='PUT'&&request.path==='/api/system');
-  for(const item of saved.body.nodes){assert.equal(Object.hasOwn(item,'execution'),false);assert.equal(Object.hasOwn(item,'executionError'),false);}
+  assert.deepEqual(saved.body,{revision:3,update:{id:'root',changes:{name:'组织新名称'}}});
   assert.equal(ui.backend.system.nodes[0].concurrency,original.concurrency);assert.deepEqual(ui.backend.system.nodes[0].roleModels,original.roleModels);
   assert.equal(ui.backend.execution.root.maxWorkers,7);assert.equal(ui.backend.system.nodes[0].name,'组织新名称');
+  const savedIndex=ui.requests.indexOf(saved);
+  assert.equal(ui.requests[savedIndex+1].method,'GET','a committed update is read back before showing success');
+  assert.match(ui.id('composition-toast').textContent,/组织信息已保存.*页面已更新.*下次启动后生效/);
+});
+
+test('metadata conflict review resubmits only edited fields and preserves newer names, descriptions and model selections',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/child/organization');await until(()=>ui.id('field-name'),'metadata');
+  ui.input('field-name','我修改的名称');
+  ui.backend.system.revision=4;
+  const actual=ui.backend.system.nodes[1];actual.description='其他窗口的新职责';actual.brainName='其他窗口的新大脑';actual.model={provider:'other',model:'new',reasoningEffort:'low'};
+  ui.backend.hook=({path,method,body})=>path==='/api/system'&&method==='PUT'&&body.revision!==ui.backend.system.revision
+    ?Response.json({error:'系统配置版本已更新'},{status:409}):null;
+  ui.submit('unit-form');await until(()=>!ui.id('system-conflict-review').hidden,'conflict');
+  ui.id('composition-page').querySelector('[data-action="accept-latest"]').click();
+  assert.equal(ui.id('field-description').value,'其他窗口的新职责');
+  ui.submit('unit-form');await until(()=>!ui.id('unit-form'),'reviewed save');
+  assert.deepEqual(ui.requests.filter(request=>request.method==='PUT').map(request=>request.body),[
+    {revision:3,update:{id:'child',changes:{name:'我修改的名称'}}},
+    {revision:4,update:{id:'child',changes:{name:'我修改的名称'}}},
+  ]);
+  assert.equal(ui.backend.system.nodes[1].description,'其他窗口的新职责');assert.equal(ui.backend.system.nodes[1].brainName,'其他窗口的新大脑');
+  assert.deepEqual(ui.backend.system.nodes[1].model,actual.model);
+});
+
+test('a failed readback preserves the committed metadata draft and distinguishes saved state from confirmation',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/child/organization');await until(()=>ui.id('field-name'),'metadata');
+  let written=false;
+  ui.backend.hook=({path,method,query})=>{
+    if(path==='/api/system'&&method==='PUT')written=true;
+    if(written&&path==='/api/system'&&method==='GET'&&query.get('view')==='topology')return Response.json({error:'回读暂不可用'},{status:503});
+  };
+  ui.input('field-name','已经落盘的新名称');ui.submit('unit-form');
+  await until(()=>ui.id('form-error').textContent.includes('已保存，但未能回读确认')&&!ui.id('unit-form').inert,'readback failure');
+  assert.equal(ui.backend.system.revision,4);assert.equal(ui.backend.system.nodes[1].name,'已经落盘的新名称');
+  assert.equal(ui.id('draft-indicator').textContent,'已保存，回读待确认');assert.equal(ui.id('field-name').value,'已经落盘的新名称');
+  assert.equal(ui.w.compositionUI.isDirty(),true);assert.doesNotMatch(ui.id('composition-toast').textContent,/已保存/);
+});
+
+test('concurrent organization removal retains the metadata draft and prevents rebasing a deleted identity',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/child/organization');await until(()=>ui.id('field-name'),'metadata');
+  ui.input('field-name','被删除组织的未保存草稿');
+  ui.backend.system.revision=4;ui.backend.system.nodes=ui.backend.system.nodes.filter(node=>node.id!=='child');
+  ui.backend.hook=({path,method})=>path==='/api/system'&&method==='PUT'?Response.json({error:'系统配置版本已更新'},{status:409}):null;
+  ui.submit('unit-form');await until(()=>!ui.id('system-conflict-review').hidden,'removed conflict');
+  assert.equal(ui.id('field-name').value,'被删除组织的未保存草稿');assert.equal(ui.w.compositionUI.isDirty(),true);
+  assert.match(ui.id('form-error').textContent,/组织已在其他位置移除.*草稿已保留/);
+  const accept=ui.id('composition-page').querySelector('[data-action="accept-latest"]');assert.equal(accept.disabled,true);
+  // A stale enabled control or synthetic replay must also keep the removed organization out of the saved tree.
+  accept.disabled=false;accept.click();
+  assert.equal(ui.id('field-name').value,'被删除组织的未保存草稿');assert.equal(ui.backend.system.nodes.some(node=>node.id==='child'),false);
+  assert.equal(ui.id('composition-page').querySelector('[data-action="accept-latest"]').disabled,true);
+  assert.equal(ui.requests.filter(request=>request.method==='PUT').length,1);
+});
+
+test('forged, incomplete and mismatching save receipts never clear metadata drafts or claim success',async t=>{
+  const ui=await openOrganization(t,organizationRoute+'/child/organization');await until(()=>ui.id('field-name'),'metadata');
+  ui.input('field-name','保留的草稿');
+  for(const change of [value=>({...value,revision:3}),value=>({...value,saved:{...value.saved,instanceId:'root'}}),
+    value=>({...value,saved:{...value.saved,fields:['model']}}),value=>({...value,nodes:ui.backend.system.nodes})]){
+    ui.backend.hook=({path,method})=>path==='/api/system'&&method==='PUT'?Response.json(change({...ui.backend.system,revision:4,
+      nodes:ui.backend.system.nodes.map(node=>node.id==='child'?{...node,name:'保留的草稿'}:node),
+      saved:{instanceId:'child',fields:['name'],effect:'next-start'},view:'configuration'})):null;
+    ui.submit('unit-form');await until(()=>ui.id('draft-indicator').textContent==='保存结果待核对'&&!ui.id('unit-form').inert,'unverified receipt');
+    assert.equal(ui.id('field-name').value,'保留的草稿');assert.equal(ui.backend.system.revision,3);assert.equal(ui.w.compositionUI.isDirty(),true);
+    assert.match(ui.id('form-error').textContent,/无法确认保存结果/);
+  }
 });
 
 const desktopModelCatalog=()=>({refreshable:true,groups:[

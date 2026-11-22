@@ -1,5 +1,11 @@
 # SuperJarvis 项目约束与协作依据
 
+## 组织信息快速保存（2026-11-22 开发分支，尚未部署）
+
+已有组织通过原 `PUT /jarvis/api/system` 的 `{revision, update:{id,changes}}` 保存实际编辑过的名称、职责、标签、大脑名和下级模型；原完整 `nodes` 调用兼容。服务端先合成并完整归一化，再按真实差异选择校验。元数据不唤醒执行设置、模型和技能目录，不关闭业务／管理 owner；页面名称立即更新，当前大脑及 Router 描述保留本代快照，下次启动采用新值。模型保存只校验已改引用，目标业务实例仍须停止。全局 CAS、拓扑／权限／持久身份及 Worker 应用门禁保持。
+
+针对性验证：先构建当前 `lib`，再 `node --test --test-timeout=45000 jarvis/process-runtime/scoped-save.test.mjs jarvis/process-runtime/capability-waiting-delegation.test.mjs jarvis/process-runtime/capability-applications-review.test.mjs jarvis/composition-settings.test.mjs jarvis/scoped-save.e2e.test.mjs`。端到端计时单独运行最后一项；证据位于 `.artifacts/scoped-org-save/`，边界与生效说明见 [运行管理记录](docs/superjarvis-system-management-progress.md)。此条不代表已更新 4318 或通过全仓检查。
+
 ## 桌面入口与模型目录（2026-11-20）
 
 日常 DSH 桌面通过 `jarvis/dsh/desktop-entry/` 打开已有的 4318 服务。桌面入口的 `shareModels: true` 与 4318 Jarvis 的 `desktopModels: true` 配合使用。可选模型读取桌面官方 `sessionController.modelCatalog()`。4318 保存独立的桌面来源键，推理交回该桌面的 DSH 模型服务；历史 4318 模型继续由原服务处理。配置方法见 [DSH 接入记录](jarvis/DSH-INTEGRATION.md)。

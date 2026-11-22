@@ -59,6 +59,7 @@ test('system mutations require same-origin and CSRF before reaching control', as
   const request = await host(t, { save: async () => { mutations++; return {}; } });
   for (const headers of [ { 'x-jarvis-csrf': '' }, { origin: 'https://other.example' }, { 'sec-fetch-site': 'cross-site' }, { host: 'other.example' } ]) {
     assert.equal((await request('/api/system', { method: 'PUT', input: { revision: 0, nodes: [] }, headers })).status, 403, JSON.stringify(headers));
+    assert.equal((await request('/api/system', { method: 'PUT', input: { revision: 3, update: { id: 'root', changes: { name: 'Scoped name' } } }, headers })).status, 403, JSON.stringify(headers));
   }
   assert.equal(mutations, 0);
 });
@@ -98,6 +99,7 @@ test('DSH login is required even when an unauthenticated caller knows the page C
   const request = await host(t, { get: async () => { accessed++; return {}; }, save: async () => { accessed++; return {}; } });
   assert.equal((await request('/api/system', { headers: { 'x-test-session': '' } })).status, 401);
   assert.equal((await request('/api/system', { method: 'PUT', input: { revision: 0, nodes: [] }, headers: { 'x-test-session': '' } })).status, 401);
+  assert.equal((await request('/api/system', { method: 'PUT', input: { revision: 3, update: { id: 'root', changes: { name: 'Scoped name' } } }, headers: { 'x-test-session': '' } })).status, 401);
   for (const path of ['/api/system/root/conversation', '/api/system/root/conversation/events']) {
     assert.equal((await request(path, { headers: { 'x-test-session': '' } })).status, 401);
   }

@@ -124,3 +124,22 @@ test('an unrelated organization save preserves pending intent and advances the s
   assert.deepEqual(control.nodes.find(node => node.id === 'other').workerSkills, ['research']);
   assert.deepEqual((await peer(control).call('test.inspect')).tasks.map(item => item.id), ['active']);
 });
+
+test('scoped metadata preserves pending Worker intent, fences affected descriptors and shares the global CAS', async t => {
+  const control = await runtimeFixture(t); await control.action('root', 'start', control.revision);
+  await peer(control).call('test.add', task('active'));
+  const waiting = (await control.management('research', { method: 'PUT', path: 'worker-capabilities',
+    body: { revision: control.revision, tools: ['read', 'glob'], skills: [] } })).body;
+  assert.equal(waiting.application.state, 'waiting');
+  const before = readFileSync(control.file, 'utf8');
+  await assert.rejects(control.save({ revision: control.revision, update: { id: 'research', changes: { name: 'blocked descriptor' } } }), error => error.status === 409);
+  assert.equal(readFileSync(control.file, 'utf8'), before);
+  const saved = await control.save({ revision: control.revision, update: { id: 'other', changes: { brainName: 'Independent brain' } } });
+  assert.equal(saved.revision, waiting.revision + 1);
+  assert.equal(control.capabilities.pending('research').id, waiting.application.id);
+  assert.equal(control.capabilities.pending('research').state, 'waiting');
+  await assert.rejects(action(control, waiting, 'cancel', 'research'), error => error.status === 409);
+  const fresh = await get(control, 'research'); await action(control, fresh, 'cancel', 'research');
+  assert.equal(control.nodes.find(node => node.id === 'other').brainName, 'Independent brain');
+  assert.deepEqual((await peer(control).call('test.inspect')).tasks.map(item => item.id), ['active']);
+});
