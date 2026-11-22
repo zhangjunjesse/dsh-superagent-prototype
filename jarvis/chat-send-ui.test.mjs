@@ -136,6 +136,72 @@ test('a rejected submission restores only its untouched draft and resends with t
   assert.equal(ui.byId('thread').querySelectorAll('.message.user').length, 1);
 });
 
+for (const entryPoint of ['root', 'organization']) test(entryPoint + ': the retry button consumes its untouched restored draft', async t => {
+  const ui = await open(t, { entryPoint });
+  ui.backend.respond = async () => new Response(JSON.stringify({ error: '尚未受理' }), { status: 400 });
+  ui.input('  原样重试的要求  '); ui.enter();
+  await until(() => ui.button('重试发送'), 'rejected draft restored');
+  assert.equal(ui.byId('input').value, '  原样重试的要求  ');
+  const original = ui.calls[0], stream = responseStream(); ui.backend.respond = () => stream.response;
+  ui.button('重试发送').click();
+  const consumed = ui.byId('input').value;
+  const turn = persisted(original, { status: 'complete', assistant: '已经完成' }); ui.backend.state.turns = [turn];
+  stream.emit({ type: 'done', turn }); stream.end();
+  await until(() => ui.byId('conversation-page').dataset.busy === 'false', 'retry button completed');
+  assert.deepEqual(ui.calls[1], original);
+  assert.equal(consumed, '', 'explicitly retrying the restored original consumes that draft');
+  assert.equal(ui.byId('input').value, '');
+  assert.equal(ui.byId('thread').querySelectorAll('.message.user').length, 1);
+  ui.enter(); assert.equal(ui.calls.length, 2, 'a subsequent Enter cannot submit the already retried original again');
+});
+
+for (const nextDraft of ['下一条新要求', '同文的下一条要求']) test('the retry button preserves an independent draft: ' + nextDraft, async t => {
+  const ui = await open(t);
+  ui.backend.respond = async () => new Response(JSON.stringify({ error: '尚未受理' }), { status: 400 });
+  ui.input('同文的下一条要求'); ui.enter();
+  await until(() => ui.button('重试发送'), 'rejected draft restored');
+  const original = ui.calls[0];
+  ui.input(nextDraft);
+  ui.backend.respond = async payload => {
+    const turn = persisted(payload, { status: 'complete', assistant: '本条已经完成' }); ui.backend.state.turns.push(turn);
+    return new Response(JSON.stringify({ type: 'done', turn }) + '\n');
+  };
+  ui.button('重试发送').click();
+  await until(() => ui.byId('conversation-page').dataset.busy === 'false', 'retry preserves the independent draft');
+  assert.deepEqual(ui.calls[1], original);
+  assert.equal(ui.byId('input').value, nextDraft, 'an input event marks a separate draft even when its text is identical');
+  ui.enter();
+  await until(() => ui.calls.length === 3 && ui.byId('conversation-page').dataset.busy === 'false', 'independent draft submitted');
+  assert.notEqual(ui.calls[2].id, original.id);
+  assert.equal(ui.calls[2].text, nextDraft);
+});
+
+test('the retry button preserves a same-text draft whose task selection changed', async t => {
+  const backend = { state: stateFor(), respond: async () => new Response(JSON.stringify({ error: '尚未受理' }), { status: 400 }) };
+  backend.state.turns = [{ id: 'task-notice', source: 'gateway', role: 'assistant', status: 'complete', assistant: '两个任务的回报',
+    workRefs: [{ workRef: 'JW-first' }, { workRef: 'JW-second' }] }];
+  const ui = await open(t, { backend });
+  ui.d.querySelector('[data-work-ref="JW-first"] .work-reference').click();
+  ui.input('按原来的要求继续'); ui.enter();
+  await until(() => ui.button('重试发送'), 'task draft restored');
+  const original = ui.calls[0]; assert.equal(original.selectedWorkRef, 'JW-first');
+  ui.d.querySelector('[data-work-ref="JW-second"] .work-reference').click();
+  backend.respond = async payload => {
+    const turn = persisted(payload, { status: 'complete', assistant: '本条已经完成' }); backend.state.turns.push(turn);
+    return new Response(JSON.stringify({ type: 'done', turn }) + '\n');
+  };
+  ui.button('重试发送').click();
+  await until(() => ui.byId('conversation-page').dataset.busy === 'false', 'retry preserves the new task selection');
+  assert.deepEqual(ui.calls[1], original);
+  assert.equal(ui.byId('input').value, '按原来的要求继续');
+  assert.equal(ui.d.querySelector('.reply-context').hidden, false);
+  assert.match(ui.d.querySelector('.reply-context').textContent, /JW-second/);
+  ui.enter();
+  await until(() => ui.calls.length === 3 && ui.byId('conversation-page').dataset.busy === 'false', 'new task draft submitted');
+  assert.notEqual(ui.calls[2].id, original.id);
+  assert.equal(ui.calls[2].selectedWorkRef, 'JW-second');
+});
+
 test('cancelling before acceptance aborts only that send and preserves the following draft without claiming delivery', async t => {
   const ui = await open(t);
   let aborted = false;

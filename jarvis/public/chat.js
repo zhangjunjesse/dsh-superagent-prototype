@@ -695,7 +695,10 @@
         if (turn.pending && turn.pending.phase !== 'sending' && !busy && canChat()) {
           const entry = turn.pending, retry = document.createElement('button');
           retry.type = 'button'; retry.className = 'action secondary'; retry.textContent = '重试发送';
-          retry.addEventListener('click', () => { if (outbox.get(turn.id) === entry && entry.scope === sendScope()) submit(entry.payload); });
+          retry.addEventListener('click', () => {
+            // User edits or task changes retire this marker, even for identical text.
+            if (outbox.get(turn.id) === entry && entry.scope === sendScope()) submit(entry.payload, { consumeDraft: restoredDraftId === turn.id });
+          });
           user.body.append(retry);
         }
       }
