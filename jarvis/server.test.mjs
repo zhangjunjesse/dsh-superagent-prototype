@@ -108,3 +108,39 @@ test('Windows credential vault round trip', { skip: process.platform !== 'win32'
   assert.ok(!encrypted.includes('test-not-a-real-api-key'));
   assert.equal(vault.open(encrypted), 'test-not-a-real-api-key');
 });
+
+test('durable chat receipts deduplicate active sends and every accepted regeneration attempt across restart', async t => {
+  const f = await fixture(t); await f.configure();
+  const state = await (await f.call('/api/state')).json();
+  const binding = { conversationId: state.binding.conversationId, generation: state.binding.generation };
+  const first = { id: 'receipt-message-0001', text: 'slow', submissionId: 'submission-first-0001', binding };
+  const request = await f.call('/api/chat', 'POST', first);
+  assert.equal(request.status, 200);
+  const replay = await f.call('/api/chat', 'POST', first);
+  assert.equal(replay.status, 200);
+  assert.equal(JSON.parse((await replay.text()).trim()).turn.status, 'streaming');
+  assert.equal((await f.call('/api/chat', 'POST', { ...first, text: 'different intent' })).status, 409);
+  assert.equal((await f.call('/api/chat', 'POST', { ...first, selectedWorkRef: 'other-work' })).status, 409);
+  await f.call('/api/stop', 'POST', { id: first.id }); await request.text();
+  const counts = [];
+  for (const submissionId of ['submission-retry-0001', 'submission-retry-0002']) {
+    const input = { id: first.id, retry: true, submissionId, binding };
+    const pending = await f.call('/api/chat', 'POST', input);
+    assert.equal(pending.status, 200);
+    const duplicate = await f.call('/api/chat', 'POST', input);
+    const turn = JSON.parse((await duplicate.text()).trim()).turn;
+    assert.equal(turn.submissionId, submissionId); assert.equal(turn.status, 'streaming');
+    assert.equal((await (await f.call('/api/state')).json()).active, first.id, 'a duplicate stream does not cancel the owner');
+    await f.call('/api/stop', 'POST', { id: first.id }); await pending.text();
+    counts.push(f.requests.length);
+  }
+  assert.deepEqual(counts, [2, 3], 'one model invocation for each explicitly new attempt');
+  await f.restart();
+  const oldAttempt = await f.call('/api/chat', 'POST', { id: first.id, retry: true, submissionId: 'submission-retry-0001', binding });
+  assert.equal(oldAttempt.status, 200);
+  assert.equal(JSON.parse((await oldAttempt.text()).trim()).turn.attempt, 3);
+  assert.equal(f.requests.length, 3, 'a late resend of an older accepted attempt cannot create another one');
+  await f.call('/api/conversation', 'DELETE');
+  assert.equal((await f.call('/api/chat', 'POST', first)).status, 409, 'an old page cannot write into the replacement conversation');
+  assert.deepEqual((await (await f.call('/api/state')).json()).turns, []);
+});

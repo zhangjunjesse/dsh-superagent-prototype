@@ -33,10 +33,11 @@ async function open(t, { lifecycle = instance(), active = null } = {}) {
     requests.push({ path, method, body: structuredClone(body) });
     if (backend.hook) { const value = await backend.hook(path, method, body); if (value !== undefined) return structuredClone(value); }
     if (path === '/api/state') { if (backend.stateError) throw new Error(backend.stateError); return structuredClone(backend.state); }
-    if (path === '/api/system' && method === 'GET') return { available: true, revision: backend.revision };
+    if (path === '/api/system?view=topology' && method === 'GET') return { available: true, revision: backend.revision };
     if (path === '/api/system/root/start' && method === 'POST') {
       backend.starts++;
       assert.equal(body.revision, backend.revision, 'start uses the latest system revision');
+      assert.equal(body.view, 'topology', 'start requests only the topology projection');
       if (backend.startError) throw Object.assign(new Error(backend.startError), { status: 503 });
       backend.state.instance = instance('starting', { generation: 4 });
       return { available: true, revision: backend.revision };
@@ -108,7 +109,7 @@ test('start reads a fresh revision, stays blocked until state is running, and re
   ui.input('启动后要发送的草稿'); ui.backend.revision = 29;
   ui.byId('instance-start').click();
   await until(() => ui.backend.starts === 1 && ui.byId('instance-status').textContent.includes('正在启动'), 'start accepted');
-  assert.deepEqual(ui.requests.slice(0, 2), [{ path: '/api/system', method: 'GET', body: undefined }, { path: '/api/system/root/start', method: 'POST', body: { revision: 29 } }]);
+  assert.deepEqual(ui.requests.slice(0, 2), [{ path: '/api/system?view=topology', method: 'GET', body: undefined }, { path: '/api/system/root/start', method: 'POST', body: { revision: 29, view: 'topology' } }]);
   assert.equal(ui.byId('send-message').disabled, true, 'a successful start response does not invent running state');
   assert.match(ui.byId('thread').textContent, /已保留的部分回复/);
   ui.backend.state.instance = instance('running', { generation: 4 });
@@ -132,7 +133,7 @@ test('start failure is visible and retryable without pretending the instance is 
   ui.backend.startError = null; ui.backend.revision = 30;
   ui.byId('instance-start').click();
   await until(() => ui.backend.starts === 2 && ui.backend.state.instance.phase === 'starting', 'explicit start retry');
-  assert.deepEqual(ui.requests.filter(request => request.path.endsWith('/start')).map(request => request.body.revision), [11, 30]);
+  assert.deepEqual(ui.requests.filter(request => request.path.endsWith('/start')).map(request => request.body), [{ revision: 11, view: 'topology' }, { revision: 30, view: 'topology' }]);
 });
 
 test('failed cleanup never claims a stopped instance or enables start', async t => {
@@ -215,12 +216,12 @@ test('a 503 chat rejection refreshes authoritative lifecycle and keeps an unacce
 
 test('an instance stopped during streaming refreshes history and cannot be revived by late stream events', async t => {
   const ui = await open(t), responseReady = deferred();
-  let writer;
+  let writer, payload;
   const stream = new ReadableStream({ start(controller) { writer = controller; } });
-  ui.backend.chatResponse = async () => { responseReady.resolve(); return new Response(stream); };
+  ui.backend.chatResponse = async options => { payload = JSON.parse(options.body); responseReady.resolve(); return new Response(stream); };
   const emit = event => writer.enqueue(new TextEncoder().encode(JSON.stringify(event) + '\n'));
   ui.input('当前回复'); ui.submit(); await responseReady.promise;
-  const turn = { id: 'streaming-reply', user: '当前回复', assistant: '已保存的流式文字', status: 'streaming' };
+  const turn = { id: payload.id, user: '当前回复', assistant: '已保存的流式文字', status: 'streaming' };
   emit({ type: 'start', turn });
   await until(() => ui.byId('thread').textContent.includes('已保存的流式文字'), 'stream accepted');
   ui.input('下一条草稿');

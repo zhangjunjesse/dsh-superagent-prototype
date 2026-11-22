@@ -1,5 +1,5 @@
 import { UserError, parseName } from '../config.mjs';
-import { Store } from '../store.mjs';
+import { Store, assertChatSubmission, replaysChatTurn } from '../store.mjs';
 import { ModelDiscovery } from './model-discovery.mjs';
 import { DesktopModels } from './desktop-model-client.mjs';
 import { JarvisGateway, currentInputSource, gatewayToolNames } from './gateway.mjs';
@@ -662,13 +662,15 @@ export class JarvisRuntime {
   }
   async chat(input, emit, signal) {
     const lease = this.captureLease();
+    assertChatSubmission(input, this.store.sessionBinding());
     await this.yieldBackground();
     this.assertLease(lease);
-    this.idle();
+    assertChatSubmission(input, this.store.sessionBinding());
     if (typeof input.id !== 'string' || !/^[a-zA-Z0-9-]{8,80}$/.test(input.id)) throw new UserError('请求标识不正确');
     const old = this.store.turn(input.id);
     if (old && (old.source === 'gateway' || old.role === 'assistant')) throw new UserError('后台通知不能作为用户交办重试', 409);
-    if (old && !input.retry) { emit({ type: 'done', turn: old }); return; }
+    if (replaysChatTurn(old, input)) { emit({ type: 'done', turn: old }); return; }
+    this.idle();
     if (input.retry && (!old || this.store.turns().filter(turn => turn.source !== 'gateway' && turn.role !== 'assistant').at(-1)?.id !== input.id || old.status === 'complete')) throw new UserError('只能重试最近一条未完成的回复', 409);
     const text = old?.user ?? input.text;
     if (typeof text !== 'string' || !text.trim() || text.length > 32000) throw new UserError('请输入 1–32000 个字符的消息');
@@ -679,6 +681,9 @@ export class JarvisRuntime {
     const promptSnapshot = this.promptSettings.snapshot('user');
     const turn = { id: input.id, user: text.trim(), source: 'user', conversationId: binding.conversationId, generation: binding.generation, promptRevision: promptSnapshot.revision,
       assistant: '', status: 'streaming', error: '', createdAt: old?.createdAt || new Date().toISOString(), attempt: (old?.attempt || 0) + 1,
+      ...(input.submissionId ? { submissionId: input.submissionId } : {}),
+      ...(input.submissionId || old?.submissionId || old?.submissionIds?.length ? {
+        submissionIds: [...new Set([...(old?.submissionIds || []), ...(old?.submissionId ? [old.submissionId] : []), ...(input.submissionId ? [input.submissionId] : [])])] } : {}),
       ...Object.fromEntries(['selectedWorkRef', 'selectedQuestionId', 'gatewayReceipts'].flatMap(field => {
         const value = old ? old[field] : input[field];
         return value === undefined || field === 'gatewayReceipts' && !old ? [] : [[field, value]];
@@ -699,6 +704,7 @@ export class JarvisRuntime {
       try { await this.ctx.llm.resolveCallConfig(callConfig(config)); } catch { throw new UserError('请先配置可用模型'); }
       operationSignal.throwIfAborted();
       this.assertLease(lease);
+      assertChatSubmission(input, this.store.sessionBinding());
       Object.assign(turn, { dshSessionId: agent.id, dshStartSeq: (agent.session.snapshotEvents().at(-1)?.seq ?? -1) + 1, requestId: `${turn.id}-${turn.attempt}` });
       old ? this.store.updateTurn(turn) : this.store.addTurn(turn);
       stored = true;

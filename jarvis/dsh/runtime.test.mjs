@@ -59,6 +59,41 @@ test('failed model validation on retry preserves the previous partial reply', as
   assert.deepEqual((await runtime.state()).turns[0], old);
 });
 
+test('daily chat pins its conversation and replays persisted sends or regeneration attempts without reentering DSH', async t => {
+  const { runtime, ctx } = harness(t); await runtime.ready();
+  const savedBinding = runtime.store.sessionBinding();
+  const binding = { conversationId: savedBinding.conversationId, generation: savedBinding.generation };
+  const entered = Promise.withResolvers(), released = Promise.withResolvers();
+  let prompts = 0;
+  ctx.sessionController.prompt = async () => { prompts++; entered.resolve(); await released.promise; };
+  const original = { id: 'dedupe-daily-0001', text: '交给后台的原始要求', submissionId: 'dedupe-send-0001', binding };
+  const events = [], pending = runtime.chat(original, event => events.push(structuredClone(event)), new AbortController().signal);
+  await entered.promise;
+  assert.equal(events[0].type, 'start');
+  assert.deepEqual(runtime.store.turn(original.id), events[0].turn, 'start follows a durable row');
+  const duplicate = [];
+  await runtime.chat(original, event => duplicate.push(event), new AbortController().signal);
+  assert.equal(duplicate[0].type, 'done'); assert.equal(duplicate[0].turn.status, 'streaming');
+  assert.equal(prompts, 1);
+  await assert.rejects(runtime.chat({ ...original, text: '同 ID 下的另一条要求' }, () => {}, new AbortController().signal), { status: 409 });
+  await assert.rejects(runtime.chat({ ...original, selectedWorkRef: 'different-work' }, () => {}, new AbortController().signal), { status: 409 });
+  released.resolve(); await pending;
+  for (const submissionId of ['dedupe-retry-0001', 'dedupe-retry-0002']) {
+    const input = { id: original.id, retry: true, submissionId, binding };
+    await runtime.chat(input, () => {}, new AbortController().signal);
+    const attempt = runtime.store.turn(original.id).attempt;
+    await runtime.chat(input, () => {}, new AbortController().signal);
+    assert.equal(runtime.store.turn(original.id).attempt, attempt);
+  }
+  assert.equal(prompts, 3);
+  await runtime.chat({ id: original.id, retry: true, submissionId: 'dedupe-retry-0001', binding }, () => {}, new AbortController().signal);
+  assert.equal(prompts, 3, 'an older accepted attempt remains deduplicated after newer attempts');
+  await runtime.clear();
+  await assert.rejects(runtime.chat(original, () => {}, new AbortController().signal), { status: 409 });
+  assert.equal(runtime.store.turns().length, 0);
+  assert.equal(prompts, 3);
+});
+
 test('clear guards concurrent operations until its replacement DSH session exists', async t => {
   const { runtime, ctx } = harness(t); await runtime.ready();
   const resolveAgent = ctx.sessionController.resolveAgent;

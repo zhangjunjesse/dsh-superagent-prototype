@@ -10,6 +10,8 @@
   const instanceStartError = byId('instance-start-error');
   let turns = [], activeId = null, busy = false, pollTimer, notificationTimer, notificationCursor = 0, selection = null, viewRevision = 0;
   let instance = null, startingInstance = false, startError = '', stateSyncError = false, stateRequest = null, activeStream = null;
+  let draftRevision = 0, selectionRevision = 0, restoredDraftId = null;
+  const outbox = new Map(), outboxKey = 'jarvis.chat.outbox:' + location.pathname;
   const nodes = new Map();
   const taskCards = new Map(), taskItems = new Map(), taskErrors = new Map(), taskDetails = new Map(), taskDetailRequests = new Map();
   const taskRecords = new Map(), taskRecordRequests = new Map(), taskRecordsRead = new Set();
@@ -38,6 +40,42 @@
     return sentence ? sentence[0] : start.trimEnd() + '…';
   }
   const taskBindingKey = binding => binding ? JSON.stringify([binding.conversationId, binding.generation, binding.dshSessionId]) : '';
+  const sendBinding = () => taskBinding ? { conversationId: taskBinding.conversationId, generation: taskBinding.generation } : undefined;
+  const sendScope = () => JSON.stringify(sendBinding() || ['legacy', jarvis.state.csrf]);
+  const visiblePending = () => [...outbox.values()].filter(entry => entry.scope === sendScope());
+  function saveOutbox() {
+    try { sessionStorage.setItem(outboxKey, JSON.stringify([...outbox.values()])); } catch { /* Sending still works when browser storage is unavailable. */ }
+  }
+  function restoreOutbox() {
+    try {
+      for (const entry of JSON.parse(sessionStorage.getItem(outboxKey) || '[]')) {
+        if (!entry || typeof entry.scope !== 'string' || typeof entry.payload?.id !== 'string' || typeof entry.payload.text !== 'string' ||
+          typeof entry.payload.submissionId !== 'string' || !['sending', 'uncertain', 'failed', 'cancelled'].includes(entry.phase)) continue;
+        outbox.set(entry.payload.id, { ...entry, phase: entry.phase === 'sending' ? 'uncertain' : entry.phase });
+      }
+    } catch { /* A damaged local draft cannot authorize a server operation. */ }
+  }
+  function matchesSubmission(turn, entry, fromStream = false) {
+    const payload = entry.payload;
+    return turn?.id === payload.id && turn.user === payload.text &&
+      ['selectedWorkRef', 'selectedQuestionId'].every(key => turn[key] === payload[key]) &&
+      (!payload.binding || (turn.conversationId === undefined || turn.conversationId === payload.binding.conversationId) &&
+        (turn.generation === undefined || turn.generation === payload.binding.generation)) &&
+      (!payload.retry || turn.submissionId === payload.submissionId || turn.submissionIds?.includes(payload.submissionId) || fromStream && turn.submissionId === undefined);
+  }
+  function confirmSubmission(turn, fromStream = false) {
+    const entry = outbox.get(turn?.id);
+    if (!entry || entry.scope !== sendScope() || !matchesSubmission(turn, entry, fromStream)) return false;
+    outbox.delete(turn.id); saveOutbox();
+    if (restoredDraftId === turn.id) restoredDraftId = null;
+    return true;
+  }
+  function projectedTurns() {
+    const pending = new Map(visiblePending().map(entry => [entry.payload.id, entry]));
+    const projection = turns.map(turn => ({ ...turn, pending: pending.get(turn.id) }));
+    for (const [id, entry] of pending) if (!turns.some(turn => turn.id === id)) projection.push({ id, user: entry.payload.text, assistant: '', local: true, pending: entry });
+    return projection;
+  }
   const tasksVisible = () => !byId('conversation-page').hidden && !window.frameElement?.hidden && document.visibilityState !== 'hidden';
   function taskReferences(turn) {
     const refs = new Map();
@@ -631,8 +669,9 @@
       if (view.parts.length || view.focus) views.set(JSON.stringify([element.dataset.turnId, element.dataset.workRef]), view);
     }
     thread.replaceChildren(); nodes.clear(); taskCards.clear();
-    byId('conversation-page').classList.toggle('is-empty', !turns.length);
-    if (!turns.length) {
+    const projection = projectedTurns();
+    byId('conversation-page').classList.toggle('is-empty', !projection.length);
+    if (!projection.length) {
       const empty = document.createElement('div'); empty.className = 'chat-empty';
       const orb = document.createElement('div'); orb.className = 'assistant-orb'; orb.setAttribute('aria-hidden', 'true');
       const title = document.createElement('h2'); title.textContent = '今天想一起推进什么？';
@@ -642,9 +681,26 @@
       if (!jarvis.state.model.value.endpoint) empty.append(action);
       thread.append(empty);
     }
-    for (const turn of turns) {
-      if (turn.role !== 'assistant' && turn.source !== 'gateway') message('user', turn.user);
+    for (const turn of projection) {
+      let delivery;
+      if (turn.role !== 'assistant' && turn.source !== 'gateway') {
+        const user = message('user', turn.user);
+        user.article.dataset.turnId = turn.id;
+        delivery = document.createElement('span'); delivery.className = 'send-status'; delivery.setAttribute('role', 'status');
+        delivery.textContent = turn.pending ? ({ sending: '发送中…', uncertain: '发送状态待确认', failed: '发送失败', cancelled: '已取消发送' })[turn.pending.phase]
+          : '已发送，等待回复';
+        delivery.hidden = !turn.pending && (turn.status !== 'streaming' || Boolean(turn.assistant));
+        user.body.append(delivery);
+        if (turn.pending && turn.pending.phase !== 'sending' && !busy && canChat()) {
+          const entry = turn.pending, retry = document.createElement('button');
+          retry.type = 'button'; retry.className = 'action secondary'; retry.textContent = '重试发送';
+          retry.addEventListener('click', () => { if (outbox.get(turn.id) === entry && entry.scope === sendScope()) submit(entry.payload); });
+          user.body.append(retry);
+        }
+      }
+      if (turn.local) continue;
       const node = message('jarvis', turn.assistant || '');
+      node.delivery = delivery;
       const status = document.createElement('span'); status.className = 'turn-status'; status.textContent = statusLabel(turn); node.meta.append(status);
       if (turn.status === 'complete' && turn.assistant) {
         const actions = document.createElement('div'); actions.className = 'message-tools';
@@ -676,9 +732,10 @@
         node.body.append(row);
       }
       const lastUser = turns.findLast(item => item.source !== 'gateway' && item.role !== 'assistant');
-      if (turn.source !== 'gateway' && turn.id === lastUser?.id && turn.status !== 'complete' && turn.status !== 'streaming' && !busy && canChat()) {
+      if (!turn.pending && turn.source !== 'gateway' && turn.id === lastUser?.id && turn.status !== 'complete' && turn.status !== 'streaming' && !busy && canChat()) {
         const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'action secondary'; retry.textContent = '重新生成';
-        retry.addEventListener('click', () => submit({ id: turn.id, retry: true })); node.body.append(retry);
+        retry.addEventListener('click', () => submit({ id: turn.id, text: turn.user, retry: true,
+          ...(turn.selectedWorkRef ? { selectedWorkRef: turn.selectedWorkRef } : {}), ...(turn.selectedQuestionId ? { selectedQuestionId: turn.selectedQuestionId } : {}) })); node.body.append(retry);
       }
       nodes.set(turn.id, node);
     }
@@ -717,7 +774,7 @@
     // A running reply must not prevent the user from preparing their next message.
     input.disabled = false;
     stop.hidden = !busy || !canStopReply();
-    stop.disabled = !activeId || !canStopReply();
+    stop.disabled = !canStopReply() || !activeId && (!activeStream || activeStream.interrupted || activeStream.accepted);
     byId('reset').disabled = busy;
     notificationRetry.disabled = !canChat();
     renderInstanceStatus();
@@ -743,6 +800,7 @@
     if (state.notificationRetryable) notificationLabel.textContent = '有后台消息暂未送达。';
   }
   function selectWork(ref) {
+    selectionRevision++; restoredDraftId = null;
     selection = { selectedWorkRef: ref.workRef, ...(ref.questionId ? { selectedQuestionId: ref.questionId } : {}) };
     const label = document.createElement('span'); label.textContent = `关于 ${ref.workRef}`;
     const clear = document.createElement('button'); clear.type = 'button'; clear.textContent = '×'; clear.setAttribute('aria-label','取消任务关联');
@@ -780,7 +838,7 @@
     if (select) selectWork(target);
     return { label: question ? '回答问题' : '继续此任务' };
   };
-  function clearSelection() { selection = null; replyContext.hidden = true; replyContext.replaceChildren(); }
+  function clearSelection() { selectionRevision++; restoredDraftId = null; selection = null; replyContext.hidden = true; replyContext.replaceChildren(); }
   function syncQuestions(states) {
     if (!Array.isArray(states)) return false;
     const current = new Map(states.map(item => [item.workRef, item.questionId]));
@@ -835,7 +893,7 @@
   }
   function scheduleStatePoll() {
     clearTimeout(pollTimer);
-    if (document.visibilityState !== 'hidden' && (instance || busy)) pollTimer = setTimeout(followActive, busy ? 1200 : 5000);
+    if (document.visibilityState !== 'hidden' && (instance || busy || visiblePending().some(entry => entry.phase === 'uncertain'))) pollTimer = setTimeout(followActive, busy ? 1200 : 5000);
   }
   function syncState(state) {
     const availableBefore = canChat(), busyBefore = busy;
@@ -845,9 +903,21 @@
     stateSyncError = false;
     if (instance?.canChat) startError = '';
     // Once the server closes this runtime, late data from its old stream cannot revive it.
-    if (activeStream && (taskContextChanged || instance && (instance.phase !== 'running' ||
+    if (activeStream && (activeStream.scope !== sendScope() || taskContextChanged || instance && (instance.phase !== 'running' ||
       instance.generation !== activeStream.generation || instance.runtimeId !== activeStream.runtimeId))) activeStream.interrupted = true;
+    // A lost final frame must not leave an already completed reply busy forever.
+    const final = activeStream?.accepted && state.active !== activeStream.payload.id && state.turns?.find(turn =>
+      turn.status !== 'streaming' && matchesSubmission(turn, { payload: activeStream.payload }));
+    if (final) { activeStream.interrupted = true; activeStream.controller.abort(); }
     let changed = taskContextChanged;
+    for (const turn of state.turns || []) {
+      if (!confirmSubmission(turn)) continue;
+      changed = true;
+      if (activeStream?.payload.id === turn.id && !activeStream.interrupted) {
+        if (!activeStream.accepted) replaceTurn(turn);
+        activeStream.accepted = true; activeId = state.activeSource === 'background' ? null : state.active;
+      }
+    }
     if (!activeStream || activeStream.interrupted) {
       if (Array.isArray(state.turns) && JSON.stringify(turns) !== JSON.stringify(state.turns)) { turns = state.turns; changed = true; }
       activeId = state.activeSource === 'background' ? null : state.active;
@@ -865,7 +935,7 @@
       const state = await jarvis.api('/api/state');
       if (request.revision === viewRevision) syncState(state);
     })();
-    try { await request.promise; }
+    try { return await request.promise; }
     finally { if (stateRequest === request) stateRequest = null; }
   }
   async function followActive() {
@@ -879,63 +949,91 @@
       controls(); render();
     } finally { scheduleStatePoll(); }
   }
-  async function submit(payload) {
-    if (busy || !canChat()) return;
-    viewRevision++;
-    const stream = { revision: viewRevision, generation: instance?.generation, runtimeId: instance?.runtimeId, interrupted: false };
-    activeStream = stream;
-    busy = true; activeId = null; feedback.textContent = ''; controls();
-    scheduleStatePoll();
-    const originalText = input.value;
+  async function readChatReply(response, stream, entry) {
     let gotDone = false;
-    try {
-      const response = await fetch(jarvis.url('/api/chat'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Jarvis-CSRF': jarvis.state.csrf }, body: JSON.stringify(payload) });
-      if (!response.ok) { const error = await response.json(); throw Object.assign(new Error(error.error || '发送失败'), { status: response.status }); }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder(); let buffer = '';
-      while (true) {
-        const chunk = await reader.read();
-        buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
-        let newline;
-        while ((newline = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
-          if (!line.trim()) continue;
-          const event = JSON.parse(line);
-          if (activeStream !== stream || stream.revision !== viewRevision || stream.interrupted) { if (event.type === 'done') gotDone = true; continue; }
-          if (event.type === 'start') {
-            activeId = event.turn.id; replaceTurn(event.turn);
-            if (!payload.retry) { if (input.value === originalText) input.value = ''; clearSelection(); } controls(); render();
-          }
-          if (event.type === 'delta' || event.type === 'replace') {
-            const turn = turns.find(item => item.id === activeId);
-            if (!turn) continue;
-            const bottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
-            turn.assistant = event.type === 'replace' ? event.text : turn.assistant + event.text;
-            renderReply(nodes.get(turn.id).content, turn.assistant);
-            if (bottom) thread.scrollTop = thread.scrollHeight;
-          }
-          if (event.type === 'done') {
-            gotDone = true; replaceTurn(event.turn);
-            if (event.turn.status === 'complete' && byId('connection-status')) byId('connection-status').textContent = '已连接';
-          }
+    const acceptTurn = turn => {
+      if (!matchesSubmission(turn, entry, true)) throw new Error('消息回执不匹配，请核对当前对话');
+      confirmSubmission(turn, true); stream.accepted = true;
+      activeId = turn.status === 'streaming' ? turn.id : null; replaceTurn(turn);
+    };
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder(); let buffer = '';
+    while (true) {
+      const chunk = await reader.read();
+      buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (activeStream !== stream || stream.revision !== viewRevision || stream.interrupted) { if (event.type === 'done') gotDone = true; continue; }
+        if (event.type === 'start') {
+          acceptTurn(event.turn); controls(); render();
         }
-        if (chunk.done) break;
+        if (event.type === 'delta' || event.type === 'replace') {
+          if (!stream.accepted) throw new Error('尚未确认消息已发送，请核对当前对话');
+          const turn = turns.find(item => item.id === activeId);
+          if (!turn) continue;
+          const bottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 100;
+          turn.assistant = event.type === 'replace' ? event.text : turn.assistant + event.text;
+          const node = nodes.get(turn.id);
+          renderReply(node.content, turn.assistant);
+          if (node.delivery) node.delivery.hidden = Boolean(turn.assistant);
+          if (bottom) thread.scrollTop = thread.scrollHeight;
+        }
+        if (event.type === 'done') {
+          acceptTurn(event.turn); gotDone = true;
+          if (event.turn.status === 'complete' && byId('connection-status')) byId('connection-status').textContent = '已连接';
+        }
       }
+      if (chunk.done) break;
+    }
+    return gotDone;
+  }
+  async function submit(inputPayload, { consumeDraft = false } = {}) {
+    if (busy || !canChat()) return;
+    const previous = outbox.get(inputPayload.id);
+    if (previous && previous.scope !== sendScope()) return;
+    const payload = previous?.payload || { ...inputPayload, submissionId: crypto.randomUUID(), ...(sendBinding() ? { binding: sendBinding() } : {}) };
+    const originalText = input.value, originalSelection = selection, originalDraftRevision = draftRevision;
+    const entry = { payload, scope: sendScope(), phase: 'sending' };
+    outbox.set(payload.id, entry); saveOutbox();
+    // Consume only this submission. A later receipt never clears a newer draft or task selection.
+    if (consumeDraft) { input.value = ''; clearSelection(); restoredDraftId = null; }
+    const submittedSelectionRevision = selectionRevision;
+    viewRevision++;
+    const stream = { revision: viewRevision, scope: entry.scope, payload, controller: new AbortController(), generation: instance?.generation, runtimeId: instance?.runtimeId, interrupted: false, accepted: false };
+    activeStream = stream;
+    busy = true; activeId = null; feedback.textContent = ''; controls(); render();
+    scheduleStatePoll();
+    let gotDone = false, synchronized = false;
+    try {
+      const response = await fetch(jarvis.url('/api/chat'), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Jarvis-CSRF': jarvis.state.csrf }, body: JSON.stringify(payload), signal: stream.controller.signal });
+      if (!response.ok) { const error = await response.json(); throw Object.assign(new Error(error.error || '发送失败'), { status: response.status }); }
+      gotDone = await readChatReply(response, stream, entry);
       if (!gotDone) throw new Error('回复连接中断');
     } catch (error) {
-      if (activeStream !== stream || stream.revision !== viewRevision) return;
-      feedback.textContent = error.message || '回复失败，请重试';
+      if (activeStream !== stream || stream.revision !== viewRevision || stream.scope !== sendScope() || stream.interrupted) return;
+      const failureText = stream.cancelled ? '已取消发送' : error.message || '回复失败，请重试';
       stream.interrupted = true;
-      // Before acceptance the field was never cleared; preserve any newer draft typed during the request.
       try {
-        await refreshChatState();
-        if (turns.some(turn => turn.id === payload.id) && !payload.retry && input.value === originalText) input.value = '';
+        await refreshChatState(); synchronized = true;
       } catch {}
+      if (stream.scope === sendScope() && outbox.get(payload.id) === entry) {
+        entry.phase = synchronized && activeId !== payload.id && (error.status || stream.cancelled) ? stream.cancelled ? 'cancelled' : 'failed' : 'uncertain'; saveOutbox();
+        if ((error.status || stream.cancelled) && consumeDraft && draftRevision === originalDraftRevision && selectionRevision === submittedSelectionRevision && !input.value && !selection) {
+          input.value = originalText;
+          if (originalSelection) selectWork({ workRef: originalSelection.selectedWorkRef, questionId: originalSelection.selectedQuestionId });
+          restoredDraftId = payload.id;
+        }
+      }
+      if (stream.scope === sendScope()) feedback.textContent = outbox.get(payload.id) === entry ? failureText : '';
+      controls(); render();
     } finally {
+      if (outbox.get(payload.id) === entry && entry.phase === 'sending') { entry.phase = 'uncertain'; saveOutbox(); }
       if (activeStream === stream && stream.revision === viewRevision) {
         stream.interrupted = true;
-        if (gotDone) activeId = null;
-        if (instance) {
+        if (!synchronized && (instance || activeId || !gotDone)) {
           try { await refreshChatState(); } catch { if (activeStream === stream && stream.revision === viewRevision) stateSyncError = true; }
         }
         if (activeStream === stream && stream.revision === viewRevision) {
@@ -950,12 +1048,14 @@
   byId('composer').addEventListener('submit', event => {
     event.preventDefault();
     const text = input.value.trim();
-    if (text) submit({ id: crypto.randomUUID(), text, ...selection });
+    if (!text) return;
+    const restored = outbox.get(restoredDraftId);
+    submit(restored?.scope === sendScope() && restored.payload.text === text ? restored.payload : { id: crypto.randomUUID(), text, ...selection }, { consumeDraft: true });
   });
   input.addEventListener('keydown', event => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); byId('composer').requestSubmit(); }
   });
-  input.addEventListener('input', () => { send.disabled = busy || !canChat() || !input.value.trim(); resizeInput(); });
+  input.addEventListener('input', () => { draftRevision++; restoredDraftId = null; send.disabled = busy || !canChat() || !input.value.trim(); resizeInput(); });
   window.addEventListener('resize', resizeInput);
   if (typeof ResizeObserver !== 'undefined') {
     let previousWidth;
@@ -965,7 +1065,11 @@
     }).observe(input);
   }
   stop.addEventListener('click', async () => {
-    if (!activeId || !canStopReply()) return;
+    if (!canStopReply()) return;
+    if (!activeId) {
+      if (activeStream && !activeStream.interrupted && !activeStream.accepted) { activeStream.cancelled = true; activeStream.controller.abort(); }
+      return;
+    }
     stop.disabled = true;
     try { await jarvis.api('/api/stop', 'POST', { id: activeId }); }
     catch (error) { feedback.textContent = error.message; stop.disabled = !canStopReply(); }
@@ -975,9 +1079,9 @@
     if (!instance || startingInstance || instanceStart.disabled || !['stopped', 'failed'].includes(instance.phase)) return;
     startingInstance = true; startError = ''; viewRevision++; controls(); render();
     try {
-      const system = await jarvis.api('/api/system');
+      const system = await jarvis.api('/api/system?view=topology');
       if (!Number.isInteger(system.revision)) throw new Error('无法读取实例配置版本，请重试。');
-      await jarvis.api('/api/system/root/start', 'POST', { revision: system.revision });
+      await jarvis.api('/api/system/root/start', 'POST', { revision: system.revision, view: 'topology' });
       await refreshChatState();
     } catch (error) {
       startError = error.message || '实例启动失败，请重试。';
@@ -988,18 +1092,22 @@
   byId('clear-cancel').addEventListener('click', () => { byId('chat-confirm').hidden = true; });
   byId('clear-confirm').addEventListener('click', async () => {
     try {
-      await jarvis.api('/api/conversation', 'DELETE'); viewRevision++; turns = []; clearSelection(); resetTaskContext();
+      await jarvis.api('/api/conversation', 'DELETE'); viewRevision++;
+      for (const entry of visiblePending()) outbox.delete(entry.payload.id);
+      saveOutbox(); restoredDraftId = null; turns = []; clearSelection(); resetTaskContext();
       feedback.textContent = ''; byId('chat-confirm').hidden = true; render();
-      if (tasksAvailable) await refreshChatState();
+      if (jarvis.state.binding || tasksAvailable) await refreshChatState();
     }
     catch (error) { feedback.textContent = error.message; }
   });
   instance = jarvis.state.instance || null;
   turns = jarvis.state.turns; activeId = jarvis.state.activeSource === 'background' ? null : jarvis.state.active; busy = Boolean(activeId);
   syncTaskContext(jarvis.state);
+  restoreOutbox();
+  for (const turn of turns) confirmSubmission(turn);
   syncNotificationStatus(jarvis.state);
   controls(); render();
-  if (busy) followActive(); else scheduleStatePoll();
+  if (busy || visiblePending().length) followActive(); else scheduleStatePoll();
   syncNotifications();
   document.addEventListener('jarvis:instance-updated', () => { if (instance) followActive(); });
   document.addEventListener('visibilitychange', () => {

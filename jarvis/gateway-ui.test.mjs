@@ -43,7 +43,7 @@ test('Gateway notifications have no fake user bubble, recover by cursor, and bin
     } };
   w.fetch = async (_url,options)=>{
     submitted = JSON.parse(options.body);
-    const turn = {id:submitted.id,user:submitted.text,assistant:'已收到你的回答。',status:'complete'};
+    const turn = {id:submitted.id,user:submitted.text,selectedWorkRef:submitted.selectedWorkRef,selectedQuestionId:submitted.selectedQuestionId,assistant:'已收到你的回答。',status:'complete'};
     return new Response(JSON.stringify({type:'start',turn})+'\n'+JSON.stringify({type:'done',turn})+'\n');
   };
   const script = w.document.createElement('script'); script.textContent = readFileSync(new URL('./public/chat.js',import.meta.url),'utf8');

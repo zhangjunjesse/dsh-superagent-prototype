@@ -93,6 +93,8 @@ svg { display:block; }
 .shell[data-busy='true'] .brand-mark { animation:orb-breathe 2s ease-in-out infinite; }
 .shell[data-busy='true'] .message:last-child .avatar { animation:orb-breathe 2s ease-in-out infinite; }
 .message .action { align-self:flex-start; margin-top:14px; }
+.message.user .send-status { align-self:flex-end; margin-top:7px; color:var(--muted); font-size:12px; line-height:1.6; }
+.message.user .action { align-self:flex-end; }
 .composer { flex-shrink:0; width:100%; max-width:900px; margin:0 auto; padding:12px 30px 26px; }
 .composer-box { position:relative; padding:17px 16px 12px; border:1px solid #dce4f0; border-radius:24px; background:#ffffffeb; box-shadow:0 8px 32px #3157860c,0 1px 4px #31578608; backdrop-filter:blur(16px); transition:border-color 200ms,box-shadow 200ms; }
 .composer-box:focus-within { border-color:#9fbbea; box-shadow:0 8px 36px #31578614,0 0 0 3px #eaf1fd80; }

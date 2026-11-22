@@ -4,6 +4,23 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { defaultModel, UserError } from './config.mjs';
 
+// Optional for older clients; new clients pin a submission to its conversation and attempt.
+export function assertChatSubmission(input, binding) {
+  if (input.submissionId !== undefined && (typeof input.submissionId !== 'string' || !/^[a-zA-Z0-9-]{8,80}$/.test(input.submissionId))) throw new UserError('发送标识不正确');
+  const expected = input.binding;
+  if (expected === undefined) return;
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected) || Object.keys(expected).some(key => !['conversationId', 'generation'].includes(key)) ||
+    typeof expected.conversationId !== 'string' || !expected.conversationId || !Number.isSafeInteger(expected.generation) || expected.generation < 0) throw new UserError('对话关联不正确');
+  if (expected.conversationId !== binding?.conversationId || expected.generation !== binding?.generation || binding.status !== 'ready') throw new UserError('对话已切换，请重新读取后再发送', 409);
+}
+
+export function replaysChatTurn(turn, input) {
+  if (!turn) return false;
+  if ((!input.retry || input.text !== undefined) && (typeof input.text !== 'string' || input.text.trim() !== turn.user) ||
+    ['selectedWorkRef', 'selectedQuestionId'].some(key => (!input.retry || input[key] !== undefined) && input[key] !== turn[key])) throw new UserError('消息标识已属于其他内容，请重新读取对话', 409);
+  return !input.retry || Boolean(input.submissionId && (turn.submissionId === input.submissionId || turn.submissionIds?.includes(input.submissionId)));
+}
+
 export class Store {
   constructor(file) {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
