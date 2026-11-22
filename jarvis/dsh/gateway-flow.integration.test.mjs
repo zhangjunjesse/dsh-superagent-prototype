@@ -28,8 +28,10 @@ const fixture = async (path, input) => {
   const body = await response.json(); assert.equal(response.status, 200, JSON.stringify(body)); return body;
 };
 const api = async (path, method = 'GET', input) => {
-  const response = await fetch(origin + '/jarvis/api' + path, { method,
-    headers: { 'content-type': 'application/json', ...(state?.csrf ? { 'x-jarvis-csrf': state.csrf } : {}) },
+  const cookie = process.env.JARVIS_DSH_TEST_COOKIE;
+  assert.ok(cookie, 'This opt-in profile requires its signed DSH test session cookie');
+  const response = await fetch(origin + '/jarvis/api' + path, { method, redirect: 'error',
+    headers: { cookie, 'content-type': 'application/json', ...(state?.csrf ? { 'x-jarvis-csrf': state.csrf } : {}) },
     ...(input ? { body: JSON.stringify(input) } : {}), signal: AbortSignal.timeout(12000) });
   if (path === '/chat' && response.ok) return (await response.text()).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   const body = await response.json(); assert.equal(response.status, 200, JSON.stringify(body)); return body;

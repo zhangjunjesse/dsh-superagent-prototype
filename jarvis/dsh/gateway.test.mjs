@@ -48,7 +48,8 @@ function harness(t, options = {}) {
     if (service && injected) injected({ get: () => service, effect: effect => { injectionCleanup = effect(); } });
   };
   if (options.dynamic) ctx.inject = (_names, listener) => { injected = listener; mount(); };
-  const runtime = new JarvisRuntime(ctx, { dataFile: join(directory, 'state.sqlite'), workspace: directory });
+  const runtime = new JarvisRuntime(ctx, { dataFile: join(directory, 'state.sqlite'), workspace: directory },
+    { readOrganizationDirectory: options.readOrganizationDirectory });
   t.after(async () => { if (!runtime.closed) { await runtime.close(); runtime.closed = true; } cleanups.forEach(cleanup => cleanup()); if (!options.directory) rmSync(directory, { recursive: true, force: true }); });
   return { runtime, ctx, calls, guards, registrations, directory, cleanup: fn => cleanups.push(fn),
     setService: value => { service = value; mount(); }, setResponder: value => { responder = value; } };
@@ -78,6 +79,54 @@ function queuedMessage(item) {
   return { id: 'jarvis-gateway:' + item.deliveryId, role: 'user', source: { kind: 'jarvis-gateway', form: 'relay', deliveryId: item.deliveryId },
     content: [{ type: 'text', text: notificationText(item) }] };
 }
+
+test('a daily user can look up organizational ownership with a saved custom role and disconnected Gateway', async t => {
+  const name = 'jarvis_organization_directory';
+  let reads = 0;
+  const h = harness(t, { readOrganizationDirectory: () => {
+    reads++;
+    return { organizations: [{ id: 'rd', name: 'superjarvis-研发', brainName: '研发负责人', phase: 'stopped' }] };
+  } });
+  await h.runtime.ready();
+  const customRole = '请用中文回答。';
+  const prompt = await h.runtime.savePrompts({ revision: 0, text: customRole });
+  assert.equal(prompt.text, customRole);
+  assert.match(prompt.effectiveText, /先用 jarvis_organization_directory/);
+  assert.doesNotMatch(h.runtime.promptSettings.snapshot('background').effectiveText, /jarvis_organization_directory/);
+  const definition = h.registrations.get(h.runtime.agent.id).get(name);
+  const execute = (agent, args = {}) => definition.execute(args, { agent, signal: new AbortController().signal });
+  h.setResponder(async ({ agent }) => {
+    await assert.rejects(execute({ id: 'another-session' }), /当前集团/);
+    await assert.rejects(execute(agent, { target: 'rd' }), /参数/);
+    const { organizations } = await execute(agent);
+    return organizations[0].name + '，负责人是' + organizations[0].brainName;
+  });
+  await h.runtime.chat({ id: 'directory-owning-organization', text: 'SuperJarvis 的研发应该交给谁？' }, () => {}, new AbortController().signal);
+  assert.equal(h.runtime.store.turn('directory-owning-organization').assistant, 'superjarvis-研发，负责人是研发负责人');
+  assert.equal(reads, 1);
+  await assert.rejects(execute(h.runtime.agent), /当前集团/);
+  assert.equal(h.runtime.gateway.connected(), false);
+});
+
+test('a directory response arriving after user cancellation is discarded', async t => {
+  const entered = Promise.withResolvers(), directory = Promise.withResolvers();
+  const h = harness(t, { readOrganizationDirectory: () => { entered.resolve(); return directory.promise; } });
+  await h.runtime.ready();
+  let result;
+  h.setResponder(async ({ agent, tools, signal }) => {
+    result = await tools.get('jarvis_organization_directory').execute({}, { agent, signal }).then(
+      () => 'directory returned', error => error.name);
+    return '已停止';
+  });
+  const controller = new AbortController();
+  const chatting = h.runtime.chat({ id: 'directory-cancelled', text: '谁负责研发？' }, () => {}, controller.signal);
+  await entered.promise;
+  controller.abort();
+  directory.resolve({ organizations: [] });
+  await chatting;
+  assert.equal(result, 'AbortError');
+  assert.equal(h.runtime.store.turn('directory-cancelled').status, 'stopped');
+});
 
 test('high-level tools use only the current persisted human turn and retain durable receipts', async t => {
   const submissions = [];

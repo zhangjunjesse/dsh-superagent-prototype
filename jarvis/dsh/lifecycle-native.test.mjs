@@ -8,7 +8,9 @@ import { available, nativeFixture } from '../process-runtime/native-host-fixture
 async function fixture(t, { realCapabilities = false, legacy = false, isolatedJobs = false, drainTimeout = 10000 } = {}) {
   const f = await nativeFixture(t, { managementOnly: true, realCapabilities, inherited: realCapabilities ? [] : ['read', 'write'], local: [] });
   const daily = join(f.modules, 'jarvis/dsh'); mkdirSync(daily, { recursive: true });
-  for (const name of ['runtime.mjs', 'gateway.mjs', 'gateway-delivery.mjs', 'organization-gateway.mjs', 'model-discovery.mjs', 'prompts.mjs', 'read-capabilities.mjs']) copyFileSync(new URL(name, import.meta.url), join(daily, name));
+  mkdirSync(join(daily, 'desktop-entry'), { recursive: true });
+  for (const name of ['runtime.mjs', 'gateway.mjs', 'gateway-delivery.mjs', 'organization-gateway.mjs', 'model-discovery.mjs', 'desktop-model-client.mjs',
+    'desktop-entry/model-protocol.mjs', 'prompts.mjs', 'read-capabilities.mjs']) copyFileSync(new URL(name, import.meta.url), join(daily, name));
   cpSync(new URL('prompts/', import.meta.url), join(daily, 'prompts'), { recursive: true });
   for (const name of ['store.mjs', 'config.mjs']) copyFileSync(new URL('../' + name, import.meta.url), join(f.modules, 'jarvis', name));
   let context = f.ctx, jobsProvider, jobsProviderSequence = 0, installJobs;

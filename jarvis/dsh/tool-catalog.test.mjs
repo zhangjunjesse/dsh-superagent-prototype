@@ -23,7 +23,8 @@ if (process.env.JARVIS_TOOL_CATALOG_RUNTIME) {
   after(() => removeFixture(directory));
   symlinkSync(fileURLToPath(new URL('../../node_modules/', import.meta.url)), join(directory, 'node_modules'), 'junction');
   symlinkSync(fileURLToPath(new URL('../../lib/', import.meta.url)), join(directory, 'lib'), 'junction');
-  for (const name of ['dsh/runtime.mjs', 'dsh/read-capabilities.mjs', 'dsh/prompts.mjs', 'dsh/prompts/jarvis.md', 'dsh/gateway.mjs', 'dsh/organization-gateway.mjs', 'dsh/gateway-delivery.mjs', 'dsh/model-discovery.mjs', 'store.mjs', 'config.mjs']) {
+  for (const name of ['dsh/runtime.mjs', 'dsh/read-capabilities.mjs', 'dsh/prompts.mjs', 'dsh/prompts/jarvis.md', 'dsh/gateway.mjs', 'dsh/organization-gateway.mjs', 'dsh/gateway-delivery.mjs', 'dsh/model-discovery.mjs',
+    'dsh/desktop-model-client.mjs', 'dsh/desktop-entry/model-protocol.mjs', 'store.mjs', 'config.mjs']) {
     const target = join(directory, 'jarvis', name); mkdirSync(dirname(target), { recursive: true });
     copyFileSync(name === 'dsh/runtime.mjs' ? resolve(process.env.JARVIS_TOOL_CATALOG_RUNTIME) : new URL('../' + name, import.meta.url), target);
   }
@@ -38,7 +39,7 @@ const syntheticTool = (name, calls) => defineTool({ name, description: 'Catalog 
   output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
   execute: async () => { calls.push(name); return { fixture: true, name }; } });
 
-async function fixture(t) {
+async function fixture(t, { readOrganizationDirectory } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'jarvis-tool-catalog-state-'));
   const root = new Context(); new SystemPrompt(root, {}); const tools = new ToolRuntime(root, { mode: 'native' });
   const agents = new Map(), scopes = [], calls = [], callbacks = new Map(); let service, worker;
@@ -64,7 +65,7 @@ async function fixture(t) {
       },
       prompt: async () => { throw new Error('Tool catalog checks must not invoke a model'); },
     } };
-  const runtime = new Runtime(ctx, { dataFile: join(directory, 'state.sqlite'), workspace: directory });
+  const runtime = new Runtime(ctx, { dataFile: join(directory, 'state.sqlite'), workspace: directory }, { readOrganizationDirectory });
   t.after(async () => { await runtime.close(); for (const scope of scopes.reverse()) await scope.dispose(); removeFixture(directory); });
   runtime.policy = runtime.store.save('dsh-tools', runtime.policy.revision, policy);
   await runtime.ready();
@@ -234,4 +235,37 @@ test('task controls stay separate and saved-off own Gateway schemas and executio
     f.runtime.saveTool({ name, allowed: true, revision: f.runtime.tools().revision });
     assert.equal((await f.wireNames()).has(name), true);
   }
+});
+
+test('organization directory uses the native read-tool switch, user schema and current daily Session', async t => {
+  const name = 'jarvis_organization_directory';
+  const f = await fixture(t, { readOrganizationDirectory: () => assert.fail('denied calls cannot read the directory') });
+  assert.equal(f.rows().find(tool => tool.name === name)?.kind, 'direct_read');
+  assert.ok((await f.wireNames()).has(name));
+  assert.equal((await f.execute(name)).isError, true, 'an unbound native call has no user turn');
+  assert.equal((await f.execute(name, {}, f.worker())).isError, true);
+  f.runtime.active = { kind: 'background' };
+  try {
+    assert.equal((await f.wireNames()).has(name), false);
+    assert.equal((await f.execute(name)).isError, true);
+  } finally { f.runtime.active = null; }
+  f.runtime.saveTool({ name, allowed: false, revision: f.runtime.tools().revision });
+  await f.runtime.clear();
+  assert.equal(f.rows().find(tool => tool.name === name)?.allowed, false);
+  assert.equal((await f.wireNames()).has(name), false);
+  assert.doesNotMatch(f.runtime.promptSettings.snapshot().effectiveText, /先用 jarvis_organization_directory/);
+  f.runtime.saveTool({ name, allowed: true, revision: f.runtime.tools().revision });
+  assert.ok((await f.wireNames()).has(name));
+});
+
+test('a host without organization management cannot supply a substitute directory tool', async t => {
+  const name = 'jarvis_organization_directory', f = await fixture(t);
+  const dispose = f.root.tools.register(syntheticTool(name, f.calls));
+  try {
+    f.runtime.refreshToolCatalog();
+    assert.equal(f.rows().some(tool => tool.name === name), false);
+    assert.equal((await f.wireNames()).has(name), false);
+    assert.equal((await f.execute(name)).isError, true);
+    assert.deepEqual(f.calls, []);
+  } finally { dispose(); }
 });

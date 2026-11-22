@@ -704,7 +704,7 @@ export class ProcessManager {
     }
   }
   ready(id) { const item = this.instance(id); if (item.phase !== 'running' || !item.peer) throw new Error('SuperJarvis instance is not running'); return item; }
-  async delegationCatalog(source, generation) {
+  async delegationCatalog(source, generation, { recordMetadata = true } = {}) {
     const ownsSource = () => !this.closing && this.instances.get(source.config.instanceId) === source
       && source.generation === generation && ['starting', 'running'].includes(source.phase);
     if (!ownsSource()) throw new Error('Delegation source generation is no longer active');
@@ -720,7 +720,7 @@ export class ProcessManager {
     }));
     if (!ownsSource()) throw new Error('Delegation source generation is no longer active');
     const targets = ownerTargets(source.config, source.runtimeMetadata);
-    if (source.runtimeMetadata) source.runtimeMetadata.delegationTargets = targets.map(({ instanceId, organizationName, description }) => ({ instanceId, organizationName, description }));
+    if (recordMetadata && source.runtimeMetadata) source.runtimeMetadata.delegationTargets = targets.map(({ instanceId, organizationName, description }) => ({ instanceId, organizationName, description }));
     return { targets, readyInstanceIds: ready.filter(Boolean) };
   }
   async delegate(source, sourceGeneration, input, { managementOwner } = {}) {

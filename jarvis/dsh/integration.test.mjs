@@ -11,7 +11,12 @@ const home = process.env.JARVIS_DSH_TEST_HOME;
 test('installed DSH: settings, native tool execution/denial, context, cancellation and reset', { skip: !home, timeout: 50000 }, async t => {
   assert.match(resolve(home), /[\\/]\.artifacts[\\/]jarvis-dsh[\\/]home$/);
   const origin = 'http://127.0.0.1:4318/jarvis';
-  let state = await (await fetch(origin + '/api/state')).json();
+  const cookie = process.env.JARVIS_DSH_TEST_COOKIE;
+  assert.ok(cookie, 'This opt-in profile requires its signed DSH test session cookie');
+  const sessionFetch = (path, options = {}) => fetch(origin + path, { ...options, redirect: 'error', headers: { ...options.headers, cookie } });
+  const initial = await sessionFetch('/api/state');
+  assert.equal(initial.status, 200, 'The fixture session must be signed in');
+  let state = await initial.json();
   assert.equal(state.runtime, 'dsh');
   assert.ok(state.models.groups.some(group => group.id === 'jarvis-test'), 'requires the explicitly installed local fixture route');
   const originalModel = state.model.value, originalBasic = state.basic.value;
@@ -47,13 +52,13 @@ test('installed DSH: settings, native tool execution/denial, context, cancellati
   });
   await new Promise(resolve => upstream.listen(4320, '127.0.0.1', resolve));
   const api = async (path, method = 'GET', value) => {
-    const response = await fetch(origin + '/api' + path, { method, headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf }, ...(value ? { body: JSON.stringify(value) } : {}) });
+    const response = await sessionFetch('/api' + path, { method, headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf }, ...(value ? { body: JSON.stringify(value) } : {}) });
     return { status: response.status, value: await response.json() };
   };
   const model = async value => { state = (await api('/state')).value; const result = await api('/model', 'PUT', { revision: state.model.revision, value }); assert.equal(result.status, 200, JSON.stringify(result)); return result.value; };
   const tool = async allowed => { const current = (await api('/tools')).value; const result = await api('/tools', 'PUT', { revision: current.revision, name: 'write', allowed }); assert.equal(result.status, 200); };
   const chat = async (text, options = {}) => {
-    const response = await fetch(origin + '/api/chat', { method: 'POST', headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf }, body: JSON.stringify({ id: randomUUID(), text, ...options }), signal: AbortSignal.timeout(12000) });
+    const response = await sessionFetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json', 'x-jarvis-csrf': state.csrf }, body: JSON.stringify({ id: randomUUID(), text, ...options }), signal: AbortSignal.timeout(12000) });
     assert.equal(response.status, 200, await (response.status === 200 ? Promise.resolve('') : response.text()));
     return (await response.text()).trim().split('\n').map(line => JSON.parse(line));
   };

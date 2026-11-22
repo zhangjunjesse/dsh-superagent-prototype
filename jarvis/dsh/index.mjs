@@ -19,6 +19,8 @@ export const inject = ['agents', 'agentPresets', 'sessionController', 'sessionPe
   'subprocess', 'permissionPresets', 'workspaceRegistry'];
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 const organizationBundle = fileURLToPath(new URL('../../lib/organization.js', import.meta.url));
+// Both state and the notification cursor can return stored user and assistant turns.
+const dailyConversationPaths = new Set(['/api/chat', '/api/state', '/api/notifications', '/api/notifications/retry', '/api/stop', '/api/conversation']);
 const files = new Set(['index.html', 'identity.js', 'model-catalog.js', 'model-picker.js', 'layout.js', 'settings.js', 'chat.js', 'capabilities.js', 'capabilities.css', 'ui.css', 'dsh-tools.js', 'composition.html', 'composition.css', 'composition.js', 'operation-logs.js', 'operation-logs.css', 'prompts.js', 'prompts.css']);
 const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
 async function body(req, limit = 100000) {
@@ -35,15 +37,19 @@ export async function apply(ctx, config) {
   const rootStateDir = join(config.systemManagement?.rootDir ?? join(config.stateDir, 'superjarvis'), 'instances', 'root', 'state');
   const adoption = config.systemManagement !== false ? readOriginalAdoption(rootStateDir) : undefined;
   const gatewayOptions = adoption ? { adoptedRoot: { stateDir: rootStateDir, identity: adoption.identity } } : {};
+  let system, systemError;
+  const readOrganizationDirectory = config.systemManagement === false ? undefined : () => {
+    if (!system) throw new UserError('组织目录暂不可用，请检查实例管理状态', 503);
+    return system.organizationDirectory();
+  };
   const runtime = new JarvisRuntime(ctx, { ...config, lifecycleManaged: config.systemManagement !== false,
-    dataFile: join(config.stateDir, 'jarvis-dsh.sqlite') });
+    dataFile: join(config.stateDir, 'jarvis-dsh.sqlite') }, { readOrganizationDirectory });
   const csrf = randomBytes(32).toString('hex');
   // Session-switch recovery needs its durable notification ledgers before optional engine management initializes.
   try {
     if (config.systemManagement !== false) runtime.gateway.connectOrganization(undefined, join(config.stateDir, 'organization-gateway.sqlite'), gatewayOptions);
     await runtime.ready();
   } catch (error) { await runtime.close(); throw error; }
-  let system, systemError;
   try {
     if (config.systemManagement !== false) system = new SystemControl(ctx, {
       rootDir: config.systemManagement?.rootDir ?? join(config.stateDir, 'superjarvis'),
@@ -88,7 +94,7 @@ export async function apply(ctx, config) {
   ctx.logger.info('Jarvis available at /jarvis/');
 }
 
-/** Log evidence and instance controls share the existing login and same-origin boundary. */
+/** Authenticate protected APIs before reading data or starting a streamed response. */
 export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, logs, tasks }) {
   return async (req, res) => {
     try {
@@ -100,12 +106,11 @@ export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, l
       const logsPath = path === '/api/logs' || path.startsWith('/api/logs/');
       const promptsPath = path === '/api/prompts' || path.startsWith('/api/prompts/');
       const tasksPath = path === '/api/tasks' || path.startsWith('/api/tasks/');
-      if (systemPath || logsPath || promptsPath || tasksPath) {
-        if (typeof ctx.connection?.requestRejection !== 'function') throw new UserError(promptsPath ? '提示词管理认证暂不可用' : logsPath ? '日志访问认证暂不可用' : '当前宿主未提供实例管理认证', 503);
+      if (systemPath || logsPath || promptsPath || tasksPath || dailyConversationPaths.has(path)) {
+        if (typeof ctx.connection?.requestRejection !== 'function') throw new UserError('当前宿主未提供 DSH 登录认证', 503);
         const rejection = ctx.connection.requestRejection(req);
         if (rejection !== undefined) throw new UserError(rejection === 401
-          ? (logsPath || promptsPath ? '登录已失效，请重新登录后打开' : 'DSH 登录已失效，请通过宿主入口重新打开')
-          : (promptsPath ? '不允许访问提示词管理' : logsPath ? '不允许访问运行日志' : '不允许访问实例管理'), rejection);
+          ? 'DSH 登录已失效，请通过宿主入口重新打开' : 'DSH 不允许访问此资源', rejection);
       }
       if (!['GET', 'HEAD'].includes(req.method) && req.headers['x-jarvis-csrf'] !== csrf) throw new UserError('页面会话已失效，请刷新页面', 403);
       if (tasksPath) {

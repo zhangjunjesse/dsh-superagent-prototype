@@ -224,6 +224,42 @@ export class SystemControl {
       throw new SystemControlError(400, '当前仅能选择助手已保存的宿主模型');
     }
   }
+  /** Saved ownership and observed Router availability, without opening settings or changing an owner's catalog. */
+  async organizationDirectory() {
+    const nodes = this.nodes, revision = this.revision, rootId = 'root', manager = this.manager;
+    if (!nodes) return { configured: false, revision, rootId, organizations: [] };
+    const source = manager.instances.get(rootId), generation = source?.generation;
+    const owners = new Map([...manager.instances].map(([id, item]) => [id, { item, generation: item.generation, peer: item.peer }]));
+    let catalog;
+    if (source && Number.isSafeInteger(generation) && generation > 0 && ['starting', 'running'].includes(source.phase) && !manager.closing) {
+      try { catalog = await manager.delegationCatalog(source, generation, { recordMetadata: false }); }
+      catch { /* Keep saved organizations visible when current admission cannot be confirmed. */ }
+    }
+    if (nodes !== this.nodes || revision !== this.revision) throw new SystemControlError(409, '组织配置已更新，请重新查询组织目录');
+    const currentSource = manager.instances.get(rootId);
+    const sourceActive = currentSource && ['starting', 'running'].includes(currentSource.phase) && !manager.closing;
+    const verified = catalog && sourceActive && currentSource === source && currentSource.generation === generation;
+    const targets = new Set((verified ? catalog.targets : currentSource?.config.delegationTargets ?? []).map(target => target.instanceId));
+    const ready = new Set(verified ? catalog.readyInstanceIds : []);
+    return { configured: true, revision, rootId, organizations: nodes.map(node => {
+      const item = manager.instances.get(node.id), owner = owners.get(node.id), candidate = targets.has(node.id);
+      // A peer may have confirmed early while another readiness call was still pending.
+      const sameOwner = item && item === owner?.item && item.generation === owner.generation && item.peer === owner.peer;
+      const available = ready.has(node.id) && sameOwner && item.phase === 'running' && !item.cleanupPending && !manager.capabilityHolds.has(node.id);
+      let status;
+      if (node.id === rootId) status = 'self';
+      else if (!currentSource) status = 'unknown';
+      else if (!candidate) status = 'not-target';
+      else if (!sourceActive) status = 'source-unavailable';
+      else if (!verified || !item) status = 'unknown';
+      else if (available) status = 'ready';
+      else if (item.phase === 'running' && !sameOwner) status = 'unknown';
+      else status = 'unavailable';
+      return { id: node.id, parentId: node.parent, name: node.name, brainName: node.brainName,
+        description: node.description, capabilities: node.capabilities, phase: item?.phase ?? 'unknown',
+        routing: { candidate, available: Boolean(available), status } };
+    }) };
+  }
   async get({ view } = {}) {
     const nodes = this.nodes ?? this.initialNodes();
     const snapshot = { available: true, revision: this.revision, configured: this.nodes !== null, rootId: 'root',
