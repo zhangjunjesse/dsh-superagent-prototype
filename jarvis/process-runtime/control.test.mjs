@@ -75,6 +75,22 @@ async function setup(control, extras = [child()]) {
 const status = (snapshot, id) => snapshot.runtime.instances.find(instance => instance.instanceId === id);
 const rejectsStatus = (work, expected) => assert.rejects(work, error => error instanceof SystemControlError && error.status === expected);
 
+test('a topology action validates the target and avoids opening other organizations to acknowledge startup', async t => {
+  const control = new SystemControl({}, options());
+  t.after(() => control.close());
+  const { revision } = await setup(control);
+  const validated = [], checkModel = control.checkModel.bind(control);
+  control.checkModel = async model => { validated.push(model); return checkModel(model); };
+  const result = await control.action('research', 'start', revision, { view: 'topology' });
+  assert.ok(validated.length > 0);
+  assert.equal(result.view, 'topology');
+  assert.ok(result.nodes.every(node => !Object.hasOwn(node, 'execution')));
+  assert.equal(status(result, 'research').phase, 'running');
+  assert.equal(status(result, 'root').pid, null);
+  const full = await control.action('research', 'stop', revision);
+  assert.ok(full.nodes.every(node => Object.hasOwn(node, 'execution')));
+});
+
 test('direct organization children provide delegation without a toggle and preserve role models and tool limits', async () => {
   const control = new SystemControl({}, options());
   try {

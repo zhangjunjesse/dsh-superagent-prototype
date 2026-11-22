@@ -621,7 +621,10 @@
     if (!connected() || settingsPending() || service.busy || id!==currentInstanceId || !service.snapshot.configured) return;
     service.busy=true; service.epoch++; service.controlError=''; clearTimeout(service.pollTimer); updateRuntimeStatus();
     try {
-      const snapshot=await apiClient().api('/api/system/'+encodeURIComponent(id)+'/'+action,'POST',{revision:service.snapshot.revision});
+      let snapshot=await apiClient().api('/api/system/'+encodeURIComponent(id)+'/'+action,'POST',{revision:service.snapshot.revision,view:'topology'});
+      if (snapshot.view==='topology') {
+        snapshot=snapshot.revision===service.snapshot.revision ? {...service.snapshot,runtime:snapshot.runtime} : await apiClient().api('/api/system');
+      }
       installSnapshot(snapshot); service.details.delete(id); await refreshDetail();
       const runtime=runtimeOf(id);
       const complete=action==='stop'?runtime?.phase==='stopped'&&!runtime?.cleanupPending:['ready','running'].includes(runtime?.phase)&&!runtime?.cleanupPending;

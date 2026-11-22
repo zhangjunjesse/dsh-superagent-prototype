@@ -63,6 +63,21 @@ test('system mutations require same-origin and CSRF before reaching control', as
   assert.equal(mutations, 0);
 });
 
+test('a lifecycle action can request only topology after authenticated admission', async t => {
+  const calls = [];
+  const request = await host(t, { action: async (id, action, revision, options) => {
+    calls.push([id, action, revision, options.view]);
+    return { revision, view: options.view };
+  } });
+  const path = '/api/system/research/start', input = { revision: 3, view: 'topology' };
+  for (const [headers, code] of [[{ 'x-jarvis-csrf': '' }, 403], [{ 'x-test-session': '' }, 401]]) {
+    assert.equal((await request(path, { method: 'POST', input, headers })).status, code);
+  }
+  assert.equal((await request(path, { method: 'POST', input: { ...input, view: 'unknown' } })).status, 400);
+  assert.deepEqual((await request(path, { method: 'POST', input })).value, { revision: 3, view: 'topology' });
+  assert.deepEqual(calls, [['research', 'start', 3, 'topology']]);
+});
+
 test('organization prompt preview uses the existing login and CSRF boundary and forwards its owning instance', async t => {
   const calls = [];
   const request = await host(t, { previewPrompts: async (id, input) => { calls.push({ id, input }); return { role: input.role, effectiveText: 'Actual role prompt' }; } });

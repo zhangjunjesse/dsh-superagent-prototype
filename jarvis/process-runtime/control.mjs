@@ -369,7 +369,7 @@ export class SystemControl {
       throw new SystemControlError(500, '系统配置未能保存，已恢复原配置，请检查服务日志', { cause: error });
     } finally { this.saving = false; }
   }
-  async action(id, action, revision) {
+  async action(id, action, revision, { view } = {}) {
     await this.initialization;
     this.assertRevision(revision);
     if (!this.nodes?.some(node => node.id === id)) throw new SystemControlError(404, '未找到已保存的 SuperJarvis 实例');
@@ -384,7 +384,7 @@ export class SystemControl {
       if (runtime.phase !== (action === 'stop' ? 'stopped' : 'running') || runtime.cleanupPending || action === 'stop' && runtime.pid !== null) {
         throw new SystemControlError(503, '实例运行操作尚未完成，请查看运行状态和会话清理结果');
       }
-      return this.get();
+      return this.get({ view });
     } catch (error) {
       if (error instanceof SystemControlError) throw error;
       throw new SystemControlError(503, '实例运行操作失败，请查看运行状态和服务日志', { cause: error });

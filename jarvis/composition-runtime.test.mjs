@@ -43,7 +43,7 @@ async function open(t,{initial=snapshot(),draft,ready=Promise.resolve(),wait=tru
       runtime.generation+=action[2]==='stop'?0:1;runtime.pid=action[2]==='stop'?null:200+runtime.generation;
       runtime.phase=action[2]==='stop'?'stopped':'ready';
       const events=backend.events.get(id)||[];events.push({at:'2026-11-15T08:00:00.000Z',event:action[2],pid:runtime.pid,generation:runtime.generation});backend.events.set(id,events);
-      return copy(backend.snapshot);
+      return body.view==='topology'?{...copy(backend.snapshot),view:'topology',catalogs:{}}:copy(backend.snapshot);
     }
     const detail=/^\/api\/system\/([^/]+)$/.exec(path);
     if(detail&&method==='GET'){
@@ -241,7 +241,7 @@ test('runtime actions use the selected instance and expose actual PID, generatio
   ui.backend.controlError='';ui.action('runtime-stop','child').click();await until(()=>ui.query('[data-runtime-phase]').textContent==='已停止','child stop');
   assert.equal(ui.query('[data-runtime-pid]').textContent,'—');assert.deepEqual(ui.backend.snapshot.runtime.instances.find(n=>n.instanceId==='root'),initial.runtime.instances[0]);
   assert.deepEqual(ui.requests.filter(r=>r.method==='POST').map(r=>[r.path,r.body]),[
-    ['/api/system/child/start',{revision:4}],['/api/system/child/restart',{revision:4}],['/api/system/child/restart',{revision:4}],['/api/system/child/stop',{revision:4}],
+    ['/api/system/child/start',{revision:4,view:'topology'}],['/api/system/child/restart',{revision:4,view:'topology'}],['/api/system/child/restart',{revision:4,view:'topology'}],['/api/system/child/stop',{revision:4,view:'topology'}],
   ]);
 });
 
