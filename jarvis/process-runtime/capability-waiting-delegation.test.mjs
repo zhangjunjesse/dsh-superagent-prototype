@@ -182,6 +182,16 @@ test('waiting delegated questions survive automatic Worker capability applicatio
     assert.notEqual(identities[0].pid, identities[1].pid);
     const sessionIds = Object.fromEntries([...native.instances].map(([id, value]) => [id, [...value.sessions.keys()].sort()]));
     save('two-delegations-awaiting-input', { identities, bindings, quiet, receipts, links, turns: initialTurns });
+    const source = control.manager.instance('root'), catalogBeforeRename = await control.manager.delegationCatalog(source, source.generation);
+    const renamed = await control.save({ revision: control.revision, update: { id: 'child', changes: {
+      name: 'Renamed child', brainName: 'Renamed brain', description: 'Saved routing description', capabilities: 'Saved routing tags',
+    } } });
+    assert.equal(renamed.nodes.find(node => node.id === 'child').name, 'Renamed child');
+    assert.deepEqual((await control.manager.delegationCatalog(source, source.generation)).targets, catalogBeforeRename.targets,
+      'live metadata saves must preserve the descriptors bound by the original Router');
+    assert.deepEqual(runtimeIdentity(control), identities);
+    assert.deepEqual(waitingBindings(await states(control)), bindings, 'renaming must not rewrite existing task or question bindings');
+    save('metadata-saved-with-original-router-descriptors', { renamed: renamed.saved, runtime: runtimeIdentity(control) });
     const response = await control.management('child', { method: 'PUT', path: 'worker-capabilities',
       body: { revision: control.revision, tools: ['read', 'glob'], skills: [] } });
     assert.equal(response.status, 200);

@@ -36,6 +36,7 @@ test('live DOM: separate settings, persistence, real message events, context, st
     const w = dom.window; windows.push(w);
     w.fetch = (url, options) => fetch(new URL(url, origin), options);
     w.TextDecoder = TextDecoder;
+    w.AbortController = AbortController;
     w.matchMedia = () => ({ matches: false });
     for (const name of ['identity', 'layout', 'model-catalog', 'model-picker', 'capabilities', 'settings', 'chat']) { const script = w.document.createElement('script'); script.textContent = readFileSync(new URL(name + '.js', root), 'utf8'); w.document.body.append(script); }
     const byId = id => w.document.getElementById(id);
@@ -62,7 +63,7 @@ test('live DOM: separate settings, persistence, real message events, context, st
   ui.byId('input').value = '尚未配置模型时保留这段草稿';
   ui.submit('composer');
   await until(() => ui.byId('chat-feedback').textContent && ui.byId('stop-generation').hidden, 'configuration error');
-  assert.equal(ui.byId('input').value, '尚未配置模型时保留这段草稿');
+  assert.equal(ui.byId('input').value, '尚未配置模型时保留这段草稿', ui.byId('chat-feedback').textContent);
   assert.equal(ui.byId('send-message').disabled, false, 'failed submission can be sent again');
   assert.equal(ui.w.document.activeElement, ui.byId('input'));
   await ui.nav('#settings'); ui.input('assistantName', '小维'); ui.submit('basic-form');
@@ -105,7 +106,7 @@ test('live DOM: separate settings, persistence, real message events, context, st
   await until(() => requests.length === 2 && ui.byId('stop-generation').hidden, 'second answer');
   assert.deepEqual(requests[1].messages.slice(1).map(message => message.content), ['你好', '实际 HTTP 回复', '继续']);
   ui.byId('input').value = 'slow'; ui.submit('composer');
-  await until(() => !ui.byId('stop-generation').disabled && !ui.byId('stop-generation').hidden, 'stoppable');
+  await until(() => ui.byId('thread').textContent.includes('slow') && ui.byId('thread').textContent.includes('正在回复…') && !ui.byId('stop-generation').disabled && !ui.byId('stop-generation').hidden, 'persisted reply is stoppable');
   assert.equal(ui.byId('input').disabled, false, 'a running reply allows preparing the next draft');
   ui.byId('input').value = '下一条草稿';
   assert.equal(ui.byId('send-message').hidden, true, 'stop replaces send while generating');

@@ -56,6 +56,8 @@ const now = (): string => new Date().toISOString()
 export interface RuntimeOptions {
   native?: RuntimeNativePorts
   setup?: Pick<SetupHost, 'native' | 'allowLocal'>
+  /** Observes the original setup and Session readiness, without replacing any lifecycle checks. */
+  startup?: SetupHost['startup']
   /** Management mode owns the same Store lock, without starting Sessions, Sources or business effects. */
   managementOnly?: boolean
   registerHttp?: boolean
@@ -138,7 +140,7 @@ export class Runtime extends Service implements SourceHost {
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
       options.native?.bindStore?.(store)
       if (options.machineSettings) { this.machineSettings = new MachineSettings(store, machine); this.machine = machine = this.machineSettings.machine }
-      const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart, ...options.setup })
+      const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart, startup: options.startup, ...options.setup })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
@@ -285,9 +287,12 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ state: 'paused', detail: 'Management only; business processing is stopped', at: now() })
       return
     }
+    await this.options.startup?.({ stage: 'sessions', status: 'running' })
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.options.masterDirectory ?? this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
+    await this.options.startup?.({ stage: 'sessions', status: 'complete' })
+    await this.options.startup?.({ stage: 'finalizing', status: 'running' })
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
@@ -295,6 +300,7 @@ export class Runtime extends Service implements SourceHost {
     this.passes.start()
     this.effects.start()
     this.runtimeHealth.set({ state: 'ready', detail: 'Orchestrator is ready', at: now() })
+    await this.options.startup?.({ stage: 'finalizing', status: 'complete' })
   }
   private httpHost(): HttpHost {
     const runtime = this

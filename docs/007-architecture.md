@@ -451,6 +451,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/original-task-files.spec.ts` | Historical Core directory authority and deliverable bindings without moving files or trusting an index as authorization |
 | `tests/original-management.spec.ts` | Full original management dispatcher through an organization owner, real settings/prompts and management-only lifecycle |
 | `tests/local-organization-setup.spec.ts` | Original Setup and deployment for local work without mandatory GitHub, preserving configured source checks |
+| `tests/startup-stages.spec.ts`, `tests/deployment-concurrency.spec.ts` | Startup phase reporting and concurrent GitHub account and repository validation |
+| `tests/native-model-picker.spec.tsx` | Native model selection in the settings interface |
+| `tests/process-capability-chat.spec.ts`, `tests/process-capability-configure.spec.ts` | Daily replies and live Worker capability changes while delegated work is running |
 | `tests/machine-settings.spec.ts` | Actual machine defaults, validation, revision conflicts and next-use application |
 | `tests/executor-native.spec.ts` | Native executor cancellation ownership across independent organizations |
 | `jarvis/process-runtime/native-plugin-scope.test.mjs` | Installed Cordis consumer scope declares actual native subprocess, permission and workspace dependencies |

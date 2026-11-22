@@ -153,8 +153,9 @@ export function createJarvisHandler(ctx, runtime, { csrf, system, systemError, l
         if (match && !match[2] && req.method === 'GET') return json(res, 200, await system.detail(match[1]));
         if (match?.[2] && req.method === 'POST') {
           const input = await body(req);
-          if (Object.keys(input).some(key => key !== 'revision') || !Number.isSafeInteger(input.revision) || input.revision < 0) throw new UserError('实例操作参数不正确');
-          return json(res, 200, await system.action(match[1], match[2], input.revision));
+          if (Object.keys(input).some(key => !['revision', 'view'].includes(key)) || !Number.isSafeInteger(input.revision)
+            || input.revision < 0 || input.view !== undefined && input.view !== 'topology') throw new UserError('实例操作参数不正确');
+          return json(res, 200, await system.action(match[1], match[2], input.revision, { view: input.view }));
         }
         throw new UserError('未找到此实例操作', 404);
       }

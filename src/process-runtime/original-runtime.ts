@@ -7,6 +7,7 @@ import { Runtime } from '../app/runtime.ts'
 import type { Ticket } from '../core/index.ts'
 import type { RuntimeNativePorts } from '../app/runtime-ports.ts'
 import type { Machine } from '../deployment.ts'
+import type { StartupObserver } from '../setup.ts'
 import { family, KV } from '../kv.ts'
 import { LIMITS } from '../limits.ts'
 import { SettingsSchema } from '../policy.ts'
@@ -50,6 +51,8 @@ export interface ProcessRuntimeOptions {
   restart?(): void;
   /** Installed from durable host coordination before original Sources or effects can admit work. */
   capabilityHold?: CapabilityHold;
+  /** Stage-only observation of the original setup and native Session initialization. */
+  startup?: StartupObserver;
 }
 type Preparation = { prepare(id: string, text: string): Promise<ProcessRunResult>; cancel(sessionKey: string): Promise<unknown> }
 const WorkerCapabilityBindingSchema = z.object({ version: z.literal(1), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
@@ -117,6 +120,7 @@ export class OriginalProcess {
       this.ledger = ledger = new GatewayLedger(join(directory, 'jarvis-gateway.sqlite'), identity)
       this.runtime = runtime = new Runtime(this.context, machine, () => { options.restart?.() }, {
         native: options.native, managementOnly: options.managementOnly, registerHttp: false, machineSettings: true, localTasks: true,
+        startup: options.managementOnly ? undefined : options.startup,
         setup: { native: options.native.deployment, allowLocal: true },
         masterDirectory: adoption?.sessions.find(item => item.role === 'orchestrator')?.cwd,
         expectedMasterId: adoption?.masterId,

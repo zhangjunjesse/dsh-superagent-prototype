@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
-import { Store } from './store.mjs';
+import { Store, assertChatSubmission, replaysChatTurn } from './store.mjs';
 import { vault as systemVault } from './vault.mjs';
 import { parseName, parseModel, UserError } from './config.mjs';
 import { generate, makeRequest } from './model.mjs';
@@ -26,10 +26,11 @@ function publicModel(setting) {
 
 export function createApp({ dataFile, vault = systemVault, fetcher = fetch }) {
   const store = new Store(dataFile);
+  store.initializeSessionBinding();
   const csrf = randomBytes(32).toString('hex');
   let active = null;
   let origin;
-  const state = () => ({ basic: store.setting('basic'), model: publicModel(store.setting('model')), turns: store.turns(), active: active?.id || null, csrf });
+  const state = () => ({ basic: store.setting('basic'), model: publicModel(store.setting('model')), turns: store.turns(), active: active?.id || null, binding: store.sessionBinding(), csrf });
   function authorize(req) {
     if (req.headers.host !== new URL(origin).host) throw new UserError('不允许的访问地址', 403);
     if (req.headers.origin && req.headers.origin !== origin) throw new UserError('不允许跨站访问', 403);
@@ -48,10 +49,11 @@ export function createApp({ dataFile, vault = systemVault, fetcher = fetch }) {
     return publicModel(store.save('model', input.revision, { ...model, encryptedKey }));
   }
   function prepareTurn(input) {
-    if (active) throw new UserError('当前回复尚未结束', 409);
+    assertChatSubmission(input, store.sessionBinding());
     if (typeof input.id !== 'string' || !/^[a-zA-Z0-9-]{8,80}$/.test(input.id)) throw new UserError('请求标识不正确');
     const existing = store.turn(input.id);
-    if (existing && !input.retry) return { existing };
+    if (replaysChatTurn(existing, input)) return { existing };
+    if (active) throw new UserError('当前回复尚未结束', 409);
     if (input.retry && (!existing || store.turns().at(-1)?.id !== input.id || existing.status === 'complete')) throw new UserError('只能重试最近一条未完成的回复', 409);
     const config = store.setting('model').value;
     if (!config.endpoint || !config.model) throw new UserError('请先在设置中配置模型');
@@ -59,7 +61,11 @@ export function createApp({ dataFile, vault = systemVault, fetcher = fetch }) {
     if (!apiKey && new URL(config.endpoint).protocol === 'https:') throw new UserError('请先填写模型访问密钥');
     const user = existing?.user ?? input.text;
     if (typeof user !== 'string' || !user.trim() || user.length > 32000) throw new UserError('请输入 1–32000 个字符的消息');
-    const turn = { id: input.id, user: user.trim(), assistant: '', status: 'streaming', error: '', createdAt: existing?.createdAt || new Date().toISOString(), attempt: (existing?.attempt || 0) + 1 };
+    const binding = store.sessionBinding();
+    const turn = { id: input.id, user: user.trim(), assistant: '', status: 'streaming', error: '', createdAt: existing?.createdAt || new Date().toISOString(), attempt: (existing?.attempt || 0) + 1,
+      conversationId: binding.conversationId, generation: binding.generation, ...(input.submissionId ? { submissionId: input.submissionId } : {}),
+      ...(input.submissionId || existing?.submissionId || existing?.submissionIds?.length ? {
+        submissionIds: [...new Set([...(existing?.submissionIds || []), ...(existing?.submissionId ? [existing.submissionId] : []), ...(input.submissionId ? [input.submissionId] : [])])] } : {}) };
     const context = [...store.turns().filter(row => row.id !== turn.id), turn];
     const body = makeRequest(config, store.setting('basic').value.assistantName, context);
     if (existing) store.updateTurn(turn); else store.addTurn(turn);
@@ -119,7 +125,11 @@ export function createApp({ dataFile, vault = systemVault, fetcher = fetch }) {
     }
     if (req.method === 'DELETE' && path === '/api/conversation') {
       if (active) throw new UserError('请先停止当前回复', 409);
-      store.clear(); return json(res, 200, { cleared: true });
+      store.atomic(() => {
+        const binding = store.sessionBinding();
+        store.clear(); store.writeBinding({ ...binding, generation: binding.generation + 1, revision: binding.revision + 1 }, binding.revision);
+      });
+      return json(res, 200, { cleared: true });
     }
     if (req.method === 'GET' && assets[path]) {
       const [file, type] = assets[path];

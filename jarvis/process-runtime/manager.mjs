@@ -7,6 +7,7 @@ import { ProcessPeer, CONVERSATION_RPC_TIMEOUT_MS } from './ipc.mjs';
 import { DshBridge, installBridgeLifecycleGuard } from './dsh-bridge.mjs';
 import { NativeHost, installNativeLifecycleGuard } from './native-host.mjs';
 import { nativeHash } from './native-journal.mjs';
+import { beginStartup, cancelStartup, finishStartup, restoreStartup, startupSnapshot, updateStartup } from './startup-progress.mjs';
 import { readOriginalAdoption } from './original-adoption.mjs';
 import { lockSync } from 'proper-lockfile';
 import { DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normalizeEngineConfig } from '../../lib/process-runtime.js';
@@ -105,6 +106,20 @@ function configuration(rawInstances, rootDir) {
 }
 
 const sameConfiguration = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+const metadata = config => ({ organizationName: config.organizationName, brainName: config.brainName, description: config.description,
+  delegationTargets: config.delegationTargets.map(({ instanceId, organizationName, description }) => ({ instanceId, organizationName, description })) });
+// A running Router binds its descriptors. Keep that generation's names while accepting the existing catalog's additive targets and permission updates.
+function ownerTargets(config, ownerMetadata) {
+  return config.delegationTargets.map(target => {
+    const prior = ownerMetadata?.delegationTargets.find(item => item.instanceId === target.instanceId);
+    return prior ? { ...target, organizationName: prior.organizationName, description: prior.description } : target;
+  });
+}
+function metadataPending(item) {
+  if (!item.child || !item.runtimeMetadata) return false;
+  const current = metadata(item.config), known = new Set(item.runtimeMetadata.delegationTargets.map(target => target.instanceId));
+  return !sameConfiguration(item.runtimeMetadata, { ...current, delegationTargets: current.delegationTargets.filter(target => known.has(target.instanceId)) });
+}
 function delegationLimits(instances, config) {
   return config.allowedParents.map(sourceInstanceId => ({
     sourceInstanceId, tools: instances.get(sourceInstanceId).config.delegationTargets.find(target => target.instanceId === config.instanceId).tools,
@@ -157,6 +172,7 @@ export class ProcessManager {
         participant.setCapabilityHold?.(this.capabilityHolds.get(id));
       }
       for (const item of this.instances.values()) if (this.cleanupIntent(item)?.pending) { item.cleanupPending = true; item.phase = 'failed'; }
+      this.restoreStartups();
       this.record();
     } catch (error) { this.releaseLock(); throw error; }
     this.initialization = Promise.resolve().then(async () => { await this.recoverCleanup(); await this.recoverRestarts(); });
@@ -184,6 +200,7 @@ export class ProcessManager {
   }
   beginStop(item, reason) {
     item.phase = 'stopping'; item.cleanupPending = true;
+    if (cancelStartup(item.startup)) this.event(item, 'startup-cancelling', { attemptId: item.startup.id, stage: item.startup.stage, elapsedMs: item.startup.elapsedMs });
     this.suspendParticipant(item, reason);
     item.native?.setLifecycleStopping?.(true);
     item.bridge?.setLifecycleStopping?.(true);
@@ -197,12 +214,45 @@ export class ProcessManager {
   status() {
     return { hostPid: process.pid, instances: [...this.instances.values()].map(item => ({ instanceId: item.config.instanceId,
       pid: item.child?.pid ?? null, phase: item.phase, generation: item.generation,
+      ...(item.startup ? { startup: startupSnapshot(item.startup) } : {}),
       ...(item.management ? { managementPid: item.management.ended ? null : item.management.child.pid, managementPhase: item.management.phase } : {}),
+      ...(metadataPending(item) ? { metadataPending: true } : {}),
       ...(this.capabilityHolds.has(item.config.instanceId) ? { capabilityHold: { ...this.capabilityHolds.get(item.config.instanceId) } } : {}),
       ...(item.cleanupPending ? { cleanupPending: true } : {}), ...(item.error ? { error: item.error } : {}) })) };
   }
   reconfigure(rawInstances, { persist = () => {} } = {}) {
     return this.applyConfiguration(configuration(rawInstances, this.rootDir), persist);
+  }
+  /** Save identity labels and independently selected models without replacing any live or management owner. */
+  reconfigureScoped(rawInstances, { persist = () => {} } = {}) {
+    if (this.closing || this.reconfiguring) throw new Error('Runtime configuration is changing or closing');
+    const next = configuration(rawInstances, this.rootDir), updates = [];
+    if (next.size !== this.instances.size) throw new Error('Scoped organization updates cannot change topology');
+    for (const [id, item] of this.instances) {
+      const config = next.get(id)?.config;
+      const expected = config && { ...item.config, organizationName: config.organizationName, brainName: config.brainName,
+        description: config.description, model: config.model, roleModels: config.roleModels,
+        delegationTargets: ownerTargets(item.config, metadata(config)) };
+      if (!config || !sameConfiguration(expected, config)) throw new Error('Scoped organization updates cannot change directories, topology or permissions');
+      if (sameConfiguration(item.config, config)) continue;
+      this.capabilityLifecycle(item);
+      if (['starting', 'stopping'].includes(item.phase) || item.cleanupPending || item.operation && item.operationKind !== 'management') {
+        throw capabilityConflict('相关组织正在启停或清理，请完成后再保存');
+      }
+      const modelChanged = !sameConfiguration(item.config.model, config.model) || !sameConfiguration(item.config.roleModels, config.roleModels);
+      if (modelChanged && (item.phase !== 'stopped' || item.child || item.bridge || item.native)) throw new Error('Changed model instances must be stopped before saving configuration');
+      if (['requested', 'restarting'].includes(this.restartIntent(item)?.phase)) throw capabilityConflict('相关组织正在重启，请等待重启完成后再保存');
+      updates.push({ item, previous: item.config, config });
+    }
+    // No asynchronous owner calls in this turn: failed recording/commit rolls both in-memory configuration and status back.
+    for (const update of updates) update.item.config = update.config;
+    try { this.record(); persist(); }
+    catch (error) {
+      for (const update of updates) update.item.config = update.previous;
+      try { this.record(); } catch { /* Retain the original save failure. */ }
+      throw error;
+    }
+    return this.status();
   }
   applyConfiguration(next, persist) {
     if (this.closing) throw new Error('Runtime manager is closing');
@@ -307,14 +357,14 @@ export class ProcessManager {
       if (!this.capabilityHolds.get(id)?.frozen) throw new Error('Worker capability configuration requires a frozen owner');
       const input = { operationId, workerTools: config.workerTools, workerSkills: config.workerSkills,
         delegationTargets: config.delegationTargets, delegationLimits: delegationLimits(next, config) };
-      const configure = async peer => {
-        const result = await peer.call('capabilities.configure', input);
+      const configure = async (peer, ownerMetadata) => {
+        const result = await peer.call('capabilities.configure', { ...input, delegationTargets: ownerTargets(config, ownerMetadata) });
         if (!result?.configured || result.instanceId !== id) throw new Error('Worker capability acknowledgement differs from the target');
       };
       await this.exclusive(item, async () => {
         if (item.phase === 'running' && item.peer && !item.cleanupPending) {
           const peer = item.peer, generation = item.generation;
-          await configure(peer);
+          await configure(peer, item.runtimeMetadata);
           if (item.peer !== peer || item.generation !== generation || item.phase !== 'running') throw new Error('Worker owner changed during configuration');
           await item.bridge?.configureCapabilities?.(input);
         } else {
@@ -324,7 +374,7 @@ export class ProcessManager {
           clearTimeout(owner.idleTimer);
           try {
             await owner.peer.call('capabilities.hold', { operationId, held: true, frozen: true });
-            await configure(owner.peer);
+            await configure(owner.peer, owner.metadata);
           } finally { await this.closeManagement(item); }
         }
       }, { kind: 'management', queue: true });
@@ -500,6 +550,21 @@ export class ProcessManager {
     writeFileSync(temporary, JSON.stringify({ at: new Date().toISOString(), ...this.status() }, null, 2));
     replaceAtomic(temporary, file);
   }
+  restoreStartups() {
+    let previous;
+    try { previous = JSON.parse(readFileSync(join(this.rootDir, 'processes.json'), 'utf8')); } catch { return; }
+    if (!Array.isArray(previous?.instances)) return;
+    for (const item of this.instances.values()) {
+      const saved = previous.instances.find(row => row.instanceId === item.config.instanceId)?.startup;
+      item.startup = restoreStartup(saved);
+      if (['starting','cancelling'].includes(saved?.state) && item.startup) this.event(item, 'startup-interrupted', { generation: item.startup.generation,
+        attemptId: item.startup.id, stage: item.startup.stage, elapsedMs: item.startup.elapsedMs });
+    }
+  }
+  finishStartup(item, state) {
+    if (finishStartup(item.startup, state)) this.event(item, `startup-${state}`, { attemptId: item.startup.id,
+      stage: item.startup.stage, elapsedMs: item.startup.elapsedMs });
+  }
   event(item, event, extra = {}) {
     appendFileSync(join(item.config.stateDir, 'lifecycle.jsonl'), JSON.stringify({ at: new Date().toISOString(), instanceId: item.config.instanceId,
       generation: item.generation, hostPid: process.pid, pid: item.child?.pid ?? null, event, ...extra }) + '\n');
@@ -529,13 +594,17 @@ export class ProcessManager {
     if (this.closing) throw new Error('Runtime manager is closing');
     if (item.stopEpoch !== stopEpoch) throw new Error('Instance start was superseded by an explicit stop');
     item.phase = 'starting'; item.error = undefined; item.generation++;
+    item.runtimeMetadata = metadata(item.config);
+    item.startup = beginStartup(item.generation);
     const generation = item.generation;
     this.saveCleanupIntent(item, true);
-    const stdout = openSync(join(item.config.stateDir, 'stdout.log'), 'a'), stderr = openSync(join(item.config.stateDir, 'stderr.log'), 'a');
-    let child;
-    try { child = fork(this.entry, [], { cwd: item.config.workspace, execPath: process.execPath, execArgv: [],
+    let child, stdout, stderr;
+    try {
+      stdout = openSync(join(item.config.stateDir, 'stdout.log'), 'a'); stderr = openSync(join(item.config.stateDir, 'stderr.log'), 'a');
+      child = fork(this.entry, [], { cwd: item.config.workspace, execPath: process.execPath, execArgv: [],
       windowsHide: true, stdio: ['ignore', stdout, stderr, 'ipc'], serialization: 'json', env: childEnvironment() }); }
-    finally { closeSync(stdout); closeSync(stderr); }
+    catch (error) { item.phase = 'failed'; item.error = error.message; this.finishStartup(item, 'failed'); throw error; }
+    finally { if (stdout !== undefined) closeSync(stdout); if (stderr !== undefined) closeSync(stderr); }
     item.child = child;
     let bridge;
     try { bridge = item.bridge = this.bridgeFactory(item.config, input => {
@@ -543,6 +612,7 @@ export class ProcessManager {
       return item.peer.call('tool', input, 30000);
     }); } catch (error) {
       child.on('error', () => {}); child.kill(); item.child = null; item.phase = 'failed';
+      this.finishStartup(item, 'failed');
       item.error = error.message; this.event(item, 'initialization-failed'); throw error;
     }
     bridge.setCapabilityHold?.(this.capabilityHolds.get(item.config.instanceId));
@@ -560,6 +630,11 @@ export class ProcessManager {
       'delegation.catalog': () => this.delegationCatalog(item, generation),
       'delegation.send': input => this.delegate(item, generation, input),
       'runtime.restart': () => this.requestRestart(item, generation),
+      'runtime.startup': update => {
+        if (item.generation !== generation || item.child !== child || item.phase !== 'starting') throw new Error('Startup generation is no longer active');
+        this.event(item, 'startup-progress', updateStartup(item.startup, update));
+        return { recorded: true };
+      },
     });
     try {
       const adoption = readOriginalAdoption(item.config.stateDir, item.config.instanceId);
@@ -568,6 +643,7 @@ export class ProcessManager {
         isCurrent: () => item.generation === generation && item.child === child && ['starting', 'running', 'stopping'].includes(item.phase) });
     } catch (error) {
       item.peer.close(); child.on('error', () => {}); child.kill(); item.child = null; item.phase = 'failed';
+      item.error = error.message; this.finishStartup(item, 'failed');
       await Promise.resolve(bridge.close()).catch(() => {}); item.bridge = null; throw error;
     }
     child.once('error', error => { item.error = error.message; });
@@ -580,6 +656,7 @@ export class ProcessManager {
         // Invalidate all model/tool callbacks before allowing another generation to start.
         if (item.child === child) {
           if (item.phase !== 'stopping') { item.phase = 'failed'; item.error = `Instance exited (${code ?? signal ?? 'unknown'})`; }
+          if (item.phase !== 'stopping') this.finishStartup(item, 'failed');
           item.cleanupPending = true;
         }
         const native = item.native;
@@ -608,17 +685,20 @@ export class ProcessManager {
       const hold = this.capabilityHolds.get(item.config.instanceId);
       const result = await item.peer.call('initialize', { ...item.config, ...(hold ? { capabilityHold: { ...hold } } : {}) }, 240000);
       if (this.closing || item.child !== child || item.generation !== generation || item.phase !== 'starting' || result?.pid !== child.pid || result?.instanceId !== item.config.instanceId || child.exitCode !== null) throw new Error('Instance initialization identity mismatch');
-      item.phase = 'running'; this.event(item, 'ready');
+      item.phase = 'running'; this.record();
       const participant = this.lifecycleParticipants.get(item.config.instanceId);
       if (participant) {
         const isCurrent = () => this.instances.get(item.config.instanceId) === item && item.generation === generation && item.child === child && item.phase === 'running' && !item.cleanupPending && !this.closing;
         await participant.resumeInstance({ runtimeId: this.lifecycleOwnerId, generation, isCurrent });
         if (!isCurrent()) throw new Error('Instance changed while resuming its lifecycle participant');
       }
+      this.finishStartup(item, result.ready === false ? 'blocked' : 'ready');
+      if (result.ready !== false) this.event(item, 'ready');
       this.completeRestart(item);
       return this.status();
     } catch (error) {
       item.error = error.message;
+      if (item.startup?.state !== 'cancelling') this.finishStartup(item, 'failed');
       try { await this.stopInstance(item); } catch (cleanup) { error.message += `; Cleanup pending: ${cleanup.message}`; }
       item.phase = 'failed'; this.record(); throw error;
     }
@@ -639,7 +719,9 @@ export class ProcessManager {
       } catch { /* A target that cannot confirm admission is omitted from this selection. */ }
     }));
     if (!ownsSource()) throw new Error('Delegation source generation is no longer active');
-    return { targets: source.config.delegationTargets, readyInstanceIds: ready.filter(Boolean) };
+    const targets = ownerTargets(source.config, source.runtimeMetadata);
+    if (source.runtimeMetadata) source.runtimeMetadata.delegationTargets = targets.map(({ instanceId, organizationName, description }) => ({ instanceId, organizationName, description }));
+    return { targets, readyInstanceIds: ready.filter(Boolean) };
   }
   async delegate(source, sourceGeneration, input, { managementOwner } = {}) {
     const request = DelegationRequestSchema.parse(input), control = ['query', 'stop'].includes(request.operation);
@@ -728,7 +810,7 @@ export class ProcessManager {
     try { child = fork(this.entry, [], { cwd: item.config.workspace, execPath: process.execPath, execArgv: [], windowsHide: true,
       stdio: ['ignore', stdout, stderr, 'ipc'], serialization: 'json', env: childEnvironment() }); }
     finally { closeSync(stdout); closeSync(stderr); }
-    const owner = { child, id: randomUUID(), active: true, ended: false, phase: 'starting', native: undefined, peer: undefined };
+    const owner = { child, id: randomUUID(), active: true, ended: false, phase: 'starting', native: undefined, peer: undefined, metadata: metadata(item.config) };
     item.management = owner;
     owner.exited = new Promise(resolveExit => {
       const end = () => { if (!owner.ended) { owner.ended = true; if (owner.phase !== 'closing') owner.phase = 'failed'; owner.peer?.close('Management owner exited'); this.record(); resolveExit(); } };
@@ -930,9 +1012,11 @@ export class ProcessManager {
     if (failures.length || item.child || item.bridge || item.native || item.management) {
       item.phase = 'failed'; item.cleanupPending = true;
       item.error = `Instance cleanup pending: ${failures.map(error => error.message).join('; ') || 'An owner remains active'}`;
+      this.finishStartup(item, 'failed');
       this.record(); throw new Error(item.error);
     }
     item.phase = 'stopped'; item.cleanupPending = false; item.error = undefined;
+    this.finishStartup(item, 'cancelled');
     if (this.cleanupIntent(item)?.pending) this.saveCleanupIntent(item, false);
     this.record();
   }

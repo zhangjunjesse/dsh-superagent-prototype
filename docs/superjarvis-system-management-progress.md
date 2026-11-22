@@ -2,6 +2,17 @@
 
 2026-11-15 用户“继续”授权接续上一阶段：把现有系统管理页连接真实本机实例配置、生命周期及状态，并进行隔离联调。实现、隔离验收和 4318 现有入口发布均已完成。
 
+2026-11-22 开发分支增加组织信息快速保存及模型精准校验，已完成下述隔离验证，尚未推送或部署；此前生产交付记录仍按各自日期理解。
+
+## 2026-11-22 组织信息保存
+
+- 已有组织沿用 `PUT /jarvis/api/system`，提交 `{revision, update: {id, changes}}`。只允许实际改动的 `name`、`brainName`、`description`、`capabilities` 和下级贾维斯 `model`。服务端用当前配置合成并执行完整结构、字段、路径、身份和拓扑校验，不能借客户端声明绕过安全检查。原 `{revision, nodes}` 调用及完整读取响应保持兼容；新增组织仍用完整配置。
+- 名称和元数据保存不查询任务引擎、不读取模型或工具技能目录、不关闭管理进程。运行中可保存，页面立即显示新名称；当前大脑身份及 Router 已绑定的组织描述继续使用本代快照，下次启动后采用新值。`runtime.instances[].metadataPending` 标记现有业务代次仍在使用旧元数据。保存不改变 PID、代次、任务、工具交集或身份归属。启停、未完成清理、已接受的重启及相关 Worker 设置应用仍按原门禁拒绝冲突。
+- 模型仅校验真实改变的服务、模型和推理强度；不校验未编辑的模型或其他组织。模型变更仍要求目标业务实例完全停止，已有离线管理进程保留；下次启动采用新模型。原 Superagent 的 Router/Worker 设置、提示词及 Worker 权限继续由原管理入口负责，组织信息保存不回写其旧镜像。
+- scoped 保存回执由真实原子提交产生，并用轻量拓扑 GET 回读核对后再显示成功。不刷新无关执行设置与能力目录。已提交但回读失败时保留草稿并显示“已保存，回读待确认”；未经验证的回执不显示成功。版本冲突只在人工核对后重放实际编辑过的字段；其他窗口的新职责、名称和模型保留。目标已被删除时禁止重建旧身份并保留草稿。
+- 隔离端到端验证使用真实 `identity.js`、`settings.js`、`composition.js`、HTTP 鉴权及 CSRF 路由、SystemControl、ProcessManager 和 `fsync`/原子替换；仅业务子进程和模型／工具来源受控。6 次点击保存至回读及页面确认耗时 171.17–350.82 ms，中位 252.91 ms，停止 2 次、运行 4 次。计时区间执行设置、模型检查、能力扫描及管理进程关闭调用均为 0，PID／代次保持，重新创建控制器读回一致。证据为 `.artifacts/scoped-org-save/e2e/measurements.json`。这不代表真实模型生成或 4318 线上耗时验收。
+- 可复现命令：先 `pnpm build`，再 `node --test --test-timeout=30000 jarvis/scoped-save.e2e.test.mjs`。相关验证为 `node --test --test-timeout=45000 jarvis/process-runtime/scoped-save.test.mjs jarvis/process-runtime/capability-waiting-delegation.test.mjs jarvis/process-runtime/capability-applications-review.test.mjs jarvis/composition-settings.test.mjs jarvis/scoped-save.e2e.test.mjs`。既有等待委派验证额外覆盖运行中改名 → 应用 Worker 设置 → 原问题续答及新派工，保留原任务／问题／权限断言；未修改 Core 或其协议。
+
 ## 范围与边界
 
 - 延续现有拓扑和设置页，保存服务器持久配置，使用版本号拒绝并发覆盖；启动、停止、重启明确作用于所选实例。

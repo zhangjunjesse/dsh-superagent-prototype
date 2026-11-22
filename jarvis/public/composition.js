@@ -105,6 +105,8 @@
     if (!service.snapshot.configured) return '尚未注册';
     const runtime=runtimeOf(id);
     if (runtime?.cleanupPending && !['starting','stopping'].includes(runtime.phase)) return '停止未完成';
+    if (runtime?.phase==='running' && runtime.startup?.state==='starting') return '启动中';
+    if (runtime?.phase==='running' && runtime.startup?.state==='blocked') return '等待设置';
     return phaseName(runtime?.phase);
   }
   function workerStatus(id) {
@@ -122,6 +124,12 @@
   const workerCapacity = n => maxWorkersOf(n)===undefined?'并发上限未同步':`并发上限 ${maxWorkersOf(n)}`;
   const workerCapacityDetail = n => maxWorkersOf(n)===undefined?'实际并发上限未同步':`按任务自动分配 · 最多同时执行 ${maxWorkersOf(n)} 个任务`;
   const configurationNode = value => { const {execution,executionError,...saved}=value; return saved; };
+  const organizationFields = ['name','brainName','description','capabilities','model'];
+  const sameField = (key, left, right) => key==='model'
+    ? ['provider','model','reasoningEffort'].every(part=>left?.[part]===right?.[part]) : left===right;
+  const organizationChanges = (value, original) => Object.fromEntries(organizationFields
+    .map(key=>[key,typeof value[key]==='string'?value[key].trim():value[key]])
+    .filter(([key,next])=>!sameField(key,next,original[key])));
   const pill = n => `<span class="status-pill ${connected()?'neutral':'pending'}" data-runtime-label="${escape(n.id)}"><i></i>${connected()?escape(runtimeLabel(n.id)):n.kind === 'root' ? '状态未同步' : '待连接'}</span>`;
   const button = (label, action, id = '', style = 'secondary', glyph = '') => `<button type="button" class="btn ${style}" data-action="${action}"${id ? ` data-id="${escape(id)}"` : ''}>${glyph ? icon(glyph) : ''}<span>${label}</span></button>`;
   function announce(message) {
@@ -144,6 +152,16 @@
   }
   function installSnapshot(snapshot, updateConfiguration = true) {
     if (!snapshot?.available || !Array.isArray(snapshot.nodes) || !Number.isInteger(snapshot.revision) || !snapshot.nodes.some(item => item.id === snapshot.rootId)) throw new Error('系统配置响应无效，请重试。');
+    if (snapshot.view==='configuration' && service.snapshot) {
+      const catalogs={};
+      snapshot={...snapshot,nodes:snapshot.nodes.map(value=>{
+        const previous=service.snapshot.nodes.find(item=>item.id===value.id);
+        // A scoped save/readback does not refresh original execution settings. Retain only unchanged organizations' read-only projections.
+        if (!previous || ['workspace','roleModels','concurrency','engine','workerTools','workerSkills'].some(key=>JSON.stringify(previous[key])!==JSON.stringify(value[key]))) return value;
+        if (service.snapshot.catalogs?.[value.id]) catalogs[value.id]=service.snapshot.catalogs[value.id];
+        return {...value,...Object.fromEntries(['execution','executionError'].filter(key=>Object.hasOwn(previous,key)).map(key=>[key,previous[key]]))};
+      }),catalogs};
+    }
     service.snapshot = snapshot; service.phase = 'connected'; service.error = '';
     if (updateConfiguration) {
       state = {version:1,nodes:structuredClone(snapshot.nodes)};
@@ -566,7 +584,49 @@
     main.innerHTML = `${heading()}<div class="page-content runtime-layout" data-runtime-instance="${escape(n.id)}"><section class="runtime-panel"><div class="section-title"><div><h2>${escape(n.name)} · 运行状态</h2><p>运行数据尚未获取</p></div>${button('运行配置','runtime-config',n.id,'secondary','settings')}</div><dl class="runtime-facts"><div><dt>健康状态</dt><dd><span class="status-pill neutral">未获取</span></dd></div><div><dt>运行版本</dt><dd>—</dd></div><div><dt>任务执行中</dt><dd>—</dd></div><div><dt>维护方</dt><dd>${n.mode === 'connect' ? '外部实例维护方' : '当前计算机'}</dd></div></dl><div class="maintenance-actions"><button class="btn secondary" type="button" disabled>暂停接单</button><button class="btn secondary" type="button" disabled>重启实例</button><button class="btn danger" type="button" disabled>停止实例</button><span>运行管理尚未接入，暂不可操作</span></div></section><section class="runtime-records" id="runtime-records"><div class="section-title"><h2>维护记录</h2><span class="muted">${escape(n.name)}</span></div><div class="empty-state compact">${icon('clock')}<p>暂无运行维护记录</p></div></section></div>`;
   }
   function renderConnectedRuntime(n) {
-    main.innerHTML = `${heading()}<div class="page-content runtime-layout" data-runtime-instance="${escape(n.id)}"><section class="runtime-panel"><div class="section-title"><div><h2>${escape(n.name)} · 运行状态</h2><p data-runtime-summary></p></div>${button('运行配置','runtime-config',n.id,'secondary','settings')}</div><dl class="runtime-facts"><div><dt>实例状态</dt><dd data-runtime-phase></dd></div><div><dt>实例 PID</dt><dd data-runtime-pid></dd></div><div><dt>进程代次</dt><dd data-runtime-generation></dd></div><div><dt>DSH 宿主 PID</dt><dd data-runtime-host></dd></div><div><dt>执行中的 Worker</dt><dd data-runtime-workers>—</dd></div><div><dt>未结束任务</dt><dd data-runtime-tickets>—</dd></div></dl><p class="runtime-error field-error" data-runtime-error role="alert" hidden></p><p class="runtime-query-note" data-runtime-query hidden></p><div class="maintenance-actions">${button('启动实例','runtime-start',n.id,'primary')}${button('重启实例','runtime-restart',n.id,'secondary','refresh')}${button('停止实例','runtime-stop',n.id,'danger')}<span data-runtime-action-note></span></div><p class="runtime-operation-note">启停统一控制此实例的贾维斯对话、任务路由和 Worker；历史记录与设置仍可查看。下级实例按任务绑定接收停止请求，其独立进程在各自的运行状态中管理。停止后可重新启动；重启不会重放结果不明的任务。</p></section><section class="runtime-records" id="runtime-records"><div class="section-title"><h2>维护记录</h2><span class="muted">${escape(n.name)}</span></div><div data-runtime-lifecycle></div></section></div>`;
+    main.innerHTML = `${heading()}<div class="page-content runtime-layout" data-runtime-instance="${escape(n.id)}"><section class="runtime-panel"><div class="section-title"><div><h2>${escape(n.name)} · 运行状态</h2><p data-runtime-summary></p></div>${button('运行配置','runtime-config',n.id,'secondary','settings')}</div><dl class="runtime-facts"><div><dt>实例状态</dt><dd data-runtime-phase></dd></div><div><dt>实例 PID</dt><dd data-runtime-pid></dd></div><div><dt>进程代次</dt><dd data-runtime-generation></dd></div><div><dt>DSH 宿主 PID</dt><dd data-runtime-host></dd></div><div><dt>执行中的 Worker</dt><dd data-runtime-workers>—</dd></div><div><dt>未结束任务</dt><dd data-runtime-tickets>—</dd></div></dl><p class="runtime-error field-error" data-runtime-error role="alert" hidden></p><p class="runtime-query-note" data-runtime-query hidden></p><section data-runtime-startup role="status" aria-live="polite" hidden></section><div class="maintenance-actions">${button('启动实例','runtime-start',n.id,'primary')}${button('重启实例','runtime-restart',n.id,'secondary','refresh')}${button('停止实例','runtime-stop',n.id,'danger')}<span data-runtime-action-note></span></div><p class="runtime-operation-note">启停统一控制此实例的贾维斯对话、任务路由和 Worker；历史记录与设置仍可查看。下级实例按任务绑定接收停止请求，其独立进程在各自的运行状态中管理。停止后可重新启动；重启不会重放结果不明的任务。</p></section><section class="runtime-records" id="runtime-records"><div class="section-title"><h2>维护记录</h2><span class="muted">${escape(n.name)}</span></div><div data-runtime-lifecycle></div></section></div>`;
+  }
+  const startupStages = {process:'启动进程',github:'GitHub 连接检查',sources:'其他来源检查',environment:'准备执行环境',sessions:'初始化会话',finalizing:'确认就绪'};
+  const startupStates = {starting:'启动中',ready:'已就绪',blocked:'等待设置',failed:'启动失败',cancelling:'正在取消启动',cancelled:'启动已取消',interrupted:'启动已中断'};
+  const startupStageStates = {running:'进行中',complete:'已完成',skipped:'无需检查',blocked:'等待设置',failed:'检查失败',cancelling:'正在取消',cancelled:'已取消',interrupted:'已中断'};
+  const seconds = ms => Number.isFinite(ms) && ms>=0 ? (ms/1000).toFixed(1)+' 秒' : '—';
+  function paintStartup(panel,runtime) {
+    const element=panel.querySelector('[data-runtime-startup]'), startup=runtime?.startup;
+    if (!element) return;
+    const request=runtimeControlPoll;
+    if (request && request.id===panel.dataset.runtimeInstance && ['start','restart'].includes(request.action)
+      && (!startup || startup.id===request.previousAttempt)) {
+      element.hidden=false;
+      element.textContent='已请求启动，等待确认 · 已等待 '+seconds(Date.now()-request.requestedAt);
+      return;
+    }
+    element.hidden=!startup;
+    if (!startup) { element.textContent=''; return; }
+    const previous=['stopped','failed'].includes(runtime.phase) && startup.state==='ready'?'上次启动 · ':'';
+    const markup=`<p><strong>${escape(previous+(startupStates[startup.state]||'启动状态未同步'))}</strong> · ${escape(seconds(startup.elapsedMs))}</p><ol class="runtime-event-list">${Object.entries(startupStages).map(([stage,label])=>{
+      const row=startup.stages?.find(item=>item.stage===stage);
+      return `<li data-startup-stage="${stage}"><span>${escape(label)} · ${escape(row?startupStageStates[row.status]||'状态未同步':'等待')}</span><small>${row?escape(seconds(row.durationMs)):'—'}</small></li>`;
+    }).join('')}</ol>`;
+    if (element.innerHTML!==markup) element.innerHTML=markup;
+  }
+  let runtimeControlPoll=null;
+  function scheduleRuntimeControlPoll(poll) {
+    clearTimeout(poll.timer);
+    if (runtimeControlPoll!==poll) return;
+    poll.timer=setTimeout(async()=>{
+      try {
+        if (!visible()) return;
+        // Topology is the existing read-only status path: it never opens a
+        // management owner or waits behind the initialize POST for settings.
+        const snapshot=await apiClient().api('/api/system?view=topology');
+        if (runtimeControlPoll!==poll) return;
+        if (!snapshot?.available || !Array.isArray(snapshot.runtime?.instances)) throw new Error('运行状态响应无效，请重试。');
+        service.snapshot.runtime=snapshot.runtime; poll.error=''; updateRuntimeStatus();
+      } catch (error) {
+        if (runtimeControlPoll!==poll) return;
+        poll.error=error.message||'暂时无法读取启动进度。'; updateRuntimeStatus();
+      } finally { scheduleRuntimeControlPoll(poll); }
+    },visible()?500:5000);
   }
   function updateRuntimeStatus() {
     if (!connected()) return;
@@ -592,6 +652,7 @@
     const panel = main.querySelector('[data-runtime-instance]');
     if (!panel) return;
     const id = panel.dataset.runtimeInstance, runtime = runtimeOf(id), detail = service.details.get(id);
+    paintStartup(panel,runtime);
     const set = (key,value) => { const element=panel.querySelector('[data-runtime-'+key+']'); if (element) element.textContent=value; };
     const unavailable = !!service.error;
     set('summary',!service.snapshot.configured?'尚未注册实例，先保存配置。':unavailable?'暂时无法读取运行服务。':'当前实例包含贾维斯对话、任务路由和 Worker，启停统一生效。');
@@ -603,34 +664,40 @@
     const error = panel.querySelector('[data-runtime-error]');
     error.textContent = service.controlError || (!unavailable && runtime?.error) || ''; error.hidden=!error.textContent;
     const query=panel.querySelector('[data-runtime-query]');
-    query.textContent=unavailable?service.error:detail?.queryError||''; query.hidden=!query.textContent;
-    const phase=runtime?.phase, transitional=['starting','stopping'].includes(phase);
+    query.textContent=unavailable?service.error:runtimeControlPoll?.error||detail?.queryError||''; query.hidden=!query.textContent;
+    const phase=runtime?.phase, transitional=['starting','stopping'].includes(phase)||runtime?.startup?.state==='starting';
     const running=['ready','running'].includes(phase), blocked=service.busy || transitional || unavailable || settingsPending() || !service.snapshot.configured;
     for (const control of panel.querySelectorAll('[data-action^="runtime-"]')) {
       const action=control.dataset.action; if (action==='runtime-config') continue;
       control.disabled=blocked || (action==='runtime-start'?(running||!!runtime?.cleanupPending):action==='runtime-stop'?!runtime?.pid&&!runtime?.cleanupPending:!runtime?.pid);
     }
-    set('action-note',service.busy?'正在处理…':transitional?'进程正在切换状态。':runtime?.cleanupPending?'会话清理未完成，可重试停止实例。':'');
+    set('action-note',runtime?.startup?.state==='starting'?startupStages[runtime.startup.stage]||'正在启动…':service.busy?'正在处理…':transitional?'进程正在切换状态。':runtime?.cleanupPending?'会话清理未完成，可重试停止实例。':'');
     const lifecycle=panel.querySelector('[data-runtime-lifecycle]');
     const events=detail?.lifecycle||[];
-    const eventName = event => ({start:'开始启动',starting:'开始启动',started:'已启动',ready:'已就绪',stop:'停止',stopping:'开始停止',stopped:'已停止',exit:'进程退出',failed:'启动失败','initialization-failed':'初始化失败',restart:'重启'}[event]||event);
-    const markup=events.length?`<ol class="runtime-event-list">${events.slice(-20).reverse().map(item=>`<li><span>${escape(eventName(item.event))}</span><small>${escape(item.at)} · 第 ${escape(item.generation)} 代${item.pid?` · PID ${escape(item.pid)}`:''}${item.code!==undefined?` · 退出码 ${escape(item.code)}`:''}${item.signal?` · ${escape(item.signal)}`:''}</small></li>`).join('')}</ol>`:`<div class="empty-state compact">${icon('clock')}<p>${detail?.queryError?'维护记录暂不可用':'暂无运行维护记录'}</p></div>`;
+    const eventName = item => item.event==='startup-progress'?`${startupStages[item.stage]||'启动阶段'} · ${startupStageStates[item.status]||'状态已更新'}`:item.event.startsWith('startup-')?startupStates[item.event.slice(8)]||'启动状态已更新':({start:'开始启动',starting:'开始启动',started:'已启动',ready:'已就绪',stop:'停止',stopping:'开始停止',stopped:'已停止',exit:'进程退出',failed:'启动失败','initialization-failed':'初始化失败',restart:'重启'}[item.event]||item.event);
+    const markup=events.length?`<ol class="runtime-event-list">${events.slice(-20).reverse().map(item=>`<li><span>${escape(eventName(item))}</span><small>${escape(item.at)} · 第 ${escape(item.generation)} 代${item.pid?` · PID ${escape(item.pid)}`:''}${item.elapsedMs!==undefined?` · 累计 ${escape(seconds(item.elapsedMs))}`:''}${item.code!==undefined?` · 退出码 ${escape(item.code)}`:''}${item.signal?` · ${escape(item.signal)}`:''}</small></li>`).join('')}</ol>`:`<div class="empty-state compact">${icon('clock')}<p>${detail?.queryError?'维护记录暂不可用':'暂无运行维护记录'}</p></div>`;
     if (lifecycle.innerHTML!==markup) lifecycle.innerHTML=markup;
   }
   async function controlRuntime(action,id) {
     if (!connected() || settingsPending() || service.busy || id!==currentInstanceId || !service.snapshot.configured) return;
     service.busy=true; service.epoch++; service.controlError=''; clearTimeout(service.pollTimer); updateRuntimeStatus();
+    const poll=runtimeControlPoll={id,action,previousAttempt:runtimeOf(id)?.startup?.id,requestedAt:Date.now(),error:'',timer:null};
+    updateRuntimeStatus(); scheduleRuntimeControlPoll(poll);
     try {
-      const snapshot=await apiClient().api('/api/system/'+encodeURIComponent(id)+'/'+action,'POST',{revision:service.snapshot.revision});
+      let snapshot=await apiClient().api('/api/system/'+encodeURIComponent(id)+'/'+action,'POST',{revision:service.snapshot.revision,view:'topology'});
+      runtimeControlPoll=null; clearTimeout(poll.timer); service.epoch++;
+      if (snapshot.view==='topology') {
+        snapshot=snapshot.revision===service.snapshot.revision ? {...service.snapshot,runtime:snapshot.runtime} : await apiClient().api('/api/system');
+      }
       installSnapshot(snapshot); service.details.delete(id); await refreshDetail();
       const runtime=runtimeOf(id);
-      const complete=action==='stop'?runtime?.phase==='stopped'&&!runtime?.cleanupPending:['ready','running'].includes(runtime?.phase)&&!runtime?.cleanupPending;
+      const complete=action==='stop'?runtime?.phase==='stopped'&&!runtime?.cleanupPending:['ready','running'].includes(runtime?.phase)&&!runtime?.cleanupPending&&(!runtime?.startup||runtime.startup.state==='ready');
       announce(complete?{start:'实例已启动',stop:'实例已停止',restart:'实例已重启'}[action]:'实例状态：'+runtimeLabel(id));
     } catch (error) {
       service.controlError=error.message||'操作失败，请重试。';
       if (service.request) await service.request;
       await refreshService();
-    } finally { service.busy=false; updateRuntimeStatus(); schedulePoll(); document.dispatchEvent(new Event('jarvis:instance-updated')); }
+    } finally { runtimeControlPoll=null; clearTimeout(poll.timer); service.busy=false; updateRuntimeStatus(); schedulePoll(); document.dispatchEvent(new Event('jarvis:instance-updated')); }
   }
   function draftProblems(draft) {
     if (!draft || !Array.isArray(draft.nodes)) return ['此窗口草稿无法读取，原内容已保留。'];
@@ -690,6 +757,7 @@
       for (const role of ['router','worker']) editor.value.roleModels[role] ??= structuredClone(editor.value.model ?? {});
       if (!editor.value.engine && service.snapshot.defaults.engine) editor.value.engine=structuredClone(service.snapshot.defaults.engine);
     }
+    editor.original=structuredClone(editor.value);
     selectEditorTab(tab,section); navigate('editor');
   }
   const field = (label, name, value, options = {}) => `<div class="field${options.wide?' full-width':''}"><label for="field-${name}">${label}${options.required?' <span class="required-dot">*</span>':''}</label>${options.multiline ? `<textarea id="field-${name}" name="${name}" rows="3" maxlength="${options.max||500}" placeholder="${escape(options.placeholder||'')}">${escape(value)}</textarea>` : `<input id="field-${name}" name="${name}" type="${options.type||'text'}" value="${escape(value)}" ${options.required?'required':''} ${options.readonly?'readonly':''} ${options.disabled?'disabled':''} ${options.list?`list="${escape(options.list)}"`:''} ${options.type==='number'?`min="${options.min??1}" max="${options.max??20}"`:`maxlength="${options.max||160}"`} placeholder="${escape(options.placeholder||'')}" autocomplete="off">`}${options.help?`<small>${options.help}</small>`:''}</div>`;
@@ -755,7 +823,7 @@
     const n = editor.value, tabs = editorTabs(n); if (!tabs.some(([id])=>id===editorTab)) editorTab = 'basic';
     const title = editor.isNew ? '添加下级 SuperJarvis' : organizationMode() ? n.name+' · 设置' : '实例配置';
     const embedded=organizationMode() && editorTab==='engine' && !editor.isNew;
-    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'修改前先停止实例；保存后重新启动当前组织生效':'修改运行中的实例前，请先停止该实例';
+    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'组织信息可在运行时保存，页面名称立即更新；大脑名称和路由说明在下次启动后生效。修改模型须先停止当前组织，保存后下次启动生效。':'修改运行中的实例前，请先停止该实例';
     if (embedded && engineMount?.id===n.id && engineMount.target.isConnected) {
       engineMount.controller?.update(engineLocation()); return;
     }
@@ -927,15 +995,18 @@
     service.conflict=snapshot;
     const area=byId('system-conflict-review'); if (!area || !editor) return;
     const latest=snapshot.nodes.find(n=>n.id===editor.value.id), removed=!latest&&!editor.isNew;
+    if (removed) showEditorError('此组织已在其他位置移除。当前草稿已保留，请返回组织架构核对。');
     area.hidden=false;
     area.innerHTML=`<div class="system-conflict-panel"><h2>配置已在其他位置更新</h2><p>当前编辑内容已保留。核对后采用最新系统版本，再保存当前实例；其他实例使用最新配置。</p><div class="configuration-comparison"><section><h3>系统中的当前配置</h3><pre>${escape(latest?JSON.stringify(latest,null,2):removed?'此实例已被移除，请返回系统重新选择。':'尚未添加此实例')}</pre></section><section><h3>当前编辑内容</h3><pre>${escape(JSON.stringify(editor.value,null,2))}</pre></section></div><button type="button" class="btn secondary" data-action="accept-latest"${removed?' disabled':''}>保留更改并采用最新版本</button></div>`;
   }
   async function saveConnectedEditor(value) {
     if (settingsPending()) return;
-    if (organizationMode() && !editor.isNew) {
+    const scoped=organizationMode() && !editor.isNew;
+    const changes=scoped?organizationChanges(value,editor.original):null;
+    if (scoped) {
       // The original settings APIs own executor, eval, prompts and Worker authorization. A metadata edit must not resave their stale mirrors.
       const base=state.nodes.find(item=>item.id===value.id);
-      if (base) value={...structuredClone(base),...Object.fromEntries(['name','brainName','description','capabilities','model'].map(key=>[key,value[key]]))};
+      if (base) value={...structuredClone(base),...changes};
       delete value.redelegate; delete value.depth;
     }
     value=configurationNode(value);
@@ -944,19 +1015,36 @@
     value.name=value.name.trim(); value.brainName=value.brainName.trim(); value.workspace=value.workspace.trim();
     const nodes=structuredClone(state.nodes).map(configurationNode), index=nodes.findIndex(n=>n.id===value.id);
     if (index<0) nodes.push(value); else nodes[index]=value;
-    const form=byId('unit-form'), editing=editor; form.inert=true; service.busy=true; service.epoch++; clearTimeout(service.pollTimer);
+    const form=byId('unit-form'), editing=editor; let committed=false;
+    form.inert=true; service.busy=true; service.epoch++; clearTimeout(service.pollTimer);
     byId('draft-indicator').textContent='正在保存…';
     try {
-      const snapshot=await apiClient().api('/api/system','PUT',{revision:editing.revision,nodes});
+      const input=scoped?{revision:editing.revision,update:{id:value.id,changes}}:{revision:editing.revision,nodes};
+      let snapshot=await apiClient().api('/api/system','PUT',input);
+      if (scoped) {
+        const matches=actual=>actual?.available && Number.isSafeInteger(actual.revision) && actual.revision>=editing.revision+1
+          && actual.nodes?.some(item=>item.id===value.id && Object.entries(changes).every(([key,next])=>sameField(key,item[key],next)));
+        if (snapshot.revision!==editing.revision+1 || snapshot.saved?.instanceId!==value.id || snapshot.saved?.effect!=='next-start'
+          || !Array.isArray(snapshot.saved.fields) || JSON.stringify([...snapshot.saved.fields].sort())!==JSON.stringify(Object.keys(changes).sort())
+          || !matches(snapshot)) throw new Error('暂时无法确认保存结果，请重新读取后核对。');
+        committed=true;
+        snapshot=await apiClient().api('/api/system?view=topology');
+        if (!matches(snapshot)) throw new Error('保存后的组织配置已有变化，请重新读取后核对。');
+        snapshot={...snapshot,view:'configuration'};
+      }
       installSnapshot(snapshot); service.conflict=null;
       if (editor===editing) { editor=null; navigate(editorReturn); }
-      announce(editing.isNew?'下级 SuperJarvis 已添加，尚未启动；进入下级的运行状态，启动后即可接单。':savedConfigurationText());
+      announce(editing.isNew?'下级 SuperJarvis 已添加，尚未启动；进入下级的运行状态，启动后即可接单。':scoped
+        ?Object.hasOwn(changes,'model')?'组织模型已保存，下次启动后生效。':'组织信息已保存，页面已更新；运行中的大脑与路由信息下次启动后生效。':savedConfigurationText());
     } catch (error) {
       if (editor!==editing) { announce(error.message||'配置保存失败，请重试。'); return; }
-      editor.dirty=true; byId('draft-indicator').textContent='更改尚未保存'; showEditorError(error.message||'配置保存失败，请重试。');
+      const uncertain=scoped && (!error.status || error.status>=500);
+      editor.dirty=true; byId('draft-indicator').textContent=committed?'已保存，回读待确认':uncertain?'保存结果待核对':'更改尚未保存';
+      showEditorError(committed?'组织配置已保存，但未能回读确认。更改仍保留，请重新读取后核对。':error.message||'配置保存失败，请重试。');
       if (error.status===409) {
         try {
-          const latest=await apiClient().api('/api/system');
+          const latest=await apiClient().api(scoped?'/api/system?view=topology':'/api/system');
+          if (scoped) latest.view='configuration';
           if (latest.revision!==editing.revision) showConflictReview(latest);
           else { installSnapshot(latest,false); service.conflict=null; byId('system-conflict-review').hidden=true; updateRuntimeStatus(); }
         }
@@ -1008,8 +1096,13 @@
     if (action==='draft-save') { saveWindowDraft(); return; }
     if (action==='accept-latest') {
       if (!editor || !service.conflict) return;
-      captureForm(); const latest=service.conflict;
+      captureForm(); const latest=service.conflict, changes=organizationMode()&&!editor.isNew?organizationChanges(editor.value,editor.original):null;
+      if (!editor.isNew && !latest.nodes.some(item=>item.id===editor.value.id)) { showConflictReview(latest); return; }
       installSnapshot(latest,false); state={version:1,nodes:structuredClone(latest.nodes)};
+      if (changes) {
+        const base=structuredClone(state.nodes.find(item=>item.id===editor.value.id)); base.brainName=brainNameOf(base);
+        editor.original=structuredClone(base); editor.value={...base,...changes};
+      }
       editor.revision=latest.revision; editor.promptPreview=null; service.conflict=null; renderEditor(); announce('已采用最新系统版本，请确认后保存。'); return;
     }
     if (['runtime-start','runtime-stop','runtime-restart'].includes(action)) { controlRuntime(action.slice(8),id); return; }
