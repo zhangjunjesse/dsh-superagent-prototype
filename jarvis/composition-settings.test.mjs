@@ -609,7 +609,7 @@ test('running organization adds a stopped child through the existing CAS save an
     if(path==='/api/system/'+addedId&&method==='GET')return Response.json({available:true,instanceId:addedId,stateAvailable:false,
       runtime:ui.backend.system.runtime.instances.find(item=>item.instanceId===addedId),counts:{},lifecycle:[]});
     if(path==='/api/system/'+addedId+'/start'&&method==='POST'){
-      assert.deepEqual(body,{revision:4});
+      assert.deepEqual(body,{revision:4,view:'topology'});
       Object.assign(ui.backend.system.runtime.instances.find(item=>item.instanceId===addedId),{pid:103,phase:'running',generation:1});
       return Response.json(ui.backend.system);
     }
