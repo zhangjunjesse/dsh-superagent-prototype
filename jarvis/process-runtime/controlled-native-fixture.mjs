@@ -5,6 +5,28 @@ import { NativeWire } from './native-wire.mjs';
 import { nativeHash } from './native-journal.mjs';
 import { messageId } from '../../lib/process-runtime.js';
 
+/** The controlled main Session accepts only after its scenario checks the original request and the actual child evidence. */
+export async function reviewDelegatedResult(tool, card, check) {
+  async function read(resource) {
+    let text = '', offset = 0;
+    for (;;) {
+      const page = await tool('orchestrator_read', { resource, offset, limit: 8000 });
+      text += page.text;
+      if (page.next_offset === null) return text;
+      offset = page.next_offset;
+    }
+  }
+  const original = await read(card.original_request), review = JSON.parse(await read(card.read));
+  assert.equal(review.id, card.review_id);
+  assert.equal(review.assignment_id, card.assignment_id);
+  assert.equal(review.evidenceRef, card.evidence_ref);
+  const parts = review.summary.split('\n\n'), summary = parts[0], evidence = JSON.parse(parts.at(-1));
+  assert.equal(evidence.evidence_ref, card.evidence_ref);
+  await check({ original, summary, ...evidence });
+  await tool('orchestrator_result_review', { ticket_id: card.ticket_id, assignment_id: card.assignment_id,
+    review_id: card.review_id, decision: { kind: 'accept', summary } });
+}
+
 export function controlledNativeFactory(onTurn) {
   const instances = new Map(), errors = [];
   const factory = (config, peer, { managementOnly = false, isCurrent = () => true } = {}) => {

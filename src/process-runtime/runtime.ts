@@ -24,6 +24,8 @@ import { originalConfigurationMigrations } from './original-config.ts'
 import { executionRoot } from '../app/execution-environment.ts'
 import { textPage } from '../app/context.ts'
 import { CapabilityHoldSchema, type CapabilityTask } from './capability-drain.ts'
+import { ArtifactReadSchema, ArtifactTransferSchema, artifactIdentity, type ArtifactChunk, type ArtifactRead } from './artifact-contract.ts'
+export { ArtifactReadSchema, ArtifactReferenceSchema, ArtifactTransferSchema } from './artifact-contract.ts'
 export { DelegationRequestSchema } from './delegation-contract.ts'
 export { WORKER_TOOL_NAMES, WorkerSkillsSchema, effectiveWorkerTools } from './worker-capabilities.ts'
 export { EngineConfigSchema, normalizeEngineConfig, defaultEngineConfig } from './engine-config.ts'
@@ -61,6 +63,8 @@ export interface ProcessHost {
   delegate?(request: DelegationRequest): Promise<DelegationSnapshot>
   /** Authenticated host observation; model tools cannot supply a catalog or readiness. */
   delegationCatalog?(): Promise<DelegationCatalog>
+  /** Private host transfer. Source authorization and producer registration are checked by the actual business owners. */
+  readArtifact?(input: ArtifactRead & { ticketId: string; assignmentId: string }): Promise<ArtifactChunk>
 }
 export interface ProcessToolCall {
   sessionKey: string; role: ProcessRole; requestId: string; name: string; args: unknown
@@ -171,6 +175,8 @@ export class ProcessRuntime {
     if (this.stopping || this.closed) return
     return this.ticking ??= (async () => {
       this.inbound.tick(); await this.pump.tick(); await this.delegated.tick()
+      await this.original.reconcileDepartments()
+      this.original.reconcileDepartmentNotices()
       for (const ticket of this.store.tickets.cancelling()) {
         if (this.delegated.list().some(row => row.request.parentTicketId === ticket.id && row.snapshot?.executionStopped !== true)) continue
         await this.stopNativeTicket(ticket.id)
@@ -256,6 +262,7 @@ export class ProcessRuntime {
     this.available()
     const input = FeedbackSchema.parse(raw)
     await this.pump.tick()
+    this.original.reconcileDepartmentNotices()
     const questionStates: { workRef: string; questionId: string | null }[] = []
     for (let offset = 0;; offset += 20) {
       const works = this.ledger.works('', offset, 20)
@@ -389,7 +396,9 @@ export class ProcessRuntime {
     if (request.operation === 'query') {
       const projection = this.gateway.query(request.input)
       if (request.input.operation !== 'get') return projection
-      return { ...projection, artifacts: this.artifactsForTicket(this.ledger.work(request.input.workRef)?.ticketId) }
+      const ticketId = this.ledger.work(request.input.workRef)?.ticketId
+      return { ...projection, artifacts: this.artifactsForTicket(ticketId),
+        departmentWaits: ticketId ? this.original.departmentWaitsForTicket(ticketId) : [] }
     }
     const page = this.ledger.eventPage(request.conversationId, request.cursor, request.limit)
     const refs = new Set(page.items.map(event => event.workRef))
@@ -411,6 +420,7 @@ export class ProcessRuntime {
       turns: this.store.keys(turns).map(name => this.store.get(name)!).sort((a, b) => a.at.localeCompare(b.at)), tickets: this.store.tickets.list(),
       works: this.gateway.query({ operation: 'search', query: '', cursor: 0, limit: 20 }), events: this.ledger.eventPage(this.conversationId, 0, 50),
       delegations: { incoming: this.inbound.list(), outgoing: this.delegated.list() },
+      departmentWaits: this.store.tickets.open().flatMap(ticket => this.original.departmentWaitsForTicket(ticket.id)),
       execution: { evalModel: settings.eval.model, workerModel: settings.executor.model, maxWorkers: settings.executor.maxWorkers,
         directory: executionRoot(settings, this.original.runtime.machine.stateDir) },
       health: { ...this.original.runtime.health, ...this.board.all }, active: [...this.active.values()].map(({ sessionKey, role, requestId }) => ({ sessionKey, role, requestId })) }
@@ -422,6 +432,20 @@ export class ProcessRuntime {
     const artifacts = [...this.taskFiles.links(this.config.instanceId, ticketId).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId })),
       ...this.delegated.artifacts(ticketId)]
     return [...new Map(artifacts.map(item => [item.url, item])).values()]
+  }
+  /** The host checks this again for every transfer chunk; a model cannot supply an additional handoff grant. */
+  authorizeArtifact(raw: unknown): { authorized: true } {
+    const input = ArtifactTransferSchema.parse(raw)
+    const ticket = this.store.tickets.get(input.ticketId), assignment = ticket && latestAssignment(ticket)
+    if (!ticket || !liveTicket(ticket) || assignment?.id !== input.assignmentId || assignment.state === 'ended'
+      || !this.original.handoffArtifacts(ticket).some(item => artifactIdentity(item) === artifactIdentity(input.artifact))) throw new Error('Artifact has no authorized handoff in the current task assignment')
+    return { authorized: true }
+  }
+  /** Only fixed registered producer/task/assignment/version references are served; paths are derived under the producer root. */
+  readArtifact(raw: unknown): ArtifactChunk {
+    const input = ArtifactReadSchema.parse(raw)
+    if (input.artifact.instanceId !== this.config.instanceId) throw new Error('Artifact producer identity does not match this owner')
+    return this.taskFiles.read(input)
   }
   async delegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     await this.ready
@@ -441,6 +465,7 @@ export class ProcessRuntime {
     const paths = snapshot.ticketId ? this.delegated.artifactLineages(snapshot.ticketId).map(path =>
       [this.inbound.resultLink(snapshot.delegationId, path[0]!.parentAssignmentId), ...path]) : []
     return { ...snapshot, artifacts: this.artifactsForTicket(snapshot.ticketId),
+      ...(snapshot.ticketId ? { departmentWaits: this.original.departmentWaitsForTicket(snapshot.ticketId) } : {}),
       ...(snapshot.lineage ? { lineage: [...snapshot.lineage, ...(downstream && downstream.lineage || [])] } : {}),
       ...(paths.length ? { artifactLineages: paths } : {}) }
   }
@@ -483,10 +508,11 @@ export class ProcessRuntime {
     await this.options.native.sessions.flush()
   }
   /** A stopped management owner can finish persisted controls without starting Sources, Router or Workers. */
-  async drainDelegations(): Promise<void> {
+  async drainDelegations(raw: unknown = {}): Promise<void> {
+    const { preserveDepartmentWaits } = z.object({ preserveDepartmentWaits: z.boolean().optional() }).strict().parse(raw)
     await this.ready
     await this.original.beginShutdown()
-    await this.delegated.shutdown()
+    await this.delegated.shutdown(undefined, preserveDepartmentWaits ? ticket => this.original.departmentWaitsForTicket(ticket.id).length > 0 : undefined)
     for (const ticket of this.store.tickets.cancelling()) {
       await this.stopNativeTicket(ticket.id)
       this.engine.confirmCancellation(ticket.id)
@@ -648,15 +674,16 @@ export class ProcessRuntime {
     await this.tick()
     return this.capabilitySnapshot()
   }
-  close(): Promise<void> {
-    return this.closing ??= this.shutdown().catch(error => { this.closing = undefined; throw error })
+  close(raw: unknown = {}): Promise<void> {
+    const { preserveDepartmentWaits } = z.object({ preserveDepartmentWaits: z.boolean().optional() }).strict().parse(raw)
+    return this.closing ??= this.shutdown(preserveDepartmentWaits).catch(error => { this.closing = undefined; throw error })
   }
-  private async shutdown(): Promise<void> {
+  private async shutdown(preserveDepartmentWaits = false): Promise<void> {
     this.stopping = true; clearInterval(this.timer)
     await Promise.allSettled([...this.active.values()].map(request => this.host.cancel({ sessionKey: request.sessionKey })))
     await this.inbound.close()
     await this.ticking
-    if (!this.options.managementOnly) await this.drainDelegations()
+    if (!this.options.managementOnly) await this.drainDelegations({ preserveDepartmentWaits })
     await this.original.close(); this.closed = true
   }
 

@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createProcessRuntime, Store, type ProcessHost, type ProcessRuntime, type ProcessRuntimeConfig } from '../src/process-runtime/runtime.ts'
 import type { Capability, DelegationCatalog, DelegationRequest } from '../src/process-runtime/delegation-contract.ts'
-import { controlledNative, routeOriginal, type NativeTurn } from './fixtures/native-ports.ts'
+import { controlledNative, originalText, routeOriginal, type NativeTurn } from './fixtures/native-ports.ts'
 
 type Id = 'parent' | 'first' | 'added'
 type Card = { trigger_id: string; text: string; execution_targets: Capability[] }
@@ -43,6 +43,7 @@ function harness() {
       },
       async cancel() {},
       async delegationCatalog() {
+        if (id !== 'parent') return { targets: [], readyInstanceIds: [] }
         catalog.reads++
         if (hooks.catalog) return hooks.catalog()
         if (catalog.override) return structuredClone(catalog.override)
@@ -63,6 +64,18 @@ function harness() {
       if (!turn.text.startsWith('{')) return
       const input = JSON.parse(turn.text)
       if (turn.policy.role === 'orchestrator') {
+        if (input.kind === 'result_review') {
+          const binding = sent.find(request => request.parentTicketId === input.ticket_id && request.parentAssignmentId === input.assignment_id && request.operation === 'submit')
+          expect(binding).toBeDefined()
+          expect(await originalText(turn, input.original_request)).toBe(binding!.taskContext!.source.text)
+          const review = JSON.parse(await originalText(turn, input.read))
+          const [summary, evidence] = review.summary.split('\n\n')
+          expect(summary).toBe(`${binding!.targetInstanceId}: original bounded execution completed`)
+          expect(JSON.parse(evidence)).toMatchObject({ producer: { instanceId: binding!.targetInstanceId }, evidence_ref: input.evidence_ref })
+          await turn.tool('orchestrator_result_review', { ticket_id: input.ticket_id, assignment_id: input.assignment_id, review_id: input.review_id,
+            decision: { kind: 'accept', summary } })
+          return
+        }
         if (input.kind !== 'candidate') return
         const card = input as Card; cards.push({ instanceId: id, card })
         if (id === 'parent' && hooks.route) { await hooks.route(turn, card); return }

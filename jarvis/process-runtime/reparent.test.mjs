@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SystemControl } from './control.mjs';
-import { controlledNativeFactory } from './controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
 import { createJarvisHandler } from '../dsh/index.mjs';
 
 const artifacts = resolve('.artifacts/organization-move');
@@ -145,6 +145,16 @@ test('real running owners keep old waiting work on its original path and switch 
     const card = JSON.parse(text);
     trace.push({ instanceId: config.instanceId, role: policy.role, card });
     if (policy.role === 'orchestrator') {
+      if (card.kind === 'result_review') {
+        await reviewDelegatedResult(tool, card, ({ original, summary, producer, artifacts }) => {
+          assert.equal(original, config.instanceId === 'old' ? 'Read the bounded old department file' : 'Read a newly authorized department file');
+          assert.equal(summary, 'Original bound work completed with its own answer.');
+          assert.equal(producer.instanceId, 'research');
+          assert.equal(artifacts.length, 1);
+          assert.equal(artifacts[0].ticketId, producer.ticketId);
+        });
+        return;
+      }
       if (card.kind !== 'candidate') return;
       let decision;
       if (card.dispatch && card.dispatch.operation !== 'new') decision = { kind: 'attach', trigger_id: card.trigger_id, ticket_id: card.dispatch.target_ticket_id };

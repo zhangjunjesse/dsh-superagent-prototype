@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ProcessManager } from './manager.mjs';
 import { DshBridge } from './dsh-bridge.mjs';
-import { controlledNativeFactory } from './controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
 
 /** Daily/preparation bridge boundary; original task Sessions use the explicit native protocol below. */
 function controlledDsh(trace) {
@@ -78,6 +78,16 @@ function controlledDsh(trace) {
     if (!text.startsWith('{')) return;
     const input = JSON.parse(text);
     if (policy.role === 'orchestrator') {
+      if (input.kind === 'result_review') {
+        assert.equal(config.instanceId, 'alpha');
+        await reviewDelegatedResult(tool, input, ({ original, summary, producer }) => {
+          assert.match(original, /Read marker.txt in the configured child workspace/);
+          assert.equal(producer.instanceId, 'beta');
+          assert.equal(summary, 'CHILD_MARKER');
+        });
+        calls.push({ source: { instanceId: config.instanceId, role: 'review' }, text });
+        return;
+      }
       if (input.kind !== 'candidate') return;
       const source = { instanceId: config.instanceId, role: 'router' };
       calls.push({ source, text, prompt: policy.prompt }); log({ event: 'native-model', ...calls.at(-1) });
@@ -136,17 +146,17 @@ test('original parent and child business processes complete delegated read throu
     assert.equal(child.tickets[0].mandate.basis.delegation.parentInstanceId, 'alpha');
     assert.deepEqual(child.tickets[0].mandate.basis.delegation.tools, ['read']);
     assert.equal(child.turns.length, 0, 'machine preparation must not create a user chat turn');
-    assert.deepEqual(host.calls.map(call => `${call.source.instanceId}:${call.source.role}`), ['alpha:jarvis', 'alpha:router', 'beta:jarvis', 'beta:router', 'beta:worker']);
+    assert.deepEqual(host.calls.map(call => `${call.source.instanceId}:${call.source.role}`), ['alpha:jarvis', 'alpha:router', 'beta:jarvis', 'beta:router', 'beta:worker', 'alpha:review']);
     assert.equal(host.nativeCalls.length, 1); assert.equal(host.nativeCalls[0].args.file_path, join(instances[1].workspace, 'marker.txt'));
     assert.deepEqual(host.errors, []); assert.deepEqual(host.nativeErrors, []);
-    assert.deepEqual(await manager.chat('alpha', input), turn); assert.equal(host.calls.length, 5);
+    assert.deepEqual(await manager.chat('alpha', input), turn); assert.equal(host.calls.length, 6);
     const queried = await manager.chat('alpha', { id: 'query-result', text: 'query: current delegated result' });
     assert.match(queried.assistant, /CHILD_MARKER/);
     await manager.restart('alpha');
     assert.equal(manager.status().instances[1].pid, started.instances[1].pid);
     parent = await manager.state('alpha'); child = await manager.state('beta');
     assert.equal(parent.tickets[0].ended?.outcome, 'completed'); assert.equal(child.tickets.length, 1);
-    assert.equal(host.calls.length, 6, 'completed work must not replay after parent restart');
+    assert.equal(host.calls.length, 7, 'completed work must not replay after parent restart');
     writeFileSync(join(rootDir, 'result.json'), JSON.stringify({ mode: 'complete original business child + private native protocol; daily/preparation bridge/model/native I/O controlled; no DSH claim',
       started, finished: manager.status(), parent, child, calls: host.calls, nativeCalls: host.nativeCalls }, null, 2));
   } catch (error) {

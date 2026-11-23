@@ -3,9 +3,10 @@ import { Engine, key, latestAssignment, liveTicket, type Assignment, type Result
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
-import { DelegationRequestSchema, verifiedArtifactLineages, verifiedDelegationArtifacts, verifiedDelegationLineage, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
+import { DelegationRequestSchema, verifiedArtifactLineages, verifiedDelegationArtifacts, verifiedDelegationLineage, verifiedDepartmentWaits, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
 import { DelegationTaskContextSchema } from '../sources/delegation-context.ts'
 import type { InboundDelegations } from './delegation-ingress.ts'
+import { ArtifactReferenceSchema, type ArtifactReference } from './artifact-contract.ts'
 
 export interface DelegationBinding {
   request: DelegationRequest; accepted?: boolean; stopped?: boolean; finished?: boolean;
@@ -13,10 +14,13 @@ export interface DelegationBinding {
   snapshot?: DelegationSnapshot; reportHash?: string; question?: { parentId: string; childId: string }; error?: string;
   retryAt?: number; failures?: number; submitAttempted?: boolean;
   reviewId?: string;
+  /** Durable cleanup proof is separate from the result being judged; stopping execution does not rewrite its evidence. */
+  handoff?: { reviewId: string; evidenceRef: string; stopping: boolean; queried?: DelegationSnapshot; stopAttempted?: boolean; stopped?: DelegationSnapshot; error?: string };
 }
 const selections = family<string, [string]>('process-delegation:route:')
 type Binding = DelegationBinding
 const outgoing = family<Binding, [string]>('process-delegation:out:')
+const targetGrants = family<{ ticketId: string; target: string; tools: string[] }, [string]>('process-delegation:target-grant:')
 type Config = { instanceId: string; workerTools: string[]; delegationTargets?: Capability[] }
 
 /** Keeps one parent Assignment bound to one child and reconciles its commands and evidence. */
@@ -24,7 +28,8 @@ export class DelegationExecutor {
   constructor(private config: Config, private store: Store, private engine: Engine,
     private send?: (request: DelegationRequest) => Promise<DelegationSnapshot>, private frozen: () => boolean = () => false,
     private ready: (instanceId: string) => boolean = () => false,
-    private toolsFor?: (ticket: Ticket) => readonly string[], private incoming?: InboundDelegations) {}
+    private toolsFor?: (ticket: Ticket) => readonly string[], private incoming?: InboundDelegations,
+    private handoffFor?: (ticket: Ticket) => ArtifactReference[]) {}
 
   /** Stored selection outlives catalog readiness; retries cannot move an existing task. */
   selected(triggerId: string): string | undefined { return this.store.get(selections(triggerId)) }
@@ -48,14 +53,28 @@ export class DelegationExecutor {
     return !!selection && selection !== 'local'
   }
   private name(ticketId: string, assignmentId: string) { return outgoing(key(ticketId, assignmentId)) }
+  private targetTools(ticket: Ticket, capability: Capability): string[] {
+    const saved = this.store.get(targetGrants(key(ticket.id, capability.instanceId)))
+    const history = this.list().filter(row => row.request.parentTicketId === ticket.id && row.request.targetInstanceId === capability.instanceId)
+    const ceiling = this.toolsFor?.(ticket) ?? this.config.workerTools
+    return capability.tools.filter(tool => this.config.workerTools.includes(tool) && ceiling.includes(tool)
+      && (saved ? saved.tools.includes(tool) : history.every(row => row.request.tools.some(name => name === tool))))
+  }
+  /** A target already used by this task cannot regain capabilities removed by later settings. */
+  narrowCapabilities(workerTools: readonly string[], targets: readonly Capability[]): void {
+    for (const name of this.store.keys(targetGrants)) {
+      const saved = this.store.get(name)!, target = targets.find(item => item.instanceId === saved.target)
+      this.store.set(name, { ...saved, tools: saved.tools.filter(tool => workerTools.includes(tool) && target?.tools.some(name => name === tool)) })
+    }
+  }
   start(ticket: Ticket, assignment: Assignment): void {
     const target = this.target(ticket, assignment), capability = this.config.delegationTargets?.find(item => item.instanceId === target)
     if (!capability) throw new Error('The fixed child target is no longer configured')
     const name = this.name(ticket.id, assignment.id)
     if (this.store.get(name)) return
-    const ceiling = this.toolsFor?.(ticket) ?? this.config.workerTools
-    const tools = capability.tools.filter(tool => this.config.workerTools.includes(tool) && ceiling.includes(tool))
+    const tools = this.targetTools(ticket, capability)
     if (!tools.length) throw new Error('Parent and child have no common execution capability')
+    this.store.set(targetGrants(key(ticket.id, capability.instanceId)), { ticketId: ticket.id, target: capability.instanceId, tools })
     const delegationId = key('delegation', this.config.instanceId, ticket.id, assignment.id)
     const source = this.store.triggers.get(ticket.origin.triggerId)
     if (!source) throw new Error('A delegated task requires its actual original source record')
@@ -64,6 +83,7 @@ export class DelegationExecutor {
       previous_results: ticket.assignments.flatMap(item => item.resultReviews ?? []),
       inputs: ticket.inputs.map(input => ({ ...input, ...(input.kind === 'trigger' ? { source: this.store.triggers.get(input.triggerId) } : {}) })) })}` : ''
     const taskContext = DelegationTaskContextSchema.parse({ scope: ticket.mandate.scope, strength: ticket.mandate.strength,
+      handoff: this.handoffFor?.(ticket) ?? [],
       assignment: (ticket.execution?.assignment ?? '') + remaining, source: inherited?.source ?? { triggerId: source.id, kind: source.source, actor: source.actor,
         human: source.human, at: source.at, text: source.text, ...(source.url ? { url: source.url } : {}) } })
     const request: DelegationRequest = DelegationRequestSchema.parse({ targetInstanceId: capability.instanceId, delegationId, parentTicketId: ticket.id,
@@ -92,20 +112,67 @@ export class DelegationExecutor {
     return { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
       ...(row ? { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped, error: row.error } : {}) }
   }
+  /** Query the exact producer before stopping it. Lost acknowledgements can retry only this binding, never create another Worker. */
+  async prepareReview(ticketId: string, assignmentId: string, reviewId: string): Promise<void> {
+    const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    const review = assignment?.resultReviews?.at(-1)
+    if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || review?.id !== reviewId || review.decision) throw new Error('Result review is no longer current')
+    if (!this.remote(ticket, assignment)) return
+    const name = this.name(ticketId, assignmentId), initial = this.store.get(name)
+    if (!initial || !this.send || !initial.snapshot) throw new Error('The original child binding or result is unavailable')
+    const evidenceRef = this.evidence(initial.snapshot)
+    if (review.evidenceRef !== evidenceRef) throw new Error('The result evidence changed; read the current review')
+    if (initial.handoff?.stopped?.executionStopped && initial.handoff.reviewId === reviewId && initial.handoff.evidenceRef === evidenceRef) return
+    const prior = initial.handoff?.reviewId === reviewId && initial.handoff.evidenceRef === evidenceRef ? initial.handoff : undefined
+    this.store.set(name, { ...initial, handoff: { ...prior, reviewId, evidenceRef, stopping: true, error: undefined } })
+    try {
+      const query = await this.send({ ...initial.request, operation: 'query', commandId: key(initial.request.delegationId, 'handoff-query', reviewId), text: undefined })
+      this.verify(initial, query)
+      const retryStopped = prior?.stopAttempted && query.status === 'stopped'
+        && fingerprint(verifiedDelegationArtifacts(query)) === fingerprint(verifiedDelegationArtifacts(initial.snapshot))
+      if (this.evidence(query) !== evidenceRef && !retryStopped) {
+        this.store.atomic(() => { const row = this.store.get(name)!; delete row.handoff; this.apply(row, query); this.store.set(name, row) })
+        throw new Error('The producer result changed during verification; read the current review before reassigning')
+      }
+      for (const artifact of verifiedDelegationArtifacts(query)) {
+        if (!artifact.version || !artifact.assignmentId) throw new Error('Historical result has no verified immutable version for handoff')
+        ArtifactReferenceSchema.parse({ instanceId: artifact.instanceId, ticketId: artifact.ticketId, assignmentId: artifact.assignmentId, version: artifact.version })
+      }
+      const beforeStop = this.store.get(name)!
+      this.store.set(name, { ...beforeStop, handoff: { ...beforeStop.handoff!, queried: query, stopAttempted: true } })
+      const stopped = await this.send({ ...initial.request, operation: 'stop', commandId: key(initial.request.delegationId, 'handoff-stop', reviewId),
+        text: 'The owning organization is arranging remaining work. Stop this exact assignment and confirm all native execution has drained.' })
+      this.verify(initial, stopped); this.stoppedSnapshot(initial, stopped)
+      // Cleanup may change the status/summary; the registered artifact versions must stay identical.
+      if (fingerprint(verifiedDelegationArtifacts(stopped)) !== fingerprint(verifiedDelegationArtifacts(query))) throw new Error('Producer artifacts changed while stopping; inspect the current versions before handoff')
+      const row = this.store.get(name)!
+      this.store.set(name, { ...row, finished: true, snapshot: { ...row.snapshot!, executionStopped: true }, handoff: { reviewId, evidenceRef, stopping: false, stopped } })
+    } catch (error) {
+      const row = this.store.get(name)!
+      if (row.handoff) this.store.set(name, { ...row, handoff: { ...row.handoff, error: String(error) } })
+      throw error
+    }
+  }
   authorizeReview(ticket: Ticket, assignment: Assignment, decision: ResultReviewDecision): void {
     const ceiling = this.toolsFor?.(ticket) ?? this.config.workerTools
     if (!ceiling.length) throw new Error('The original task has no remaining execution capability')
     if (this.remote(ticket, assignment)) {
       const row = this.store.get(this.name(ticket.id, assignment.id))
-      if (!row || row.stopped || row.error || row.request.parentDecisionId !== ticket.decisionId || row.snapshot?.status !== 'completed') throw new Error('The child result no longer has an available current binding')
+      if (!row || row.stopped || row.error || row.request.parentDecisionId !== ticket.decisionId || !row.snapshot) throw new Error('The child result no longer has an available current binding')
       this.verify(row, row.snapshot)
+      if (decision.kind === 'accept' && row.snapshot.status !== 'completed') throw new Error('The child did not complete the task; arrange remaining work or ask the user through the parent conversation')
+      if (decision.kind === 'continue') {
+        const review = assignment.resultReviews?.at(-1), handoff = row.handoff
+        if (!review || !handoff?.stopped?.executionStopped || handoff.stopping || handoff.error
+          || handoff.reviewId !== review.id || handoff.evidenceRef !== review.evidenceRef) throw new Error('The original child execution has not been verified stopped for this result')
+      }
     }
     if (decision.kind !== 'continue' || !decision.targetInstanceId) return
     const target = this.config.delegationTargets?.find(item => item.instanceId === decision.targetInstanceId)
     if (!this.send || !target || !this.ready(target.instanceId)) throw new Error('The selected child is not ready for remaining work')
     if (ticket.mandate.basis.via === 'delegation' && !this.incoming?.forward(ticket, assignment))
       throw new Error('The original parent binding is unavailable for remaining work')
-    if (!target.tools.some(tool => this.config.workerTools.includes(tool) && ceiling.includes(tool))) throw new Error('Remaining work has no common authorized capability')
+    if (!this.targetTools(ticket, target).length) throw new Error('Remaining work has no common authorized capability')
   }
   private current(row: Binding): Ticket | undefined {
     const ticket = this.store.tickets.get(row.request.parentTicketId)
@@ -122,6 +189,7 @@ export class DelegationExecutor {
         || first.strength !== r.taskContext.strength || first.assignment !== r.taskContext.assignment))))
       throw new Error('Child lineage changed the accepted parent scope or grant')
     verifiedDelegationArtifacts(snapshot)
+    verifiedDepartmentWaits(snapshot)
   }
   private controls(row: Binding, ticket: Ticket): void {
     for (const input of ticket.inputs.filter(input => ticket.undelivered.includes(input.id))) {
@@ -149,14 +217,17 @@ export class DelegationExecutor {
       throw new Error('Bound child stop has not acknowledged execution cleanup')
     return snapshot
   }
-  async shutdown(ticketId?: string): Promise<void> {
+  async shutdown(ticketId?: string, preserveWait?: (ticket: Ticket) => boolean): Promise<void> {
     // A completed business report can precede native job/subagent cleanup.
     // Only a verified lifecycle acknowledgement releases this parent's ownership.
-    const rows = this.list().filter(row => (!ticketId || row.request.parentTicketId === ticketId) && (!row.finished || row.snapshot?.executionStopped !== true))
+    const candidates = this.list().filter(row => (!ticketId || row.request.parentTicketId === ticketId) && (!row.finished || row.snapshot?.executionStopped !== true))
+    const retained = new Set(candidates.filter(row => { const ticket = this.current(row); return ticket && preserveWait?.(ticket) }).map(row => row.request.delegationId))
+    // A restart of the parent must not cancel a descendant whose original task is durably waiting for a department.
+    const rows = candidates.filter(row => !(retained.has(row.request.delegationId) && row.snapshot && verifiedDepartmentWaits(row.snapshot).length))
     for (const row of rows) {
       const ticket = this.current(row)
-      if (ticket) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
-      this.store.set(this.name(row.request.parentTicketId, row.request.parentAssignmentId), { ...this.store.get(this.name(row.request.parentTicketId, row.request.parentAssignmentId))!, stopped: true })
+      if (ticket && !retained.has(row.request.delegationId)) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
+      if (!retained.has(row.request.delegationId)) this.store.set(this.name(row.request.parentTicketId, row.request.parentAssignmentId), { ...this.store.get(this.name(row.request.parentTicketId, row.request.parentAssignmentId))!, stopped: true })
     }
     const errors: Error[] = []
     for (const pending of rows) {
@@ -169,10 +240,11 @@ export class DelegationExecutor {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
           snapshot = await this.send(request); this.verify(row, snapshot)
         }
-        this.store.set(name, { ...this.store.get(name)!, stopped: true, finished: true, snapshot: this.stoppedSnapshot(row, snapshot), error: undefined, retryAt: undefined })
+        this.store.set(name, { ...this.store.get(name)!, stopped: retained.has(row.request.delegationId) ? row.stopped : true, finished: true,
+          snapshot: this.stoppedSnapshot(row, snapshot), error: undefined, retryAt: undefined })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        this.store.set(name, { ...this.store.get(name)!, stopped: true, error: message })
+        this.store.set(name, { ...this.store.get(name)!, stopped: retained.has(row.request.delegationId) ? row.stopped : true, error: message })
         errors.push(new Error(`${row.request.targetInstanceId}/${row.request.delegationId}: ${message}`))
       }
     }
@@ -203,12 +275,14 @@ export class DelegationExecutor {
     if (snapshot.status === 'completed' && outstanding) {
       this.engine.report(ticket.id, { state: 'blocked', summary: 'Child completed before the newer input was admitted; review the result and pending request.' })
     }
-    const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question])
+    const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question, snapshot.departmentWaits])
+    if (snapshot.status === 'completed' && outstanding) { row.reportHash = hash; return }
     if (hash === row.reportHash && snapshot.status !== 'completed') return
-    if (snapshot.status === 'completed' && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim()) {
+    if (['completed', 'blocked', 'failed', 'stopped'].includes(snapshot.status) && !snapshot.question && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim() && !outstanding) {
       // Persist the transport binding in the same transaction as the review relay; completion remains the parent's decision.
       delete row.error
       this.store.set(this.name(ticket.id, assignmentId), row)
+      if (snapshot.status !== 'completed') this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed', summary: snapshot.summary, question: null })
       const evidence = this.evidence(snapshot)
       const summary = `${snapshot.summary}\n\n${JSON.stringify({ producer: { instanceId: snapshot.childInstanceId,
         ticketId: snapshot.ticketId, assignmentId: snapshot.assignmentId }, evidence_ref: evidence, artifacts: verifiedDelegationArtifacts(snapshot) })}`
@@ -218,14 +292,29 @@ export class DelegationExecutor {
         summary: snapshot.summary ?? `Child delegation ${snapshot.status}`, question: snapshot.question?.text ?? null })
       const attention = this.store.tickets.get(ticket.id)?.attention
       if (snapshot.question && attention) row.question = { parentId: attention.id, childId: snapshot.question.id }
-    } else this.engine.report(ticket.id, { state: 'waiting', summary: snapshot.ticketId ? 'Child accepted the task and is executing.' : 'Waiting for child admission.', question: null })
+    } else this.engine.report(ticket.id, { state: 'waiting', summary: snapshot.departmentWaits?.length
+      ? `Waiting for required departments: ${snapshot.departmentWaits.map(wait => wait.responsibility).join('; ')}`
+      : snapshot.ticketId ? 'Child accepted the task and is executing.' : 'Waiting for child admission.', question: null })
     row.reportHash = hash
   }
   async tick(): Promise<void> {
     if (!this.send) return
     for (const name of this.store.keys(outgoing)) {
       let row = this.store.get(name)!
-      if (row.finished || (row.retryAt ?? 0) > Date.now()) continue
+      if (row.handoff?.stopped?.executionStopped && this.current(row) && row.snapshot) {
+        // A new user input while cleanup was in flight invalidates the old review, not the verified stop.
+        // Restage the same immutable result against current inputs without re-delivering them to the stopped producer.
+        this.store.atomic(() => {
+          const ticket = this.current(row)!, assignment = latestAssignment(ticket)!
+          const original = assignment.resultReviews?.find(review => review.evidenceRef === row.handoff!.evidenceRef)
+          if (original && !assignment.resultReviews?.at(-1)?.decision) {
+            const review = this.engine.stageResultReview(ticket.id, assignment.id, row.handoff!.evidenceRef, original.summary)
+            row.reviewId = review.id; row.handoff!.reviewId = review.id; this.store.set(name, row)
+          }
+        })
+        continue
+      }
+      if (row.finished || row.handoff?.stopping || (row.retryAt ?? 0) > Date.now()) continue
       try {
         const ticket = this.current(row)
         if (!ticket && !row.stopped) { row.stopped = true; this.store.set(name, row) }

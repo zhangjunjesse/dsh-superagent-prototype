@@ -18,7 +18,10 @@ export function processRunOf(input: DeliveryInput, policy: NativeSessionPolicy):
 }
 export async function routeOriginal(turn: NativeTurn, title = 'Read bounded files', targetInstanceId?: string) {
   const card = JSON.parse(turn.text)
-  if (card.kind === 'result_review') return acceptOriginalReview(turn)
+  if (card.kind === 'result_review') {
+    if (card.producer_state && !['completed', 'waiting'].includes(card.producer_state)) return
+    return acceptOriginalReview(turn)
+  }
   if (card.kind !== 'candidate') return
   const dispatch = card.dispatch
   return turn.tool('orchestrator_route', { decisions: [dispatch && dispatch.operation !== 'new'

@@ -4,7 +4,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } f
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SystemControl } from './control.mjs';
-import { controlledNativeFactory } from './controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
 
 const model = { provider: 'controlled-test-only', model: 'live-topology-test' };
 const existingGoal = 'Keep the existing local task executing until its original completion signal.';
@@ -41,6 +41,15 @@ function fixture({ delegationSource = 'root' } = {}) {
     nativeCalls.push({ instanceId: config.instanceId, role: policy.role, input });
     trace({ event: 'native-turn', instanceId: config.instanceId, role: policy.role, input });
     if (policy.role === 'orchestrator') {
+      if (input.kind === 'result_review') {
+        assert.equal(config.instanceId, delegationSource);
+        await reviewDelegatedResult(tool, input, ({ original, summary, producer }) => {
+          assert.equal(original, delegatedGoal);
+          assert.equal(summary, 'NEW_RESEARCH_MARKER');
+          assert.equal(producer.instanceId, 'research');
+        });
+        return;
+      }
       if (input.kind !== 'candidate') return;
       const targets = input.execution_targets.map(item => item.instanceId);
       const accept = { kind: 'accept', trigger_id: input.trigger_id, title: input.text,
