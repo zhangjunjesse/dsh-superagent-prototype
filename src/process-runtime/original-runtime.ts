@@ -4,7 +4,7 @@ import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
-import { latestAssignment, liveTicket, type Ticket } from '../core/index.ts'
+import { latestAssignment, liveTicket, type Assignment, type Ticket } from '../core/index.ts'
 import type { RuntimeNativePorts } from '../app/runtime-ports.ts'
 import type { Machine } from '../deployment.ts'
 import type { StartupObserver } from '../setup.ts'
@@ -163,7 +163,7 @@ export class OriginalProcess {
         localTicket: ticket => !this.delegated.remote(ticket) && !this.departments?.held(ticket) && !this.retries?.pending(ticket),
         prepareHandoff: async (ticket, assignment) => {
           this.delegated.assertReplacement(ticket, assignment)
-          return this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket), async input => {
+          return this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket, assignment), async input => {
             // TaskFiles verifies this local task's original registration and digest.
             if (input.artifact.instanceId === config.instanceId && input.artifact.ticketId === ticket.id) return this.taskFiles.read(input)
             if (!host.readArtifact) throw new Error('The authenticated artifact transfer is unavailable')
@@ -327,9 +327,19 @@ export class OriginalProcess {
       skills: (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill)),
     }
   }
-  /** Keep task authority separate from each target's capabilities; old v1 grants remain conservatively narrow. */
-  handoffArtifacts(ticket: Ticket): ArtifactReference[] {
-    const own = this.taskFiles.links(this.config.instanceId, ticket.id).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: ticket.id }))
+  /** Legacy files may stay in their original local workspace, but are never evidence for a transfer. */
+  handoffArtifacts(ticket: Ticket, localAssignment?: Assignment): ArtifactReference[] {
+    if (localAssignment) {
+      const current = this.runtime.store.tickets.get(ticket.id), assignment = current && latestAssignment(current)
+      if (!current || !liveTicket(current) || assignment?.id !== localAssignment.id || this.delegated.remote(current, assignment)
+        || !ticket.execution?.directory || relative(this.taskFiles.directory(ticket.id), realpathSync.native(ticket.execution.directory)) !== '')
+        throw new Error('Local artifact reuse requires the current assignment in its original execution directory')
+    }
+    const own = this.taskFiles.links(this.config.instanceId, ticket.id)
+      // An old index has neither version nor assignment. The local Worker is
+      // already in that verified directory; it needs no copy or invented hash.
+      .filter(item => !localAssignment || item.version || item.assignmentId)
+      .map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: ticket.id }))
     const input = [...this.inbound.handoff(ticket), ...[...own, ...this.delegated.artifacts(ticket.id)].map(item => {
       if (!item.version || !item.assignmentId) throw new Error('Historical result has no verified version for handoff')
       return { instanceId: item.instanceId, ticketId: item.ticketId, assignmentId: item.assignmentId, version: item.version }
