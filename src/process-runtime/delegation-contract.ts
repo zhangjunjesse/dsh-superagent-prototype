@@ -75,6 +75,13 @@ export const VerifiedArtifactSchema = z.object({ instanceId: id, ticketId: id, t
     && (!item.version || !!item.assignmentId && item.url === prefix + path)
 }, 'Artifact URL does not match its fixed instance and ticket')
 export type VerifiedArtifact = z.infer<typeof VerifiedArtifactSchema>
+/** Immutable missing responsibility, reported by the organization bound to the actual receiving assignment. */
+export const DepartmentWaitSchema = z.object({
+  id, ownerInstanceId: id, ownerOrganizationName: z.string().min(1).max(200), ticketId: id, assignmentId: id, decisionId: id, reviewId: id,
+  responsibility: z.string().min(1).max(2000), requiredTools: z.array(WorkerToolSchema).min(1).max(30),
+  instructions: z.string().min(1).max(100000), summary: z.string().min(1).max(1_000_000), at: z.string().min(1),
+}).strict()
+export type DepartmentWait = z.infer<typeof DepartmentWaitSchema>
 export interface DelegationSnapshot {
   delegationId: string; parentTicketId: string; parentAssignmentId: string; childInstanceId: string;
   status: 'pending' | 'running' | 'blocked' | 'failed' | 'completed' | 'stopped' | 'missing';
@@ -88,6 +95,17 @@ export interface DelegationSnapshot {
   lineage?: DelegationLink[];
   /** Prior result paths retained when a later assignment selects a different child or a local Worker. */
   artifactLineages?: DelegationLink[][];
+  /** Current missing departments from actual owners on this immutable task path. */
+  departmentWaits?: DepartmentWait[];
+}
+export function verifiedDepartmentWaits(snapshot: DelegationSnapshot): DepartmentWait[] {
+  const waits = z.array(DepartmentWaitSchema).max(60).parse(snapshot.departmentWaits ?? [])
+  const lineage = verifiedDelegationLineage(snapshot)
+  if (new Set(waits.map(wait => wait.id)).size !== waits.length || waits.some(wait => !lineage.some(link =>
+    link.childInstanceId === wait.ownerInstanceId && link.childTicketId === wait.ticketId
+      && link.childAssignmentId === wait.assignmentId && link.childDecisionId === wait.decisionId)))
+    throw new Error('Department wait does not belong to the fixed receiving assignment path')
+  return waits
 }
 export function verifiedDelegationLineage(snapshot: DelegationSnapshot): DelegationLink[] {
   const links = LineageSchema.parse(snapshot.lineage ?? []), first = links[0]

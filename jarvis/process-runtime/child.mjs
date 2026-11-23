@@ -59,7 +59,7 @@ const peer = new ProcessPeer(process, {
   delegation: input => requireRuntime().delegation(input),
   'delegation.readiness': input => runtime ? runtime.delegationReadiness(input) : { ready: false },
   'lifecycle.delegation': input => runtime.lifecycleDelegation(input),
-  'lifecycle.drain': () => runtime.drainDelegations(),
+  'lifecycle.drain': input => runtime.drainDelegations(input),
   'artifact.authorize': input => requireRuntime().authorizeArtifact(input),
   'artifact.read': input => runtime.readArtifact(input),
   management: input => requireRuntime().management(input),
@@ -72,9 +72,9 @@ const peer = new ProcessPeer(process, {
   'topology.activity': () => requireRuntime().topologyActivity(),
   'topology.configure': input => requireRuntime().topologyConfigure(input),
   'topology.release': input => requireRuntime().topologyRelease(input),
-  async close() {
+  async close(input) {
     closing = true;
-    if (runtime) await runtime.close();
+    if (runtime) await runtime.close(input);
     native?.close();
     return { stopped: true };
   },
@@ -83,5 +83,5 @@ process.once('disconnect', () => {
   closing = true;
   // A lost host cannot finish a model/tool request. Leave durable work for explicit recovery.
   const deadline = setTimeout(() => process.exit(1), 5000);
-  Promise.resolve(runtime?.close()).catch(() => {}).finally(() => { native?.close(); clearTimeout(deadline); process.exit(0); });
+  Promise.resolve(runtime?.close({ preserveDepartmentWaits: true })).catch(() => {}).finally(() => { native?.close(); clearTimeout(deadline); process.exit(0); });
 });
