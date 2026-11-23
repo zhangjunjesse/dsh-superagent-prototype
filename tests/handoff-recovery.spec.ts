@@ -6,6 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { Store } from '../src/app/store.ts'
 import { Engine, latestAssignment, type Policy, type Trigger } from '../src/core/index.ts'
 import { DelegationExecutor } from '../src/process-runtime/delegation-executor.ts'
+import { DepartmentWaits } from '../src/process-runtime/department-waits.ts'
 import type { Capability, DelegationRequest, DelegationSnapshot } from '../src/process-runtime/delegation-contract.ts'
 
 const opened: { directory: string; store: Store }[] = []
@@ -26,7 +27,7 @@ const result = (request: DelegationRequest, patch: Partial<DelegationSnapshot> =
   childInstanceId: 'author', ticketId: 'author-ticket', assignmentId: 'author-assignment', status: 'completed',
   summary: 'The registered result is produced; original validation remains.', receipts: {}, artifacts: [artifact], ...patch,
 })
-function owner(store: Store, send: (request: DelegationRequest) => Promise<DelegationSnapshot>) {
+function owner(store: Store, send: (request: DelegationRequest) => Promise<DelegationSnapshot>, targets = config.delegationTargets) {
   let proxy: DelegationExecutor
   const reviews: { id: string; evidenceRef: string }[] = []
   const policy: Policy = { version: 'original-policy', paused: false, evalTimeoutMs: 60000,
@@ -38,7 +39,7 @@ function owner(store: Store, send: (request: DelegationRequest) => Promise<Deleg
     resultReview: { context: (ticket, assignment) => proxy.reviewContext(ticket, assignment),
       authorize: (ticket, assignment, decision) => proxy.authorizeReview(ticket, assignment, decision),
       request: (_ticket, _assignment, review) => { reviews.push({ id: review.id, evidenceRef: review.evidenceRef }) } } })
-  proxy = new DelegationExecutor(config, store, engine, send, () => false, () => true)
+  proxy = new DelegationExecutor({ ...config, delegationTargets: targets }, store, engine, send, () => false, () => true)
   return { engine, proxy, reviews }
 }
 function database() {
@@ -52,6 +53,66 @@ function accept(h: ReturnType<typeof owner>) {
   h.engine.receive(trigger); h.proxy.select(trigger.id, 'author')
   return h.engine.decide(trigger.id, { kind: 'accept', title: trigger.text, scope: trigger.text, reason: 'Explicit bounded original request' }).ticketId!
 }
+
+it.each(['completed', 'blocked'] as const)('hands off the latest %s child artifact after a department wait survives restart', async status => {
+  const db = database(), inspector: Capability = { instanceId: 'inspector', organizationName: 'Inspector', description: 'Validate the file', tools: ['read'] }
+  const targets = [...config.delegationTargets, inspector], requests: DelegationRequest[] = []
+  const updatedHash = 'b'.repeat(64)
+  const updated = { ...artifact, version: { ...artifact.version, sha256: updatedHash }, url: artifact.url.replace(sha256, updatedHash),
+    downloadUrl: artifact.downloadUrl.replace(sha256, updatedHash) }
+  let published = artifact, producerStatus: DelegationSnapshot['status'] = 'blocked'
+  const send = async (request: DelegationRequest) => {
+    requests.push(request)
+    if (request.targetInstanceId === inspector.instanceId) {
+      const received = requests.some(item => item.targetInstanceId === inspector.instanceId && item.operation === 'submit')
+      return result(request, { childInstanceId: inspector.instanceId, ticketId: received ? 'inspection' : undefined,
+        assignmentId: received ? 'inspection-worker' : undefined, status: received ? 'running' : 'missing', artifacts: [] })
+    }
+    return result(request, { status: request.operation === 'stop' ? 'stopped' : producerStatus, artifacts: [published], executionStopped: request.operation === 'stop' })
+  }
+  const cards: { review_id: string; ready_attempt_id: string }[] = []
+  function open(store: Store) {
+    const h = owner(store, send, targets)
+    const waits = new DepartmentWaits({ instanceId: config.instanceId, organizationName: 'Management' }, store, h.engine,
+      { relay: (_id, text) => { cards.push(JSON.parse(text)) } })
+    return { ...h, waits }
+  }
+  const first = open(db.item.store), ticketId = accept(first)
+  await first.proxy.tick()
+  const source = latestAssignment(db.item.store.tickets.get(ticketId)!)!, old = source.resultReviews!.at(-1)!
+  const requirement = { responsibility: 'Inspect the latest registered version', required_tools: inspector.tools, instructions: 'Verify the saved file.' }
+  const wait = first.waits.hold(ticketId, source.id, old.id, requirement, 'An inspector is required.')
+  first.waits.reconcile(() => [])
+  const recovered = open(db.reopen())
+  published = updated; producerStatus = status
+  for (let poll = 0; poll < 5; poll++) {
+    await recovered.proxy.tick()
+    recovered.waits.reconcile(() => [inspector])
+  }
+  const ticket = () => db.item.store.tickets.get(ticketId)!
+  const reviews = latestAssignment(ticket())!.resultReviews!
+  expect(reviews).toHaveLength(2)
+  const current = reviews.at(-1)!
+  expect(current.summary).toContain(updatedHash)
+  expect(current.evidenceRef).not.toBe(old.evidenceRef)
+  expect(cards).toMatchObject([{ review_id: current.id }])
+  expect(recovered.waits.forTicket(ticketId)).toMatchObject([{ id: wait.id, instructions: requirement.instructions }])
+  expect(() => recovered.waits.validateResume(ticketId, source.id, old.id, 'inspector', [inspector])).toThrow()
+  expect(requests.filter(request => request.operation === 'stop')).toHaveLength(0)
+  recovered.waits.validateResume(ticketId, source.id, current.id, 'inspector', [inspector])
+  await recovered.proxy.prepareReview(ticketId, source.id, current.id)
+  for (let i = 0; i < 2; i++) recovered.waits.resume(ticketId, source.id, current.id, 'inspector', 'Inspect the updated file.')
+  await recovered.proxy.tick()
+  expect(ticket().assignments).toHaveLength(2)
+  const inspection = latestAssignment(ticket())!
+  expect(inspection.continuation).toMatchObject({ reviewId: current.id, instructions: requirement.instructions })
+  expect(ticket().assignments[0]!.resultReviews!.at(-1)?.decision).toMatchObject({ kind: 'continue', assignmentId: inspection.id })
+  const submits = requests.filter(request => request.targetInstanceId === 'inspector' && request.operation === 'submit')
+  expect(submits).toHaveLength(1)
+  expect(submits[0]!.parentAssignmentId).toBe(inspection.id)
+  expect(submits[0]!.taskContext?.assignment).toContain(current.id)
+  expect(recovered.proxy.artifacts(ticketId)).toEqual([updated])
+})
 
 it('recovers a handoff interrupted before producer query after SQLite reopens and preserves the exact version', async () => {
   const db = database(); let interrupt = false

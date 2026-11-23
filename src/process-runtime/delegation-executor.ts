@@ -394,17 +394,21 @@ export class DelegationExecutor {
     }
     const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question, snapshot.departmentWaits])
     if (snapshot.status === 'completed' && outstanding) { row.reportHash = hash; return }
-    if (hash === row.reportHash && snapshot.status !== 'completed') return
-    if (['completed', 'blocked', 'failed', 'stopped'].includes(snapshot.status) && !snapshot.question && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim() && !outstanding) {
+    const repeated = hash === row.reportHash && snapshot.status !== 'completed' && !row.error
+    if (['completed', 'blocked', 'failed', 'stopped'].includes(snapshot.status) && !snapshot.question
+      && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim() && !outstanding) {
+      const evidence = this.evidence(snapshot)
+      // A partial result can publish new file versions under the same status and summary.
+      if (repeated && latestAssignment(ticket)?.resultReviews?.at(-1)?.evidenceRef === evidence) return
       // Persist the transport binding in the same transaction as the review relay; completion remains the parent's decision.
       delete row.error
       this.store.set(this.name(ticket.id, assignmentId), row)
       if (snapshot.status !== 'completed') this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed', summary: snapshot.summary, question: null })
-      const evidence = this.evidence(snapshot)
       const summary = `${snapshot.summary}\n\n${JSON.stringify({ producer: { instanceId: snapshot.childInstanceId,
         ticketId: snapshot.ticketId, assignmentId: snapshot.assignmentId }, evidence_ref: evidence, artifacts: verifiedDelegationArtifacts(snapshot) })}`
       row.reviewId = this.engine.stageResultReview(ticket.id, assignmentId, evidence, summary).id
-    } else if (['blocked', 'failed', 'stopped'].includes(snapshot.status)) {
+    } else if (repeated) return
+    else if (['blocked', 'failed', 'stopped'].includes(snapshot.status)) {
       this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed',
         summary: snapshot.summary ?? `Child delegation ${snapshot.status}`, question: snapshot.question?.text ?? null })
       const attention = this.store.tickets.get(ticket.id)?.attention

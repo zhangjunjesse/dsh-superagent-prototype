@@ -23,9 +23,10 @@ export class DepartmentWaits {
 
   private current(wait: DepartmentWait): Ticket | undefined {
     const ticket = this.store.tickets.get(wait.ticketId), assignment = ticket && latestAssignment(ticket)
-    const review = assignment?.resultReviews?.find(item => item.id === wait.reviewId)
+    const reviews = assignment?.resultReviews
     return ticket && liveTicket(ticket) && ticket.decisionId === wait.decisionId && assignment?.id === wait.assignmentId
-      && assignment.state !== 'ended' && review && !review.decision ? ticket : undefined
+      && assignment.state !== 'ended' && reviews?.some(review => review.id === wait.reviewId && !review.decision)
+      && !reviews.at(-1)?.decision ? ticket : undefined
   }
   forTicket(ticketId: string): DepartmentWait[] {
     return this.store.keys(waits).map(name => this.store.get(name)!).filter(wait => wait.ticketId === ticketId && this.current(wait))
@@ -80,10 +81,11 @@ export class DepartmentWaits {
   /** Availability observations only schedule original Session reasoning; they never select a department by its name. */
   reconcile(targetsFor: (ticket: Ticket) => Capability[]): void {
     for (const wait of this.active()) this.store.atomic(() => {
-      const ticket = this.current(wait)!, assignment = latestAssignment(ticket)!, original = assignment.resultReviews!.find(review => review.id === wait.reviewId)!
+      const ticket = this.current(wait)!, assignment = latestAssignment(ticket)!, latest = assignment.resultReviews!.at(-1)!
       const targets = targetsFor(ticket).filter(target => wait.requiredTools.every(tool => target.tools.some(name => name === tool)))
-      // Later inputs and policy changes demand a new review CAS, while the original wait/notice identity stays fixed.
-      const review = targets.length ? this.engine.stageResultReview(ticket.id, assignment.id, original.evidenceRef, original.summary) : original
+      // A wait retains its instructions. Only the executor can publish replacement evidence or restore a superseded report.
+      if (targets.length && assignment.report?.summary !== latest.summary) return
+      const review = targets.length ? this.engine.stageResultReview(ticket.id, assignment.id, latest.evidenceRef, latest.summary) : latest
       const signature = fingerprint([review.id, targets]), previous = this.store.get(readyCycles(wait.id))
       const now = Date.now()
       if (previous?.signature === signature) {
