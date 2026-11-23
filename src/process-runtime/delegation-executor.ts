@@ -1,5 +1,5 @@
 /** Proxy executor: persistent bindings and polling, without occupying a local Worker slot. */
-import { Engine, key, latestAssignment, liveTicket, withReviewTransport, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
+import { Engine, key, latestAssignment, liveTicket, reviewGrantSet, withReviewTransport, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
@@ -133,9 +133,9 @@ export class DelegationExecutor {
       snapshot.status, snapshot.summary, verifiedDelegationArtifacts(snapshot)])
   }
   /** Included in the Core review CAS so changed evidence, transport uncertainty or narrowed capabilities invalidate it. */
-  reviewContext(ticket: Ticket, assignment: Assignment): unknown {
+  reviewContext(ticket: Ticket, assignment: Assignment, tools: readonly string[] = reviewGrantSet(this.toolsFor?.(ticket) ?? this.config.workerTools)): unknown {
     const target = this.target(ticket, assignment), row = this.store.get(this.name(ticket.id, assignment.id))
-    const authority = { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
+    const authority = { target, tools,
       ...(row && { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped }) }
     return withReviewTransport(authority, { error: row?.error,
       ...(row?.handoff?.recoveryGeneration ? { recoveryGeneration: row.handoff.recoveryGeneration } : {}) })

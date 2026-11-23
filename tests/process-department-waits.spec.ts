@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { afterEach, expect, it, vi } from 'vitest'
 import { createProcessRuntime, type ProcessHost, type ProcessRuntime, type ProcessRuntimeConfig } from '../src/process-runtime/runtime.ts'
+import type { Capability } from '../src/process-runtime/delegation-contract.ts'
 import { acceptOriginalReview, controlledNative, originalText, routeOriginal, type NativeTurn } from './fixtures/native-ports.ts'
 
 const directories: string[] = [], owners: ProcessRuntime[] = []
@@ -59,6 +60,58 @@ it('holds the original newly accepted task once without launching a local Worker
   expect((await node.feedback()).items.filter(event => event.kind === 'message')).toHaveLength(1)
   expect(native.errors).toEqual([])
 }, 10000)
+
+it('retains a department refusal when the owner reorders its grants, and rechecks a genuine reduction', async () => {
+  const config = configuration('manager'), notices: string[] = []
+  const candidate: Capability = { instanceId: 'billing', organizationName: 'Billing', description: 'Reads invoices', tools: ['read'] }
+  let ready = false, owner: ProcessRuntime
+  const open = (workerTools: string[], workerSkills: string[]) => {
+    const native = controlledNative(async turn => {
+      if (!turn.text.startsWith('{')) return
+      const card = JSON.parse(turn.text)
+      if (card.kind === 'candidate') await turn.tool('orchestrator_route', { decisions: [{ kind: 'accept', trigger_id: card.trigger_id,
+        title: 'Certify the measurements', worktree_name: 'certification', acknowledgement: 'Accepted for certification.',
+        missing_department: { ...requirement, required_tools: ['read'] } }] })
+      if (card.kind === 'department_ready') {
+        await turn.tool('orchestrator_department_defer', { ticket_id: card.ticket_id, assignment_id: card.assignment_id,
+          review_id: card.review_id, ready_attempt_id: card.ready_attempt_id, summary: 'Billing cannot certify measurements.' })
+        notices.push(card.ticket_id)
+      }
+    })
+    owner = createProcessRuntime({ ...config, workerTools, workerSkills, delegationTargets: [candidate] }, {
+      run: async request => {
+        await owner.tool({ ...request, name: 'jarvis_work_submit', args: { operation: 'new', request: { quote: request.text, summary: request.text } } })
+        return { status: 'complete', text: 'Accepted.' }
+      }, cancel: async () => ({ cancelled: true }), delegate: async () => { throw new Error('Unexpected dispatch') },
+      delegationCatalog: async () => ({ targets: [candidate], readyInstanceIds: ready ? [candidate.instanceId] : [] }),
+    }, { native: native.native })
+    owners.push(owner)
+    return async () => {
+      await owner.gatewayRequest({ operation: 'query', input: { operation: 'search' } })
+      await native.idle()
+      expect(native.errors).toEqual([])
+    }
+  }
+  let poll = open(['read', 'grep'], ['measure', 'audit'])
+  const reopen = async (tools: string[], skills: string[]) => {
+    await owner.close(); owners.splice(owners.indexOf(owner), 1)
+    poll = open(tools, skills)
+    await owner.ready
+    await poll()
+  }
+  await owner!.chat({ id: 'measurements', text: 'Independently certify the measurements.' })
+  await vi.waitFor(async () => expect((await owner.state()).departmentWaits).toHaveLength(1))
+  ready = true
+  await vi.waitFor(async () => { await poll(); expect(notices).toHaveLength(1) }, { timeout: 3000 })
+  const ticketId = notices[0]!
+  await reopen(['grep', 'read'], ['measure', 'audit'])
+  expect(notices).toEqual([ticketId])
+  await reopen(['read'], ['measure', 'audit'])
+  await vi.waitFor(async () => { await poll(); expect(notices).toEqual([ticketId, ticketId]) }, { timeout: 3000 })
+  // Skills are loaded into the prompt in order. Only the tool allowlist is unordered.
+  await reopen(['read'], ['audit', 'measure'])
+  await vi.waitFor(async () => { await poll(); expect(notices).toEqual([ticketId, ticketId, ticketId]) }, { timeout: 3000 })
+}, 20000)
 
 for (const mode of ['cleanup-failure', 'offline', 'interrupted-ready'] as const) {
   // The interrupted case reopens two complete owners, before and during the matching turn.

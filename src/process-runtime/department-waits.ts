@@ -98,12 +98,19 @@ export class DepartmentWaits {
       // A refusal applies to the work and eligible departments the owner read, independent of transport and listing order.
       const candidates = targets.map(target => [target.instanceId, target.organizationName, target.description, [...target.tools].sort()] as const)
         .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-      const matchingSignature = fingerprint([context, latest.evidenceRef, latest.summary, candidates])
+      const matchHash = (authority: string) => fingerprint([authority, latest.evidenceRef, latest.summary, candidates])
+      const matchingSignature = 'v2:' + matchHash(context)
       if (previous?.deferredReason) {
         if (previous.matchingSignature === matchingSignature) return
-        if (!previous.matchingSignature && matchesLegacyRefusal(previous, targets, assignment.resultReviews!, latest, context)) {
-          this.store.set(readyCycles(wait.id), { ...previous, matchingSignature })
-          return
+        if (!previous.matchingSignature?.startsWith('v2:')) {
+          // Old hashes used the supplied grant order. Try the current and persisted orders with today's full authority.
+          const matches = (old: string) => previous.matchingSignature ? previous.matchingSignature === matchHash(old)
+            : matchesLegacyRefusal(previous, targets, assignment.resultReviews!, latest, old)
+          if (matches(context) || matches(this.engine.departmentMatchContext(ticket, assignment, 'recorded'))
+            || matches(this.engine.departmentMatchContext(ticket, assignment, 'configured'))) {
+            this.store.set(readyCycles(wait.id), { ...previous, matchingSignature })
+            return
+          }
         }
       }
       const review = targets.length ? this.engine.stageResultReview(ticket.id, assignment.id, latest.evidenceRef, latest.summary) : latest

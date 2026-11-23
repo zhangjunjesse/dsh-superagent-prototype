@@ -10,13 +10,28 @@ import type { Assignments, WorkerReport } from './assignments.ts'
 export type ResultReportRecovery = { state: 'blocked'; summary: string; at: string }
 
 const transportFields = Symbol('review transport fields')
+const grantOrder = Symbol('recorded grant order')
+export type DepartmentMatchOrder = 'matching' | 'configured' | 'recorded'
+
+/** Only explicit permission lists are sets. Keep their configured order for execution and their old binding for upgrades. */
+export function reviewGrantSet<T extends string>(values: readonly T[], recorded?: readonly T[]) {
+  return Object.assign([...values], { [grantOrder]: recorded ?? values })
+}
 
 /** Both views retain the same authority. Only the execution fence includes transient transport observations. */
 export function withReviewTransport<T extends object, U extends object>(authority: T, transport: U) {
   return { ...authority, ...transport, [transportFields]: Object.keys(transport) }
 }
 
-function withoutTransport(_key: string, value: unknown): unknown {
+function matchingValue(value: unknown, order: DepartmentMatchOrder): unknown {
+  if (Array.isArray(value) && grantOrder in value) {
+    if (order === 'matching') return [...new Set(value)].sort()
+    if (order === 'recorded') {
+      // Restore listing order only. A historical binding must never restore a removed permission.
+      const recorded = value[grantOrder] as readonly string[]
+      return [...new Set([...recorded.filter(name => value.includes(name)), ...value])]
+    }
+  }
   if (!value || typeof value !== 'object' || !(transportFields in value)) return value
   const fields = value[transportFields] as string[]
   return Object.fromEntries(Object.entries(value).filter(([name]) => !fields.includes(name)))
@@ -26,7 +41,7 @@ function withoutTransport(_key: string, value: unknown): unknown {
 export class ResultReviews extends EnginePart {
   constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly assignments: Assignments) { super(options) }
 
-  context(ticket: Ticket, assignment: Assignment, purpose: 'execution' | 'matching' = 'execution'): string {
+  context(ticket: Ticket, assignment: Assignment, purpose: 'execution' | DepartmentMatchOrder = 'execution'): string {
     // Delivery/read receipts do not change the request. Text, routing notes, policy and authority do.
     const inputs = ticket.inputs.map(input => {
       if (input.kind !== 'trigger') return input
@@ -37,7 +52,8 @@ export class ResultReviews extends EnginePart {
       execution: ticket.execution, follows: ticket.follows, policy: this.policy().version,
       authority: this.options.resultReview?.context?.(ticket, assignment) }
     // Providers may embed a delegated binding inside other grants. Preserve every unmarked grant in either view.
-    return key('review-context', ticket.decisionId, assignment.id, JSON.stringify(material, purpose === 'matching' ? withoutTransport : undefined))
+    const json = purpose === 'execution' ? JSON.stringify(material) : JSON.stringify(material, (_key, value) => matchingValue(value, purpose))
+    return key('review-context', ticket.decisionId, assignment.id, json)
   }
   private current(ticketId: string, assignmentId: string): { ticket: Ticket; assignment: Assignment } {
     const ticket = this.require(ticketId), assignment = latestAssignment(ticket)

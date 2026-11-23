@@ -4,7 +4,7 @@ import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
-import { latestAssignment, liveTicket, type Assignment, type Ticket } from '../core/index.ts'
+import { latestAssignment, liveTicket, reviewGrantSet, type Assignment, type Ticket } from '../core/index.ts'
 import type { RuntimeNativePorts } from '../app/runtime-ports.ts'
 import type { Machine } from '../deployment.ts'
 import type { StartupObserver } from '../setup.ts'
@@ -178,7 +178,10 @@ export class OriginalProcess {
             frozen: () => this.draining || this.capabilityDrain.frozen },
           delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false },
           resultReview: {
-            context: (ticket, assignment) => ({ delegation: this.delegated.reviewContext(ticket, assignment), capabilities: this.workerCapabilities(ticket) }),
+            context: (ticket, assignment) => {
+              const capabilities = this.workerCapabilities(ticket, true)
+              return { delegation: this.delegated.reviewContext(ticket, assignment, capabilities.tools), capabilities }
+            },
             authorize: (ticket, assignment, decision) => {
               if (this.retries.pending(ticket)) throw new Error('This result review is held by the explicit retry of its original assignment')
               this.departments.authorize(ticket, assignment, decision, this.departmentTargets(ticket))
@@ -319,13 +322,12 @@ export class OriginalProcess {
     }
   }
   /** Existing task grants can only narrow; changing instance settings never grants an old task new tools or skills. */
-  private workerCapabilities(ticket: Ticket) {
+  private workerCapabilities(ticket: Ticket, forReview = false) {
     const stored = this.runtime.store.get(workerCapabilities(ticket.id)), saved = stored && WorkerCapabilityBindingSchema.parse(stored)
-    return {
-      tools: (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
-        .filter(tool => this.config.workerTools.includes(tool) && (!saved || saved.tools.some(name => name === tool))),
-      skills: (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill)),
-    }
+    const tools = (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
+      .filter(tool => this.config.workerTools.includes(tool) && (!saved || saved.tools.some(name => name === tool)))
+    const skills = (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill))
+    return { tools: forReview ? reviewGrantSet(tools, saved?.tools) : tools, skills }
   }
   /** Legacy files may stay in their original local workspace, but are never evidence for a transfer. */
   handoffArtifacts(ticket: Ticket, localAssignment?: Assignment): ArtifactReference[] {

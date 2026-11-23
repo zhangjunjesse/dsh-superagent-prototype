@@ -11,7 +11,7 @@ import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest } from './replies.ts'
 import { Tickets } from './tickets.ts'
-import { ResultReviews, type ResultReportRecovery } from './result-reviews.ts'
+import { ResultReviews, type DepartmentMatchOrder, type ResultReportRecovery } from './result-reviews.ts'
 
 export type { EngineOptions } from './part.ts'
 export type { WorkerReport } from './assignments.ts'
@@ -307,8 +307,8 @@ export class Engine {
     return this.repo.atomic(() => this.reviews.stage(ticketId, assignmentId, evidenceRef, summary, undefined, recovery))
   }
   /** Only for remembering a negative match. Acceptance and continuation use the full execution context. */
-  departmentMatchContext(ticket: Ticket, assignment: Assignment): string {
-    return this.reviews.context(ticket, assignment, 'matching')
+  departmentMatchContext(ticket: Ticket, assignment: Assignment, order: DepartmentMatchOrder = 'matching'): string {
+    return this.reviews.context(ticket, assignment, order)
   }
   /** Accept evidence or start remaining work under the existing mandate, with stale decisions refused atomically. */
   resolveResultReview(ticketId: string, assignmentId: string, reviewId: string, decision: ResultReviewDecision): Ticket {
