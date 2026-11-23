@@ -454,6 +454,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/process-engine-settings.spec.ts` | Original saved prompts in native role policies, legacy archives, task files and completed local work continuation after restart |
 | `tests/process-delegation-artifacts.spec.ts` | Fixed child provenance and verified local artifacts across the original parent/child execution chain |
 | `tests/original-task-files.spec.ts` | Historical Core directory authority and deliverable bindings without moving files or trusting an index as authorization |
+| `tests/process-legacy-continuation.spec.ts` | Reopens a pre-versioning local result in its original task directory while requiring verified versions for transfer |
+| `tests/task-files-recovery.spec.ts` | Covers snapshot publication under disk errors, interruption and concurrent writers, plus bounded reads and invalidation during transfer |
+| `tests/delegation-stop-fence.spec.ts` | Confirms stops after a rejected or unknown first submit and prevents a delayed submit from starting the cancelled work |
 | `tests/original-management.spec.ts` | Full original management dispatcher through an organization owner, real settings/prompts and management-only lifecycle |
 | `tests/local-organization-setup.spec.ts` | Original Setup and deployment for local work without mandatory GitHub, preserving configured source checks |
 | `tests/startup-stages.spec.ts`, `tests/deployment-concurrency.spec.ts` | Startup phase reporting and concurrent GitHub account and repository validation |
