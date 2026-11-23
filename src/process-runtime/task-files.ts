@@ -1,6 +1,6 @@
 /** Durable task directories and verified deliverables; neither model text nor URLs grant file access. */
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fchmodSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type BigIntStats } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { ArtifactVersionSchema, artifactIdentity, type ArtifactChunk, type ArtifactRead, type ArtifactReference, type HandoffFile } from './artifact-contract.ts'
@@ -17,6 +17,7 @@ interface TaskFilesOptions {
   assignmentExists?: (ticketId: string, assignmentId: string) => boolean
 }
 const within = (root: string, path: string) => { const part = relative(root, path); return !isAbsolute(part) && part !== '..' && !part.startsWith(`..${sep}`) }
+const fileStamp = (stat: BigIntStats) => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].join(':')
 
 /** Keeps task files and deliverables bound to the authoritative Core execution directory. */
 export class TaskFiles {
@@ -24,6 +25,8 @@ export class TaskFiles {
   private readonly root: string
   private readonly index: FileIndex
   private readonly versionsRoot: string
+  /** Bound the metadata cache; file descriptors and artifact contents are never retained. */
+  private readonly verifiedVersions = new Map<string, string>()
   constructor(stateDir: string, workspace: string, private readonly options: TaskFilesOptions = {}) {
     this.file = join(stateDir, 'task-files.json')
     this.root = realpathSync.native(workspace)
@@ -58,10 +61,12 @@ export class TaskFiles {
     if (!old) { this.index.tasks[ticketId] = { workspace: canonical, artifacts: [] }; this.save() }
     return canonical
   }
-  private save(): void {
+  private save(index = this.index): void {
     const temporary = `${this.file}.${randomUUID()}.tmp`
-    writeFileSync(temporary, JSON.stringify(this.index), { flag: 'wx', mode: 0o600 })
-    renameSync(temporary, this.file)
+    try {
+      writeFileSync(temporary, JSON.stringify(index), { flag: 'wx', mode: 0o600, flush: true })
+      renameSync(temporary, this.file)
+    } finally { rmSync(temporary, { force: true }) }
   }
   /** Existing assignments retain their original directory; they are never silently moved. */
   preserveLegacy(ids: string[]): void {
@@ -106,16 +111,16 @@ export class TaskFiles {
     const captured = verified.map(item => { const bytes = readFileSync(resolve(workspace, item.path)); return { item, bytes,
       version: { path: item.path, sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length } } })
     const bundle = createHash('sha256').update(JSON.stringify(captured.map(item => item.version).sort((a, b) => a.path.localeCompare(b.path)))).digest('hex')
+    const task = this.index.tasks[ticketId]!, versions = [...task.versions ?? []]
     if (assignmentId) for (const { item, bytes, version: capturedVersion } of captured) {
       const version = ArtifactVersionSchema.parse({ ...capturedVersion, bundle })
-      const artifact = { ...item, assignmentId, version }, file = this.versionFile(ticketId, artifact)
-      this.secureDirectory(this.versionsRoot, resolve(file, '..'))
-      if (!existsSync(file)) { writeFileSync(file, bytes, { flag: 'wx', mode: 0o400 }); chmodSync(file, 0o400) }
-      this.versionBytes(ticketId, artifact)
-      const versions = this.index.tasks[ticketId]!.versions ??= []
+      const artifact = { ...item, assignmentId, version }
+      this.publishVersion(ticketId, artifact, bytes)
       if (!versions.some(prior => prior.assignmentId === assignmentId && JSON.stringify(prior.version) === JSON.stringify(version))) versions.push(artifact)
     }
-    this.index.tasks[ticketId]!.artifacts = verified; this.save()
+    const updated = { ...task, artifacts: verified, ...(assignmentId ? { versions } : {}) }
+    this.save({ ...this.index, tasks: { ...this.index.tasks, [ticketId]: updated } })
+    this.index.tasks[ticketId] = updated
     return verified
   }
   private versionFile(ticketId: string, artifact: Pick<VersionedArtifact, 'assignmentId' | 'version'>): string {
@@ -124,21 +129,94 @@ export class TaskFiles {
   }
   private secureDirectory(root: string, directory: string): void {
     if (!within(root, directory)) throw new Error('Artifact storage escaped its managed root')
-    if (!existsSync(root)) mkdirSync(root)
+    mkdirSync(root, { recursive: true })
     if (relative(resolve(root), realpathSync.native(root)) !== '') throw new Error('Artifact storage path was replaced or linked')
     let current = root
     for (const part of relative(root, directory).split(sep).filter(Boolean)) {
       current = join(current, part)
-      if (!existsSync(current)) mkdirSync(current)
+      mkdirSync(current, { recursive: true })
       if (relative(resolve(current), realpathSync.native(current)) !== '') throw new Error('Artifact storage path was replaced or linked')
     }
   }
-  private versionBytes(ticketId: string, artifact: Pick<VersionedArtifact, 'assignmentId' | 'version'>): Buffer {
+  private publishedVersion(ticketId: string, file: string): boolean {
+    // Another registration may have committed since this owner read its index.
+    const saved = existsSync(this.file) ? JSON.parse(readFileSync(this.file, 'utf8')) as FileIndex : this.index
+    return [this.index, saved].some(index => index.tasks[ticketId]?.versions?.some(artifact => this.versionFile(ticketId, artifact) === file))
+  }
+  private publishVersion(ticketId: string, artifact: VersionedArtifact, bytes: Buffer): void {
     const file = this.versionFile(ticketId, artifact)
-    if (relative(resolve(file), realpathSync.native(file)) !== '' || !within(this.versionsRoot, realpathSync.native(file))) throw new Error('Artifact storage path was replaced or linked')
-    const bytes = readFileSync(file)
-    if (bytes.length !== artifact.version.size || createHash('sha256').update(bytes).digest('hex') !== artifact.version.sha256) throw new Error('Artifact version digest changed')
-    return bytes
+    this.secureDirectory(this.versionsRoot, resolve(file, '..'))
+    const verifyExisting = () => {
+      try { this.versionRange(ticketId, artifact, 0, 0); return true }
+      catch (error) {
+        if (!(error instanceof Error) || error.message !== 'Artifact version digest changed' || this.publishedVersion(ticketId, file)) throw error
+        return false
+      }
+    }
+    if (existsSync(file) && verifyExisting()) return
+    const temporary = `${file}.${randomUUID()}.tmp`
+    try {
+      writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o400, flush: true }); chmodSync(temporary, 0o400)
+      this.secureDirectory(this.versionsRoot, resolve(file, '..'))
+      try { linkSync(temporary, file) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        if (verifyExisting()) return
+        // Replace only an unpublished legacy partial file, with no gap at the final path.
+        // Windows needs the old read-only attribute cleared; change the verified descriptor.
+        this.versionPath(file)
+        const descriptor = openSync(file, 'r')
+        try { this.versionState(file, descriptor); fchmodSync(descriptor, 0o600) }
+        finally { closeSync(descriptor) }
+        try { renameSync(temporary, file) }
+        catch (replaceError) {
+          if (existsSync(file) && verifyExisting()) return
+          throw replaceError
+        }
+      }
+      rmSync(temporary, { force: true })
+      this.versionRange(ticketId, artifact, 0, 0)
+    } finally { rmSync(temporary, { force: true }) }
+  }
+  private versionPath(file: string): void {
+    const canonical = realpathSync.native(file)
+    if (relative(resolve(file), canonical) !== '' || !within(this.versionsRoot, canonical)) throw new Error('Artifact storage path was replaced or linked')
+  }
+  private versionState(file: string, descriptor: number): BigIntStats {
+    this.versionPath(file)
+    const stat = fstatSync(descriptor, { bigint: true })
+    if (!stat.isFile() || fileStamp(stat) !== fileStamp(statSync(file, { bigint: true }))) throw new Error('Artifact version digest changed')
+    return stat
+  }
+  private versionRange(ticketId: string, artifact: Pick<VersionedArtifact, 'assignmentId' | 'version'>, offset: number, limit: number): Buffer {
+    const file = this.versionFile(ticketId, artifact)
+    let descriptor: number | undefined
+    try {
+      this.versionPath(file); descriptor = openSync(file, 'r')
+      const stat = this.versionState(file, descriptor), stamp = fileStamp(stat), size = artifact.version.size
+      if (stat.size !== BigInt(size)) throw new Error('Artifact version digest changed')
+      if (offset > size) throw new Error('Artifact offset is outside the registered version')
+      if (this.verifiedVersions.get(file) !== stamp) {
+        const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(262144)
+        for (let position = 0; position < size;) {
+          const count = readSync(descriptor, buffer, 0, Math.min(buffer.length, size - position), position)
+          if (!count) throw new Error('Artifact version digest changed')
+          hash.update(buffer.subarray(0, count)); position += count
+        }
+        if (hash.digest('hex') !== artifact.version.sha256) throw new Error('Artifact version digest changed')
+      }
+      const bytes = Buffer.allocUnsafe(Math.min(size - offset, limit))
+      for (let position = 0; position < bytes.length;) {
+        const count = readSync(descriptor, bytes, position, bytes.length - position, offset + position)
+        if (!count) throw new Error('Artifact version digest changed')
+        position += count
+      }
+      if (fileStamp(this.versionState(file, descriptor)) !== stamp) throw new Error('Artifact version digest changed')
+      this.verifiedVersions.delete(file); this.verifiedVersions.set(file, stamp)
+      if (this.verifiedVersions.size > 128) this.verifiedVersions.delete(this.verifiedVersions.keys().next().value!)
+      return bytes
+    } catch (error) { this.verifiedVersions.delete(file); throw error }
+    finally { if (descriptor !== undefined) closeSync(descriptor) }
   }
   /** Only an exact registered version belonging to an authoritative original assignment is readable. */
   read(input: ArtifactRead): ArtifactChunk {
@@ -149,10 +227,8 @@ export class TaskFiles {
     const found = task.versions?.find(item => item.assignmentId === artifact.assignmentId
       && JSON.stringify(item.version) === JSON.stringify(artifact.version))
     if (!found) throw new Error('Artifact is not a registered version of the fixed task and assignment')
-    const bytes = this.versionBytes(artifact.ticketId, found)
-    if (offset > bytes.length) throw new Error('Artifact offset is outside the registered version')
-    const end = Math.min(bytes.length, offset + limit)
-    return { data: bytes.subarray(offset, end).toString('base64'), nextOffset: end < bytes.length ? end : null }
+    const bytes = this.versionRange(artifact.ticketId, found, offset, limit), end = offset + bytes.length
+    return { data: bytes.toString('base64'), nextOffset: end < found.version.size ? end : null }
   }
   /** The business owner imports authorized bytes into this ticket before its Worker starts, including read-only Workers. */
   async materialize(ticketId: string, artifacts: ArtifactReference[], read: (input: ArtifactRead) => Promise<ArtifactChunk>): Promise<HandoffFile[]> {
