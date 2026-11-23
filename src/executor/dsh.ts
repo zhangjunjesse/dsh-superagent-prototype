@@ -368,8 +368,9 @@ export class DshExecutor implements Executor {
    * After the ending transaction commits (so a rollback leaves the worker working, and a launch the same transaction queued
    * starts after it): ends the look at its background work, cancels its turn unless its last word was a `ready` or `dropped`
    * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
+   * A trusted owner that already verified scoped cleanup can retire bookkeeping without issuing a second stop to the reused Session.
    */
-  stop(ticket: Ticket, assignment: Assignment, reason: string): void {
+  stop(ticket: Ticket, assignment: Assignment, reason: string, executionStopped = false): void {
     this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
@@ -377,9 +378,9 @@ export class DshExecutor implements Executor {
     const sessionId = workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
       this.settling.get(ticket.id)?.abort()
-      if (!ownTurn) void this.background(this.native.cancel(sessionId, false))
+      if (!executionStopped && !ownTurn) void this.background(this.native.cancel(sessionId, false))
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
-      this.stopWork(ticket.id, reason)
+      if (!executionStopped) this.stopWork(ticket.id, reason)
       this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
     })
   }

@@ -221,9 +221,13 @@ export function mainTools(host: MainToolsHost, agent: Pick<Agent, 'id'>): Tool[]
     }),
     tool({
       name: 'orchestrator_ticket_retry',
-      description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',
+      description: 'Request a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered. The original producer stays bound until its execution is verified stopped.',
       schema: z.object({ ticket_id: z.string() }).strict(),
-      execute: async args => routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id }),
+      execute: async args => {
+        const before = host.store.tickets.get(args.ticket_id)?.assignments.at(-1)?.id, current = host.engine.retryTicket(args.ticket_id)
+        return routed(host, { reason: current.assignments.at(-1)?.id === before
+          ? 'Retry queued; verifying that the original execution has stopped before replacement' : 'Started a new assignment', ticketId: current.id })
+      },
     }),
     tool({
       name: 'orchestrator_ticket_request_status',

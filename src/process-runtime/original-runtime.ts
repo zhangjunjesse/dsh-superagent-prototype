@@ -29,6 +29,8 @@ import { CapabilityDrain, type CapabilityHold } from './capability-drain.ts'
 import type { ProcessHost, ProcessRunResult, ProcessRuntimeConfig } from './runtime.ts'
 import { executionRoot } from '../app/execution-environment.ts'
 import { DepartmentWaits } from './department-waits.ts'
+import { ExplicitRetries } from './explicit-retries.ts'
+import { fingerprint } from '../jarvis-gateway/contracts.ts'
 
 const absolute = z.string().refine(isAbsolute)
 const machineDefaults = z.object({
@@ -62,6 +64,7 @@ export interface ProcessRuntimeOptions {
 type Preparation = { prepare(id: string, text: string): Promise<ProcessRunResult>; cancel(sessionKey: string): Promise<unknown> }
 const WorkerCapabilityBindingSchema = z.object({ version: z.union([z.literal(1), z.literal(2)]), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
 const workerCapabilities = family<z.infer<typeof WorkerCapabilityBindingSchema>, [string]>('process-runtime:worker-capabilities:')
+const localRetryStops = family<{ operationId: string; decisionId: string }, [string]>('process-runtime:local-retry-stop:')
 const localHandoffs = family<{ reviewId: string; evidenceRef: string }, [string]>('process-runtime:local-handoff:')
 
 /** Validate adopted identities against the actual locked Store rather than trusting transport observations. */
@@ -93,6 +96,7 @@ export class OriginalProcess {
   readonly taskFiles: TaskFiles
   readonly capabilityDrain: CapabilityDrain
   readonly departments: DepartmentWaits
+  readonly retries: ExplicitRetries
   readonly ready: Promise<void>
   private readonly context = new Context()
   private unregister?: () => void
@@ -102,6 +106,7 @@ export class OriginalProcess {
   private quiescing?: Promise<void>
   private readyTargets = new Set<string>()
   private catalogRefresh?: Promise<void>
+  private readonly localCleanup = new Map<string, { context: string; settled: boolean; work: Promise<boolean> }>()
 
   /** Settle a catalog read admitted before the host fenced the graph. */
   async freezeTopology(operationId: string): Promise<void> {
@@ -155,26 +160,32 @@ export class OriginalProcess {
           runtime!.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 2, ...this.workerCapabilities(ticket) }))
           return ticket
         },
-        localTicket: ticket => !this.delegated.remote(ticket) && !this.departments?.held(ticket),
-        prepareHandoff: async (ticket, assignment) => this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket), async input => {
-          // A local task's registered versions retain their original binding and digest checks without a remote host.
-          if (input.artifact.instanceId === config.instanceId && input.artifact.ticketId === ticket.id) return this.taskFiles.read(input)
-          if (!host.readArtifact) throw new Error('The authenticated artifact transfer is unavailable')
-          return host.readArtifact({ ...input, ticketId: ticket.id, assignmentId: assignment.id })
-        }),
+        localTicket: ticket => !this.delegated.remote(ticket) && !this.departments?.held(ticket) && !this.retries?.pending(ticket),
+        prepareHandoff: async (ticket, assignment) => {
+          this.delegated.assertReplacement(ticket, assignment)
+          return this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket), async input => {
+            // TaskFiles verifies this local task's original registration and digest.
+            if (input.artifact.instanceId === config.instanceId && input.artifact.ticketId === ticket.id) return this.taskFiles.read(input)
+            if (!host.readArtifact) throw new Error('The authenticated artifact transfer is unavailable')
+            return host.readArtifact({ ...input, ticketId: ticket.id, assignmentId: assignment.id })
+          })
+        },
         executionHeld: () => this.draining || (this.capabilityDrain?.frozen ?? false),
         authorizeCapabilityStop: operationId => this.capabilityDrain.authorizeStop(operationId),
         engine: { resumeCompletedCommands: true,
+          retry: { request: (ticket, assignment, eligible) => this.retries.request(ticket, assignment, eligible) },
           admission: { evaluate: trigger => !this.draining && this.capabilityDrain.evaluate(trigger), resume: ticket => !this.draining && this.capabilityDrain.resume(ticket),
             frozen: () => this.draining || this.capabilityDrain.frozen },
           delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false },
           resultReview: {
             context: (ticket, assignment) => ({ delegation: this.delegated.reviewContext(ticket, assignment), capabilities: this.workerCapabilities(ticket) }),
             authorize: (ticket, assignment, decision) => {
+              if (this.retries.pending(ticket)) throw new Error('This result review is held by the explicit retry of its original assignment')
               this.departments.authorize(ticket, assignment, decision, this.departmentTargets(ticket))
               if (decision.kind === 'continue' && !this.delegated.remote(ticket, assignment)) {
                 const review = assignment.resultReviews?.at(-1), proof = runtime!.store.get(localHandoffs(assignment.id))
-                if (!review || proof?.reviewId !== review.id || proof.evidenceRef !== review.evidenceRef) throw new Error('The original Worker execution has not been verified stopped for this result')
+                if (!review || proof?.reviewId !== review.id || proof.evidenceRef !== review.evidenceRef || this.localCleanup.get(assignment.id)?.settled === false)
+                  throw new Error('The original Worker execution has not been verified stopped for this result')
               }
               this.delegated.authorizeReview(ticket, assignment, decision)
             },
@@ -213,13 +224,23 @@ export class OriginalProcess {
         executor: local => ({
           requestCancellation: ticket => this.delegated.requestCancellation(ticket.id)
             || !this.delegated.remote(ticket) && ticket.assignments.some(assignment => assignment.startedAt),
-          start: (ticket, assignment) => this.delegated.remote(ticket, assignment) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
+          start: (ticket, assignment) => {
+            this.delegated.assertReplacement(ticket, assignment)
+            return this.delegated.remote(ticket, assignment) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment)
+          },
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
           stop: (ticket, assignment, reason) => {
             if (this.delegated.remote(ticket, assignment)) this.delegated.stop(ticket, assignment)
             // A locked management owner has no loaded native execution. Its
             // guarded domain stop is durable; only the live business owner can cancel Sessions.
-            else if (!options.managementOnly) local.stop(ticket, assignment, reason)
+            else if (!options.managementOnly) {
+              const retry = runtime!.store.get(localRetryStops(assignment.id)), review = runtime!.store.get(localHandoffs(assignment.id))
+              const prepared = this.localCleanup.get(assignment.id)?.settled === true && (reason === 'retried' && retry?.decisionId === ticket.decisionId
+                || reason === 'continuedAfterReview' && !!review && review.reviewId === assignment.resultReviews?.at(-1)?.id
+                  && review.evidenceRef === assignment.resultReviews?.at(-1)?.evidenceRef)
+              local.stop(ticket, assignment, reason, prepared)
+              if (prepared) runtime!.store.afterCommit(() => { this.localCleanup.delete(assignment.id) })
+            }
           },
         }),
         reportArtifacts: (ticketId, artifacts) => {
@@ -271,6 +292,18 @@ export class OriginalProcess {
       this.departments = new DepartmentWaits(config, runtime.store, runtime.engine, runtime.sessions)
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
+      this.retries = new ExplicitRetries({ store: runtime.store, effects: runtime.effects, engine: runtime.engine,
+        paused: () => this.draining || !this.delegationReady(),
+        accepted: (ticket, assignment, operationId) => this.delegated.requestRetry(ticket, assignment, operationId),
+        prepare: async (ticket, assignment, operationId) => {
+          if (this.delegated.remote(ticket, assignment)) return this.delegated.prepareRetry(ticket.id, assignment.id, operationId)
+          const current = await this.stopLocalExecution(ticket.id, assignment.id)
+          if (current) runtime!.store.set(localRetryStops(assignment.id), { operationId, decisionId: ticket.decisionId })
+          return current
+        },
+        ready: (ticket, assignment, operationId) => this.delegated.remote(ticket, assignment)
+          ? this.delegated.retryReady(ticket, assignment, operationId)
+          : runtime!.store.get(localRetryStops(assignment.id))?.operationId === operationId && this.localCleanup.get(assignment.id)?.settled === true })
       const backend = new SourceBackend(runtime.context(kind), identity)
       this.gateway = new GatewayService(ledger, backend, identity, Date.now, { resumeCompletedCommands: true, canResumeCompleted: ticket => !this.delegated.remote(ticket) })
       this.pump = new GatewayPump(ledger, backend)
@@ -310,15 +343,37 @@ export class OriginalProcess {
     const review = assignment?.resultReviews?.at(-1)
     if (!ticket || !liveTicket(ticket) || !assignment || assignmentId && assignment.id !== assignmentId || !review || reviewId && review.id !== reviewId) throw new Error('Result review is no longer current')
     if (this.delegated.remote(ticket, assignment)) return this.delegated.prepareReview(ticketId, assignment.id, review.id)
-    const native = this.options.native.executor, sessionId = `worker-${ticketId}`
-    if (native.current(sessionId)) await native.cancel(sessionId, false)
-    await native.stopBackground(sessionId, 'The owning organization is arranging remaining work', false)
-    if (native.current(sessionId)) {
-      await native.whenIdle(sessionId)
-      if (!await native.untilQuiet(sessionId, AbortSignal.timeout(1000)) || (await native.runningJobs(sessionId)).length || native.current(sessionId)?.status !== 'idle') throw new Error('The original Worker execution cleanup has not completed')
-    }
-    await this.options.native.sessions.flush()
+    if (!await this.stopLocalExecution(ticketId, assignment.id)) throw new Error('The original Worker assignment changed while stopping execution')
     this.runtime.store.set(localHandoffs(assignment.id), { reviewId: review.id, evidenceRef: review.evidenceRef })
+  }
+  /** Review and retry share every cleanup invocation so no old stop can arrive after a replacement reuses the Worker Session. */
+  private stopLocalExecution(ticketId: string, assignmentId: string): Promise<boolean> {
+    const current = () => {
+      const ticket = this.runtime.store.tickets.get(ticketId)
+      return ticket && liveTicket(ticket) && latestAssignment(ticket)?.id === assignmentId ? ticket : undefined
+    }
+    const ticket = current()
+    if (!ticket) return Promise.resolve(false)
+    const context = fingerprint(ticket.inputs), prior = this.localCleanup.get(assignmentId)
+    const native = this.options.native.executor, sessionId = `worker-${ticketId}`
+    if (prior && (!prior.settled || prior.context === context && native.current(sessionId)?.status !== 'running')) return prior.work
+    const entry = { context, settled: false, work: Promise.resolve(false) }
+    entry.work = (async () => {
+      if (native.current(sessionId)) await native.cancel(sessionId, false)
+      if (!current()) return false
+      await native.stopBackground(sessionId, 'The owning organization is arranging replacement work', false)
+      if (!current()) return false
+      if (native.current(sessionId)) {
+        await native.whenIdle(sessionId)
+        if (!current()) return false
+        if (!await native.untilQuiet(sessionId, AbortSignal.timeout(1000)) || (await native.runningJobs(sessionId)).length || native.current(sessionId)?.status !== 'idle')
+          throw new Error('The original Worker execution cleanup has not completed')
+      }
+      await this.options.native.sessions.flush()
+      return !!current()
+    })().then(result => { entry.settled = true; return result }, error => { if (this.localCleanup.get(assignmentId) === entry) this.localCleanup.delete(assignmentId); throw error })
+    this.localCleanup.set(assignmentId, entry)
+    return entry.work
   }
   /** Catch up a catalog addition already committed by the host before validating the unchanged relationships. */
   async prepareCapabilityConfiguration(targets: readonly Capability[]): Promise<void> {

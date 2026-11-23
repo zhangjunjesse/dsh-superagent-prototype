@@ -72,7 +72,7 @@ export interface RuntimeOptions {
   localTicket?(ticket: Ticket): boolean
   workerTools?(ticket: Ticket): readonly string[]
   workerSkills?(ticket: Ticket): readonly string[]
-  engine?: Pick<EngineOptions, 'delegation' | 'resumeCompletedCommands' | 'admission' | 'resultReview'>
+  engine?: Pick<EngineOptions, 'delegation' | 'resumeCompletedCommands' | 'admission' | 'resultReview' | 'retry'>
   /** Freezes launches/continuations for an exact forced-stop confirmation; replies remain available. */
   executionHeld?(): boolean
   /** Exact owner check for durable cancellation of an already staged/accepted native input. */

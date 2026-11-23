@@ -517,7 +517,11 @@ export class ProcessRuntime {
     const { preserveDepartmentWaits } = z.object({ preserveDepartmentWaits: z.boolean().optional() }).strict().parse(raw)
     await this.ready
     await this.original.beginShutdown()
-    await this.delegated.shutdown(undefined, preserveDepartmentWaits ? ticket => this.original.departmentWaitsForTicket(ticket.id).length > 0 : undefined)
+    if (!preserveDepartmentWaits) for (const ticket of this.store.tickets.open()) {
+      if (this.original.retries.pending(ticket)) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
+    }
+    await this.delegated.shutdown(undefined, preserveDepartmentWaits
+      ? ticket => this.original.retries.pending(ticket) || this.original.departmentWaitsForTicket(ticket.id).length > 0 : undefined)
     for (const ticket of this.store.tickets.cancelling()) {
       await this.stopNativeTicket(ticket.id)
       this.engine.confirmCancellation(ticket.id)
@@ -685,7 +689,8 @@ export class ProcessRuntime {
   }
   private async shutdown(preserveDepartmentWaits = false): Promise<void> {
     this.stopping = true; clearInterval(this.timer)
-    await Promise.allSettled([...this.active.values()].map(request => this.host.cancel({ sessionKey: request.sessionKey })))
+    await Promise.all([this.original.beginShutdown(),
+      Promise.allSettled([...this.active.values()].map(request => this.host.cancel({ sessionKey: request.sessionKey })))])
     await this.inbound.close()
     await this.ticking
     if (!this.options.managementOnly) await this.drainDelegations({ preserveDepartmentWaits })

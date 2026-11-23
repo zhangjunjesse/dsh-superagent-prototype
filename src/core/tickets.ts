@@ -165,13 +165,18 @@ export class Tickets extends EnginePart {
   }
   /**
    * Ends the stalled assignment of a retryable open ticket (`failed`, `blocked`, or failed input delivery) and starts a new one.
+   * A configured retry owner can first retain this intent without ending the original assignment until scoped cleanup is ready.
    * @throws UserError when the ticket is unknown or not retryable.
    */
   retry(ticketId: string): Ticket {
     const ticket = this.require(ticketId)
     if (this.options.admission?.resume(ticket) === false) throw new Error('Task continuation is held for a pending Worker capability change')
     const latest = latestAssignment(ticket)
-    if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
+    if (!latest || !liveTicket(ticket)) throw new UserError('notRetryable')
+    if (this.options.retry) {
+      if (!this.dispatch.revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+      if (this.options.retry.request(ticket, latest, canRetry(ticket)) === 'pending') return ticket
+    } else if (!canRetry(ticket)) throw new UserError('notRetryable')
     this.endAssignment(ticket, latest, 'retried')
     this.requeueUntaken(ticket, latest)
     const assignment = this.newAssignment(ticket, latest)

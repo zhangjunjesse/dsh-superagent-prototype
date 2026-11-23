@@ -247,7 +247,11 @@ function routes(runtime: HttpHost): Routes {
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
-    'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
+    'POST tickets/:id/retry': ({ params }) => {
+      const id = ticket(params.id), before = runtime.store.tickets.get(id)!.assignments.at(-1)?.id
+      const current = runtime.engine.retryTicket(id), pending = current.assignments.at(-1)?.id === before
+      return pending ? { retried: false, pending: true } : { retried: true }
+    },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),
     'PUT settings/:block': async ({ params, body }) => {

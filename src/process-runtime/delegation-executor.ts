@@ -7,6 +7,7 @@ import { DelegationRequestSchema, verifiedArtifactLineages, verifiedDelegationAr
 import { DelegationTaskContextSchema } from '../sources/delegation-context.ts'
 import type { InboundDelegations } from './delegation-ingress.ts'
 import { ArtifactReferenceSchema, type ArtifactReference } from './artifact-contract.ts'
+import { Later } from '../app/effects.ts'
 
 export interface DelegationBinding {
   request: DelegationRequest; accepted?: boolean; stopped?: boolean; finished?: boolean;
@@ -17,6 +18,8 @@ export interface DelegationBinding {
   /** Durable cleanup proof is separate from the result being judged; stopping execution does not rewrite its evidence. */
   handoff?: { reviewId: string; evidenceRef: string; stopping: boolean; queried?: DelegationSnapshot; stopAttempted?: boolean; stopped?: DelegationSnapshot;
     error?: string; retryAt?: number; failures?: number; recoveryGeneration?: number };
+  /** An accepted ordinary retry fences inputs to the old producer until its scoped cleanup has settled. */
+  replacement?: { operationId: string; stopped?: DelegationSnapshot };
 }
 const selections = family<string, [string]>('process-delegation:route:')
 type Binding = DelegationBinding
@@ -72,7 +75,17 @@ export class DelegationExecutor {
       this.store.set(name, { ...saved, tools: saved.tools.filter(tool => workerTools.includes(tool) && target?.tools.some(name => name === tool)) })
     }
   }
+  /** An older producer stays locked until scoped cleanup is acknowledged, regardless of its stopped/finished flags. */
+  assertReplacement(ticket: Ticket, assignment: Assignment): void {
+    for (const row of this.list().filter(item => item.request.parentTicketId === ticket.id && item.request.parentAssignmentId !== assignment.id)) {
+      const proof = row.replacement?.stopped ?? row.handoff?.stopped ?? row.snapshot
+      if (!proof?.executionStopped) throw new Later('The previous assignment execution has not been verified stopped')
+      this.verify(row, proof)
+      this.stoppedSnapshot(row, proof)
+    }
+  }
   start(ticket: Ticket, assignment: Assignment): void {
+    this.assertReplacement(ticket, assignment)
     const target = this.target(ticket, assignment), capability = this.config.delegationTargets?.find(item => item.instanceId === target)
     if (!capability) throw new Error('The fixed child target is no longer configured')
     const name = this.name(ticket.id, assignment.id)
@@ -84,8 +97,14 @@ export class DelegationExecutor {
     const source = this.store.triggers.get(ticket.origin.triggerId)
     if (!source) throw new Error('A delegated task requires its actual original source record')
     const inherited = this.incoming?.forward(ticket, assignment)
-    const remaining = assignment.continuation ? `\n\n${JSON.stringify({ remaining_work: assignment.continuation,
+    const remaining = ticket.assignments.length > 1 ? `\n\n${JSON.stringify({ ...(assignment.continuation ? { remaining_work: assignment.continuation } : {}),
       previous_results: ticket.assignments.flatMap(item => item.resultReviews ?? []),
+      previous_executions: this.list().filter(row => row.request.parentTicketId === ticket.id).map(row => ({
+        delegationId: row.request.delegationId, instanceId: row.request.targetInstanceId, ticketId: row.snapshot?.ticketId,
+        assignmentId: row.snapshot?.assignmentId, status: row.snapshot?.status, summary: row.snapshot?.summary,
+        executionStopped: row.snapshot?.executionStopped === true,
+      })),
+      retry_guidance: 'Continue from retained evidence and the actual current state. Prior execution may have made changes even without registered artifacts; inspect before repeating side effects.',
       inputs: ticket.inputs.map(input => ({ ...input, ...(input.kind === 'trigger' ? { source: this.store.triggers.get(input.triggerId) } : {}) })) })}` : ''
     const taskContext = DelegationTaskContextSchema.parse({ scope: ticket.mandate.scope, strength: ticket.mandate.strength,
       handoff: this.handoffFor?.(ticket) ?? [],
@@ -131,6 +150,7 @@ export class DelegationExecutor {
     }
     const query = await this.send({ ...initial.request, operation: 'query', commandId: key(initial.request.delegationId, operationId, 'query'), text: undefined })
     let row = reload(); this.verify(row, query)
+    if (query.status === 'missing') return { query, stopped: this.stoppedSnapshot(row, query), current: !!this.current(row) && !row.stopped }
     // Cancellation supersedes a continuation's result checks, but still drains only this fixed producer.
     if (this.current(row) && !row.stopped) beforeStop?.(query)
     row = reload()
@@ -138,6 +158,30 @@ export class DelegationExecutor {
       text: 'The owning organization is stopping this exact delegated assignment. Confirm that all of its native execution has drained.' })
     row = reload(); this.verify(row, stopped)
     return { query, stopped: this.stoppedSnapshot(row, stopped), current: !!this.current(row) && !row.stopped }
+  }
+  /** Record the user's retry atomically with its Core admission, before polling can deliver more inputs to this producer. */
+  requestRetry(ticket: Ticket, assignment: Assignment, operationId: string): void {
+    if (!this.remote(ticket, assignment)) return
+    const name = this.name(ticket.id, assignment.id), row = this.store.get(name)
+    if (!row || row.request.parentDecisionId !== ticket.decisionId) throw new Error('The original retry producer binding is unavailable')
+    if (row.replacement && row.replacement.operationId !== operationId) throw new Error('The original assignment already has another retry intent')
+    this.store.set(name, { ...row, replacement: row.replacement ?? { operationId } })
+  }
+  retryReady(ticket: Ticket, assignment: Assignment, operationId: string): boolean {
+    const row = this.store.get(this.name(ticket.id, assignment.id))
+    if (!row || row.replacement?.operationId !== operationId || !row.replacement.stopped?.executionStopped || !this.current(row) || row.stopped) return false
+    this.verify(row, row.replacement.stopped); this.stoppedSnapshot(row, row.replacement.stopped)
+    return true
+  }
+  /** A retry may discover newer results; retain their actual registered versions while confirming the exact old executor stopped. */
+  async prepareRetry(ticketId: string, assignmentId: string, operationId: string): Promise<boolean> {
+    const name = this.name(ticketId, assignmentId), before = this.store.get(name)
+    if (!before || before.replacement?.operationId !== operationId) throw new Error('No explicit retry is bound to the original producer')
+    const { stopped, current } = await this.confirmStopped(ticketId, assignmentId, key('retry', operationId))
+    const row = this.store.get(name)!
+    this.store.set(name, { ...row, finished: true, snapshot: stopped,
+      replacement: { operationId, stopped }, error: undefined, retryAt: undefined })
+    return current
   }
   /** Query the exact producer before stopping it. Lost acknowledgements can retry only this binding, never create another Worker. */
   prepareReview(ticketId: string, assignmentId: string, reviewId: string): Promise<void> {
@@ -292,7 +336,8 @@ export class DelegationExecutor {
     const candidates = this.list().filter(row => (!ticketId || row.request.parentTicketId === ticketId) && (!row.finished || row.snapshot?.executionStopped !== true))
     const retained = new Set(candidates.filter(row => { const ticket = this.current(row); return ticket && preserveWait?.(ticket) }).map(row => row.request.delegationId))
     // A restart of the parent must not cancel a descendant whose original task is durably waiting for a department.
-    const rows = candidates.filter(row => !(retained.has(row.request.delegationId) && row.snapshot && verifiedDepartmentWaits(row.snapshot).length))
+    const rows = candidates.filter(row => !(retained.has(row.request.delegationId)
+      && (row.replacement || row.snapshot && verifiedDepartmentWaits(row.snapshot).length)))
     for (const row of rows) {
       const ticket = this.current(row)
       if (ticket && !retained.has(row.request.delegationId)) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
@@ -368,8 +413,9 @@ export class DelegationExecutor {
   }
   async tick(): Promise<void> {
     if (!this.send) return
-    for (const name of this.store.keys(outgoing)) {
+    bindings: for (const name of this.store.keys(outgoing)) {
       let row = this.store.get(name)!
+      if (this.retryOwns(row)) continue
       if (row.handoff && this.current(row) && !row.stopped) {
         try { await this.recoverHandoff(name) } catch (error) {
           if ((this.store.get(name)?.handoff?.retryAt ?? 0) <= Date.now()) this.failedHandoff(name, error)
@@ -382,8 +428,9 @@ export class DelegationExecutor {
         const ticket = this.current(row)
         if (!ticket && !row.stopped) { row.stopped = true; this.store.set(name, row) }
         let snapshot = await this.send({ ...row.request, operation: 'query', commandId: key(row.request.delegationId, 'query'), text: undefined })
-        this.verify(row, snapshot)
         row = this.store.get(name)!
+        if (this.retryOwns(row)) continue
+        this.verify(row, snapshot)
         if (!this.current(row)) { row.stopped = true; this.store.set(name, row) }
         // Query before every possible submit: a lost acknowledgement never creates another task.
         if (snapshot.status === 'missing') {
@@ -393,13 +440,20 @@ export class DelegationExecutor {
           if (this.frozen()) continue
           row.submitAttempted = true
           this.store.set(name, row)
-          snapshot = await this.send(row.request); this.verify(row, snapshot)
+          snapshot = await this.send(row.request)
+          row = this.store.get(name)!
+          if (this.retryOwns(row)) continue
+          this.verify(row, snapshot)
         }
         // Reload because a human stop or a new input can arrive while the IPC request is in flight.
         row = this.store.get(name)!
+        if (this.retryOwns(row)) continue
         if (row.stopped) {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
-          snapshot = await this.send(request); this.verify(row, snapshot)
+          snapshot = await this.send(request)
+          row = this.store.get(name)!
+          if (this.retryOwns(row)) continue
+          this.verify(row, snapshot)
           row.snapshot = snapshot
           this.stoppedSnapshot(row, snapshot)
           row.finished = true
@@ -409,19 +463,25 @@ export class DelegationExecutor {
           if (!current) continue
           this.controls(row, current); this.store.set(name, row)
           if (snapshot.ticketId) for (const command of Object.values(row.commands)) {
-            if (command.settled) continue
+            row = this.store.get(name)!
+            if (this.retryOwns(row)) continue bindings
+            if (row.commands[command.request.commandId]?.settled) continue
             if (this.frozen()) break
-            if (this.store.get(name)?.stopped || !this.current(row)) break
-            snapshot = await this.send(command.request); this.verify(row, snapshot)
+            if (row.stopped || !this.current(row)) break
+            snapshot = await this.send(command.request)
+            row = this.store.get(name)!
+            if (this.retryOwns(row)) continue bindings
+            this.verify(row, snapshot)
           }
           // A stop during control delivery fences late reports as well.
-          const latest = this.store.get(name)!
-          if (latest.stopped) { row.stopped = true; this.store.set(name, row); continue }
+          row = this.store.get(name)!
+          if (this.retryOwns(row) || row.stopped) continue
           this.store.atomic(() => { this.apply(row, snapshot); this.store.set(name, row) })
         }
         delete row.error; delete row.retryAt; delete row.failures; this.store.set(name, row)
       } catch (error) {
         const latest = this.store.get(name)!
+        if (this.retryOwns(latest)) continue
         const message = String(error), ticket = this.current(latest)
         if (ticket && latest.error !== message) this.engine.report(ticket.id, { state: 'blocked',
           summary: 'Child connection or command outcome is unavailable. The fixed task will be queried again; no replacement task was created.' })
@@ -431,6 +491,8 @@ export class DelegationExecutor {
       }
     }
   }
+  /** Retry owns even a retired assignment; a late ordinary poll cannot overwrite its scoped cleanup proof. */
+  private retryOwns(row: Binding): boolean { return !!row.replacement && !row.stopped }
   list() { return this.store.keys(outgoing).map(name => this.store.get(name)!) }
   result(ticketId: string): DelegationSnapshot | undefined {
     const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
