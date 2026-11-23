@@ -143,9 +143,10 @@ export class TaskFiles {
   /** Only an exact registered version belonging to an authoritative original assignment is readable. */
   read(input: ArtifactRead): ArtifactChunk {
     const { artifact, offset, limit } = input
-    this.directory(artifact.ticketId)
+    const task = this.index.tasks[artifact.ticketId]
+    if (!task || !this.authorized(artifact.ticketId, existsSync(task.workspace) ? realpathSync.native(task.workspace) : resolve(task.workspace))) throw new Error('Artifact has no matching original task execution binding')
     if (this.options.assignmentExists?.(artifact.ticketId, artifact.assignmentId) === false) throw new Error('Artifact assignment is unavailable')
-    const found = this.index.tasks[artifact.ticketId]?.versions?.find(item => item.assignmentId === artifact.assignmentId
+    const found = task.versions?.find(item => item.assignmentId === artifact.assignmentId
       && JSON.stringify(item.version) === JSON.stringify(artifact.version))
     if (!found) throw new Error('Artifact is not a registered version of the fixed task and assignment')
     const bytes = this.versionBytes(artifact.ticketId, found)
@@ -157,7 +158,8 @@ export class TaskFiles {
   async materialize(ticketId: string, artifacts: ArtifactReference[], read: (input: ArtifactRead) => Promise<ArtifactChunk>): Promise<HandoffFile[]> {
     const workspace = this.directory(ticketId), result: HandoffFile[] = []
     for (const artifact of [...new Map(artifacts.map(item => [artifactIdentity(item), item])).values()]) {
-      const path = ['.handoff', createHash('sha256').update(artifactIdentity(artifact)).digest('hex'), ...artifact.version.path.split('/')].join('/')
+      const group = artifact.version.bundle ? JSON.stringify([artifact.instanceId, artifact.ticketId, artifact.assignmentId, artifact.version.bundle]) : artifactIdentity(artifact)
+      const path = ['.handoff', createHash('sha256').update(group).digest('hex'), ...artifact.version.path.split('/')].join('/')
       const file = resolve(workspace, path)
       this.secureDirectory(workspace, resolve(file, '..'))
       if (existsSync(file)) {
@@ -175,6 +177,7 @@ export class TaskFiles {
         }
         const bytes = Buffer.concat(parts)
         if (bytes.length !== artifact.version.size || createHash('sha256').update(bytes).digest('hex') !== artifact.version.sha256) throw new Error('Transferred artifact does not match the authorized version')
+        this.secureDirectory(workspace, resolve(file, '..'))
         const temporary = `${file}.${randomUUID()}.tmp`
         writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o400 }); renameSync(temporary, file); chmodSync(file, 0o400)
       }

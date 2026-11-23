@@ -6,11 +6,11 @@
 
 `OriginalProcess.prepareReview(ticketId, target?, assignmentId?, reviewId?)` 是普通 review 和缺部门恢复共用的准备入口。远程改派先查询原固定绑定，核对同一结果证据，再向该绑定停止并取得 `executionStopped:true`。原生 turn、后台作业和子 agent 的实际清理沿 #11 的 lifecycle 路径执行；断线、结果变化、清理失败均不创建新 Assignment。停止回执与原结果分开持久保存，停止不改写待评审证据；重试仍只操作同一旧绑定。原本有人工问题的结果继续保留原 answer 路径，无人工问题的 blocked/failed 成果交管理主 Session 判断。
 
-新建 Worker capability version:2 保存组织及原上级授予的任务整体上限，每次目标分别与它取交集。旧 version:1 记录继续按已保存的窄授权限制，无法证明的历史权限不扩大。保存设置仍只能收窄已有任务。
+新建 Worker capability version:2 保存组织及原上级授予的任务整体上限，每次目标分别与它取交集。同一工单已经用过的执行目标另存其工具上限；目标后来启用工具，不会使该工单对原目标的重试扩权。旧 version:1 记录继续按已保存的窄授权限制，无法证明的历史权限不扩大。保存设置仍只能收窄已有任务。
 
 ## 成果版本与跨部门读取
 
-TaskFiles 在真实 Worker 报告登记成果时，业务代码读取实际文件并创建内容寻址快照，记录真实生产 Assignment、相对路径、字节数和 SHA-256。共同登记文件有同一 bundle，版本 URL 中的共同目录保留 HTML/CSS/图片的相对引用。历史可变文件没有版本证据时，不当作可交接版本。
+TaskFiles 在真实 Worker 报告登记成果时，业务代码读取实际文件并创建内容寻址快照，记录真实生产 Assignment、相对路径、字节数和 SHA-256。共同登记文件有同一 bundle，版本 URL 和接手方物化的共同目录均保留 HTML/CSS/图片的相对引用。原工作文件后来修改或原工作目录删除，不影响已登记快照；源 Core 的原工单/Assignment 绑定仍须存在。历史可变文件没有版本证据时，不当作可交接版本。
 
 接手业务进程在 Worker 正常 launch 前，通过私有 `artifact.transfer` IPC 请求原件。宿主先向接手进程核对当前工单/Assignment 中已有的交接授权，再定位原生产组织；原 TaskFiles 只允许读取 Core 工单中真实 Assignment 已登记的准确版本。源文件路径由受管 stateDir、工单、Assignment 和 digest 派生，拒绝替换链接和越界路径，读取时重新核对大小与 SHA-256。接手方再次核对传输字节，再原子物化到自身工单的 `.handoff/`。Worker 无须跨组织读取文件；只读 Worker 同样可正常读取本工单内的授权版本。
 
@@ -21,3 +21,13 @@ Worker 正常卡片 `execution.handoff` 的每项包含 `instanceId`、`ticketId
 基线 `00bb172` 的隔离源码导出复现：旧版本缺少不可变快照，以及旧子级工具交集污染兄弟 Inspector 的权限（缺 grep）。新真实原 Runtime/Session 联测覆盖部分成果、明确未改动、旧 Worker 仍在跑、断线拒绝后恢复、native 清理失败后恢复。接手只读 Inspector 读取自己工单的业务物化文件；源工作文件故意后改，接手字节仍与原登记 SHA 一致。#6 既有联测也改为消费正常卡片内的版本，不再通过测试共享变量读取旧 Worker 文件。
 
 日志在工作区 `.runtime/spec4/ticket-10-*.log`。最终计数以完成记录为准。本次没有部署 4318，没有调用外部真实模型；真实 Chrome 和完整部门等待验收由 #13 的联合场景单独记录，不能把本地受控模型专项当成该验收。
+
+本分支最终验证：
+
+- Node 24 类型检查与构建通过。
+- `vitest run --configLoader=native --cache=false`：委派、竞态、三层、能力配置、结果恢复、TaskFiles 与交接共 10 文件、90 项通过。包括停止期间新增输入使旧评审过期后的原件续派、已真实停止但回执丢失后的同绑定重试。
+- `node --test jarvis/process-runtime/handoff-process.test.mjs`：真实三业务进程和宿主 IPC 的受控 native 场景通过。300KB HTML 跨多块传输，只读 Inspector 消费本工单内相同 SHA 的 HTML/CSS；当前执行期间伪造其他工单引用被拒绝。
+- `node --test jarvis/process-runtime/artifact-http.test.mjs`：版本 HTML/CSS、原工作目录删除、内容篡改、其他 Assignment 和路径越界均覆盖。版本索引跨工单路径漏洞专项保留先红后绿日志。
+- `node --test --test-name-pattern='a group cancellation' jarvis/process-runtime/manager-delegation-lifecycle.test.mjs`：丢失叶子停止回执后恢复，其他任务保持运行，通过。
+
+没有执行全仓 `pnpm check`，没有推送或部署。本分支完整证据及精确提交见工作区 `ticket-10-completion.json`。

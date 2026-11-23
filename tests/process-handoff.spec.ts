@@ -14,7 +14,7 @@ afterEach(async () => {
   roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true }))
 })
 
-it.each(['partial', 'unmodified', 'disconnect', 'cleanup-failure'] as const)('hands off %s work on the same verified version under the original grant', async mode => {
+it.each(['partial', 'unmodified', 'disconnect', 'cleanup-failure', 'lost-stop-ack'] as const)('hands off %s work on the same verified version under the original grant', async mode => {
   type Id = 'management' | 'author' | 'inspector'
   const nodes = {} as Record<Id, ProcessRuntime>, natives = {} as Record<Id, ReturnType<typeof controlledNative>>
   const gate = Promise.withResolvers<void>(); release.push(() => gate.resolve())
@@ -27,7 +27,7 @@ it.each(['partial', 'unmodified', 'disconnect', 'cleanup-failure'] as const)('ha
       ...(id === 'management' ? { delegationTargets: [{ instanceId: 'author', organizationName: 'author', description: 'Produces and corrects files', tools: ['read', 'write'] },
         { instanceId: 'inspector', organizationName: 'inspector', description: 'Reads and inspects delivered versions', tools: ['read', 'grep'] }] } : { allowedParents: ['management'] }) }
   }
-  let sourceFile = '', expected = '', oldRunning = false, inspectorStarted = 0, attempts = 0, disconnected = false, cleanupFailure = false, stopRequested = false, done = false
+  let sourceFile = '', expected = '', oldRunning = false, inspectorStarted = 0, attempts = 0, disconnected = false, cleanupFailure = false, stopRequested = false, done = false, lostAck = false
   const commands: { target: string; operation: string; tools: string[] }[] = []
   function open(id: Id) {
     const host: ProcessHost = {
@@ -43,8 +43,12 @@ it.each(['partial', 'unmodified', 'disconnect', 'cleanup-failure'] as const)('ha
         commands.push({ target: request.targetInstanceId, operation: request.operation, tools: request.tools })
         if (disconnected) throw new Error('IPC connection unavailable; execution outcome unknown')
         stopRequested = request.operation === 'stop'
-        try { return ['query', 'stop'].includes(request.operation) ? await nodes[request.targetInstanceId as Id].lifecycleDelegation({ sourceInstanceId: id, request })
-          : await nodes[request.targetInstanceId as Id].delegation({ sourceInstanceId: id, request }) }
+        try {
+          const result = ['query', 'stop'].includes(request.operation) ? await nodes[request.targetInstanceId as Id].lifecycleDelegation({ sourceInstanceId: id, request })
+            : await nodes[request.targetInstanceId as Id].delegation({ sourceInstanceId: id, request })
+          if (mode === 'lost-stop-ack' && request.operation === 'stop' && !lostAck) { lostAck = true; throw new Error('The exact stop acknowledgement was lost') }
+          return result
+        }
         finally { stopRequested = false }
       },
     }
@@ -62,9 +66,9 @@ it.each(['partial', 'unmodified', 'disconnect', 'cleanup-failure'] as const)('ha
           const args = { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
             decision: { kind: 'continue', summary: 'Production cannot complete inspection; hand off the original remaining scope.', instructions: 'Inspect the exact registered version and report the tested SHA-256. Do not change the original goal.', target_instance_id: 'inspector' } }
           disconnected = mode === 'disconnect'; cleanupFailure = mode === 'cleanup-failure'
-          if (disconnected || cleanupFailure) {
+          if (disconnected || cleanupFailure || mode === 'lost-stop-ack') {
             attempts++
-            await expect(turn.tool('orchestrator_result_review', args)).rejects.toThrow(disconnected ? 'unknown' : 'cleanup fixture')
+            await expect(turn.tool('orchestrator_result_review', args)).rejects.toThrow(disconnected ? 'unknown' : cleanupFailure ? 'cleanup fixture' : 'acknowledgement was lost')
             expect((await nodes.management.state()).tickets[0]?.assignments).toHaveLength(1)
             expect(inspectorStarted).toBe(0)
             disconnected = false; cleanupFailure = false
@@ -115,5 +119,5 @@ it.each(['partial', 'unmodified', 'disconnect', 'cleanup-failure'] as const)('ha
     ['author', ['read', 'write']], ['inspector', ['read', 'grep']],
   ])
   expect(commands.findIndex(command => command.operation === 'stop' && command.target === 'author')).toBeLessThan(commands.findIndex(command => command.operation === 'submit' && command.target === 'inspector'))
-  expect(inspectorStarted).toBe(1); expect(attempts).toBe(['disconnect', 'cleanup-failure'].includes(mode) ? 1 : 0)
+  expect(inspectorStarted).toBe(1); expect(attempts).toBe(['disconnect', 'cleanup-failure', 'lost-stop-ack'].includes(mode) ? 1 : 0)
 }, 18000)
