@@ -153,7 +153,7 @@ export type AdmissionCell = 'listedUnaddressed' | 'unlistedAddressed' | 'unliste
 export type AcceptMode = 'off' | 'observe' | 'auto'
 /** Native execution capabilities supported by the host's delegation adapter. Selection does not grant task authority. */
 export const DELEGATION_TOOLS = ['read', 'glob', 'grep', 'read_image', 'write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch'] as const
-/** Host-verified, single-hop authority inherited from one accepted parent task; never supplied by a model. */
+/** Host-verified authority inherited from one accepted direct parent's task; never supplied by a model. */
 export interface DelegationAuthority {
   delegationId: string
   parentInstanceId: string

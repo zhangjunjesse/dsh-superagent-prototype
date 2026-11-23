@@ -1,6 +1,6 @@
 /** Composition of the original complete application in an independent organization owner. */
 import { Context } from '@deepseek-ai/cordis'
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
@@ -26,6 +26,7 @@ import { TaskFiles, artifactLinks } from './task-files.ts'
 import { effectiveWorkerTools, WorkerSkillsSchema, WorkerToolSchema } from './worker-capabilities.ts'
 import { CapabilityDrain, type CapabilityHold } from './capability-drain.ts'
 import type { ProcessHost, ProcessRunResult, ProcessRuntimeConfig } from './runtime.ts'
+import { executionRoot } from '../app/execution-environment.ts'
 
 const absolute = z.string().refine(isAbsolute)
 const machineDefaults = z.object({
@@ -142,9 +143,10 @@ export class OriginalProcess {
           : this.runtime.sources.scope(input) },
         routing: {
           targets: async trigger => {
-            if (trigger.source === 'delegation') return []
             await this.refreshDelegationCatalog()
-            return (config.delegationTargets ?? []).filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
+            const ceiling = this.inbound.toolsForTrigger(trigger)
+            return (config.delegationTargets ?? []).map(target => ({ ...target, tools: target.tools.filter(tool => !ceiling || ceiling.includes(tool)) }))
+              .filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
           },
           prepare: async (id, target) => { if (target && !this.delegated.selected(id)) await this.refreshDelegationCatalog() },
           select: (id, target) => this.delegated.select(id, target),
@@ -180,7 +182,7 @@ export class OriginalProcess {
       this.inbound = new InboundDelegations(config, runtime.store, runtime.engine,
         { ...preparation, admitted: id => this.capabilityDrain.prepare(id), acceptNew: () => this.delegationReady() })
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
-        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools)
+        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound)
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
       const backend = new SourceBackend(runtime.context(kind), identity)
@@ -264,8 +266,12 @@ export class OriginalProcess {
   }
   /** The original admission owner is available without consuming or disturbing current work. */
   delegationReady(): boolean {
-    return !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
+    const available = !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
       && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId
+    if (!available) return false
+    try { return [this.config.stateDir, this.config.workspace, executionRoot(this.runtime.store.settings(), this.runtime.machine.stateDir)]
+      .every(directory => statSync(directory).isDirectory()) }
+    catch { return false }
   }
   close(): Promise<void> { return this.closing ??= this.shutdown() }
   /** Fence original admission and drain the original pass/source owners without closing their Store. */
