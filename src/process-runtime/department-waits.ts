@@ -1,6 +1,6 @@
 /** Durable coordination on an original unresolved result review, not a second task lifecycle. */
 import { randomUUID } from 'node:crypto'
-import { key, latestAssignment, liveTicket, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
+import { key, latestAssignment, liveTicket, type Assignment, type ResultReview, type ResultReviewDecision, type Ticket } from '../core/index.ts'
 import type { Engine } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import type { Sessions } from '../app/sessions.ts'
@@ -11,9 +11,17 @@ import type { Capability, DepartmentWait } from './delegation-contract.ts'
 const waits = family<DepartmentWait, [string]>('process-department:wait:')
 interface ReadyCycle {
   signature: string; generation: number; targets: string[]; owner?: string; decideBy?: number; deferredReason?: string; retryAt?: number; failures?: number
+  matchingSignature?: string
 }
 const readyCycles = family<ReadyCycle, [string]>('process-department:readiness:')
 const readyAttempt = (waitId: string, cycle: ReadyCycle) => key('department-ready', waitId, String(cycle.generation), cycle.signature)
+
+/** Older cycles hashed the review and the candidate list together. Reuse a refusal only if both can be proved. */
+function matchesLegacyRefusal(cycle: ReadyCycle, targets: Capability[], reviews: ResultReview[], latest: ResultReview, context: string): boolean {
+  const oldOrder = [...targets].sort((a, b) => cycle.targets.indexOf(a.instanceId) - cycle.targets.indexOf(b.instanceId))
+  return reviews.some(entry => entry.contextRef === context && entry.evidenceRef === latest.evidenceRef && entry.summary === latest.summary
+    && fingerprint([entry.id, oldOrder]) === cycle.signature)
+}
 
 /** A wait belongs to the exact task and assignment that discovered it; only its original owner can resume it. */
 export class DepartmentWaits {
@@ -83,18 +91,35 @@ export class DepartmentWaits {
     for (const wait of this.active()) this.store.atomic(() => {
       const ticket = this.current(wait)!, assignment = latestAssignment(ticket)!, latest = assignment.resultReviews!.at(-1)!
       const targets = targetsFor(ticket).filter(target => wait.requiredTools.every(tool => target.tools.some(name => name === tool)))
+      const previous = this.store.get(readyCycles(wait.id))
       // A wait retains its instructions. Only the executor can publish replacement evidence or restore a superseded report.
       if (targets.length && assignment.report?.summary !== latest.summary) return
+      const context = this.engine.departmentMatchContext(ticket, assignment)
+      // A refusal applies to the work and eligible departments the owner read, independent of transport and listing order.
+      const candidates = targets.map(target => [target.instanceId, target.organizationName, target.description, [...target.tools].sort()] as const)
+        .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      const matchingSignature = fingerprint([context, latest.evidenceRef, latest.summary, candidates])
+      if (previous?.deferredReason) {
+        if (previous.matchingSignature === matchingSignature) return
+        if (!previous.matchingSignature && matchesLegacyRefusal(previous, targets, assignment.resultReviews!, latest, context)) {
+          this.store.set(readyCycles(wait.id), { ...previous, matchingSignature })
+          return
+        }
+      }
       const review = targets.length ? this.engine.stageResultReview(ticket.id, assignment.id, latest.evidenceRef, latest.summary) : latest
-      const signature = fingerprint([review.id, targets]), previous = this.store.get(readyCycles(wait.id))
+      const signature = fingerprint([review.id, targets])
       const now = Date.now()
-      if (previous?.signature === signature) {
-        if (!targets.length || previous.deferredReason) return
+      if (previous?.signature === signature && !previous.matchingSignature && previous.deferredReason) {
+        this.store.set(readyCycles(wait.id), { ...previous, matchingSignature })
+        return
+      }
+      if (previous?.signature === signature && !previous.deferredReason) {
+        if (!targets.length) return
         // A delivered card may have been interrupted before a decision. Preserve pending delivery and active reasoning.
         const retryAt = previous.retryAt ?? (previous.owner === this.owner ? previous.decideBy : undefined)
         if ((retryAt ?? 0) > now || !this.canReoffer(readyAttempt(wait.id, previous))) return
       }
-      const cycle: ReadyCycle = { signature, generation: (previous?.generation ?? 0) + 1, owner: this.owner,
+      const cycle: ReadyCycle = { signature, matchingSignature, generation: (previous?.generation ?? 0) + 1, owner: this.owner,
         decideBy: now + 60_000, targets: targets.map(target => target.instanceId),
         ...(previous?.signature === signature && previous.failures ? { failures: previous.failures } : {}) }
       this.store.set(readyCycles(wait.id), cycle)

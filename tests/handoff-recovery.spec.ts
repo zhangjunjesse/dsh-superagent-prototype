@@ -27,7 +27,8 @@ const result = (request: DelegationRequest, patch: Partial<DelegationSnapshot> =
   childInstanceId: 'author', ticketId: 'author-ticket', assignmentId: 'author-assignment', status: 'completed',
   summary: 'The registered result is produced; original validation remains.', receipts: {}, artifacts: [artifact], ...patch,
 })
-function owner(store: Store, send: (request: DelegationRequest) => Promise<DelegationSnapshot>, targets = config.delegationTargets) {
+function owner(store: Store, send: (request: DelegationRequest) => Promise<DelegationSnapshot>, targets = config.delegationTargets,
+  grants?: () => string[]) {
   let proxy: DelegationExecutor
   const reviews: { id: string; evidenceRef: string }[] = []
   const policy: Policy = { version: 'original-policy', paused: false, evalTimeoutMs: 60000,
@@ -36,7 +37,7 @@ function owner(store: Store, send: (request: DelegationRequest) => Promise<Deleg
     assessor: { request: vi.fn() }, outbox: { send: vi.fn(), withdraw: vi.fn(), status: () => undefined },
     executor: { start: (ticket, assignment) => { if (proxy.remote(ticket, assignment)) proxy.start(ticket, assignment) }, deliver: vi.fn(),
       requestCancellation: ticket => proxy.requestCancellation(ticket.id), stop: (ticket, assignment) => proxy.stop(ticket, assignment) },
-    resultReview: { context: (ticket, assignment) => proxy.reviewContext(ticket, assignment),
+    resultReview: { context: (ticket, assignment) => ({ delegation: proxy.reviewContext(ticket, assignment), skills: grants?.() }),
       authorize: (ticket, assignment, decision) => proxy.authorizeReview(ticket, assignment, decision),
       request: (_ticket, _assignment, review) => { reviews.push({ id: review.id, evidenceRef: review.evidenceRef }) } } })
   proxy = new DelegationExecutor({ ...config, delegationTargets: targets }, store, engine, send, () => false, () => true)
@@ -53,6 +54,80 @@ function accept(h: ReturnType<typeof owner>) {
   h.engine.receive(trigger); h.proxy.select(trigger.id, 'author')
   return h.engine.decide(trigger.id, { kind: 'accept', title: trigger.text, scope: trigger.text, reason: 'Explicit bounded original request' }).ticketId!
 }
+
+it('remembers a department mismatch through a producer outage and SQLite restart, but reopens a changed offer', async () => {
+  const db = database(), cards: { review_id: string; ready_attempt_id: string }[] = []
+  let offline = false, summary = 'Draft ready for validation', skills = ['verify']
+  const send = async (request: DelegationRequest) => {
+    if (offline) throw new Error('temporarily offline')
+    return result(request, { status: 'blocked', summary })
+  }
+  function open(store: Store) {
+    const h = owner(store, send, config.delegationTargets, () => skills)
+    const waits = new DepartmentWaits({ instanceId: 'management', organizationName: 'Management' }, store, h.engine,
+      { relay: (_id, text) => { cards.push(JSON.parse(text)) } })
+    return { ...h, waits }
+  }
+  let h = open(db.item.store)
+  const ticketId = accept(h)
+  await h.proxy.tick()
+  const assignment = latestAssignment(db.item.store.tickets.get(ticketId)!)!, review = assignment.resultReviews!.at(-1)!
+  h.waits.hold(ticketId, assignment.id, review.id, { responsibility: 'Validate the draft', required_tools: ['read'],
+    instructions: 'Inspect the published version.' }, 'Validation remains.')
+  const invoice: Capability = { instanceId: 'finance', organizationName: 'Finance', description: 'Reads invoices', tools: ['read', 'grep'] }
+  const hr: Capability = { instanceId: 'hr', organizationName: 'HR', description: 'Reads payroll', tools: ['read'] }
+  const defer = (card: typeof cards[number]) => h.waits.defer(ticketId, assignment.id, card.review_id, card.ready_attempt_id, 'No matching responsibility.')
+  h.waits.reconcile(() => [hr, invoice])
+  expect(cards).toHaveLength(1)
+  defer(cards[0]!)
+  h = open(db.reopen())
+  offline = true
+  await h.proxy.tick()
+  expect(h.proxy.list()[0]?.error).toBeTruthy()
+  const sameCandidates = () => [{ ...invoice, tools: [...invoice.tools].reverse() }, hr]
+  h.waits.reconcile(sameCandidates)
+  expect(cards).toHaveLength(1)
+  offline = false
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2000)
+  await h.proxy.tick()
+  expect(h.proxy.list()[0]?.error).toBeUndefined()
+  h.waits.reconcile(sameCandidates)
+  expect(cards).toHaveLength(1)
+  summary = 'The producer has submitted new results'
+  await h.proxy.tick()
+  h.waits.reconcile(sameCandidates)
+  expect(cards).toHaveLength(2)
+  expect(() => defer(cards[0]!)).toThrow('current')
+  defer(cards[1]!)
+  const changedRole = () => [hr, { ...invoice, description: 'Verifies the delivered version' }]
+  h.waits.reconcile(changedRole)
+  expect(cards).toHaveLength(3)
+  expect(() => defer(cards[1]!)).toThrow('current')
+  defer(cards[2]!)
+  h.waits.reconcile(changedRole)
+  expect(cards).toHaveLength(3)
+  const candidateAdded = () => [...changedRole(), { ...hr, instanceId: 'audit', organizationName: 'Audit' }]
+  h.waits.reconcile(candidateAdded)
+  expect(cards).toHaveLength(4)
+  defer(cards[3]!)
+  const change: Trigger = { ...db.item.store.triggers.get('original-request')!, id: 'updated-request', threads: [{ source: 'jarvis', id: 'update' }],
+    text: 'Also verify the invoice totals.', dispatch: { commandId: 'change', payloadHash: 'change', operation: 'append', expectedInitialRecipients: [],
+      targetTicketId: ticketId, controlPrecondition: { mandateDecisionId: db.item.store.tickets.get(ticketId)!.decisionId } } }
+  h.engine.receive(change); h.engine.attach(ticketId, change.id)
+  h.waits.reconcile(candidateAdded)
+  expect(cards).toHaveLength(5)
+  expect(() => defer(cards[3]!)).toThrow('current')
+  defer(cards[4]!)
+  skills = []
+  h.waits.reconcile(candidateAdded)
+  expect(cards).toHaveLength(6)
+  expect(() => defer(cards[4]!)).toThrow('current')
+  defer(cards[5]!)
+  h.waits.reconcile(() => [])
+  h.waits.reconcile(candidateAdded)
+  expect(cards).toHaveLength(7)
+  expect(db.item.store.tickets.get(ticketId)!.assignments).toHaveLength(1)
+})
 
 it.each(['completed', 'blocked'] as const)('hands off the latest %s child artifact after a department wait survives restart', async status => {
   const db = database(), inspector: Capability = { instanceId: 'inspector', organizationName: 'Inspector', description: 'Validate the file', tools: ['read'] }

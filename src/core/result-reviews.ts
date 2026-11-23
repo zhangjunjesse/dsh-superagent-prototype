@@ -9,20 +9,35 @@ import type { Assignments, WorkerReport } from './assignments.ts'
 /** A trusted executor may replace only this exact stale transport projection, never a newer report. */
 export type ResultReportRecovery = { state: 'blocked'; summary: string; at: string }
 
+const transportFields = Symbol('review transport fields')
+
+/** Both views retain the same authority. Only the execution fence includes transient transport observations. */
+export function withReviewTransport<T extends object, U extends object>(authority: T, transport: U) {
+  return { ...authority, ...transport, [transportFields]: Object.keys(transport) }
+}
+
+function withoutTransport(_key: string, value: unknown): unknown {
+  if (!value || typeof value !== 'object' || !(transportFields in value)) return value
+  const fields = value[transportFields] as string[]
+  return Object.fromEntries(Object.entries(value).filter(([name]) => !fields.includes(name)))
+}
+
 /** Holds executor evidence until the owner judges the original goal; decisions and continuation commit atomically. */
 export class ResultReviews extends EnginePart {
   constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly assignments: Assignments) { super(options) }
 
-  private context(ticket: Ticket, assignment: Assignment): string {
+  context(ticket: Ticket, assignment: Assignment, purpose: 'execution' | 'matching' = 'execution'): string {
     // Delivery/read receipts do not change the request. Text, routing notes, policy and authority do.
     const inputs = ticket.inputs.map(input => {
       if (input.kind !== 'trigger') return input
       const { readAt: _read, deliveredAt: _at, deliveredTo: _to, ...material } = input
       return { ...material, trigger: this.repo.triggers.get(input.triggerId) }
     })
-    return key('review-context', ticket.decisionId, assignment.id, JSON.stringify({ inputs, mandate: ticket.mandate,
+    const material = { inputs, mandate: ticket.mandate,
       execution: ticket.execution, follows: ticket.follows, policy: this.policy().version,
-      authority: this.options.resultReview?.context?.(ticket, assignment) }))
+      authority: this.options.resultReview?.context?.(ticket, assignment) }
+    // Providers may embed a delegated binding inside other grants. Preserve every unmarked grant in either view.
+    return key('review-context', ticket.decisionId, assignment.id, JSON.stringify(material, purpose === 'matching' ? withoutTransport : undefined))
   }
   private current(ticketId: string, assignmentId: string): { ticket: Ticket; assignment: Assignment } {
     const ticket = this.require(ticketId), assignment = latestAssignment(ticket)

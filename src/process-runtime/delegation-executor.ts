@@ -1,5 +1,5 @@
 /** Proxy executor: persistent bindings and polling, without occupying a local Worker slot. */
-import { Engine, key, latestAssignment, liveTicket, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
+import { Engine, key, latestAssignment, liveTicket, withReviewTransport, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
@@ -135,9 +135,10 @@ export class DelegationExecutor {
   /** Included in the Core review CAS so changed evidence, transport uncertainty or narrowed capabilities invalidate it. */
   reviewContext(ticket: Ticket, assignment: Assignment): unknown {
     const target = this.target(ticket, assignment), row = this.store.get(this.name(ticket.id, assignment.id))
-    return { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
-      ...(row ? { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped, error: row.error,
-        ...(row.handoff?.recoveryGeneration ? { recoveryGeneration: row.handoff.recoveryGeneration } : {}) } : {}) }
+    const authority = { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
+      ...(row && { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped }) }
+    return withReviewTransport(authority, { error: row?.error,
+      ...(row?.handoff?.recoveryGeneration ? { recoveryGeneration: row.handoff.recoveryGeneration } : {}) })
   }
   /** Query and drain only an existing producer binding; the caller persists proof and decides whether its intent is still current. */
   async confirmStopped(ticketId: string, assignmentId: string, operationId: string, beforeStop?: (query: DelegationSnapshot) => void): Promise<{

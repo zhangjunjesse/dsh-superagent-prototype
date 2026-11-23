@@ -3,7 +3,7 @@ import { UserError } from './errors.ts'
 import { Dispatches } from './dispatch.ts'
 import { isoTime, latestAssignment, liveTicket } from './model.ts'
 import { key } from './ids.ts'
-import type { ChannelRef, CommandReceipt, ConsumptionReceipt, Decision, PolicyEffect, ResultReview, ResultReviewDecision, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Assignment, ChannelRef, CommandReceipt, ConsumptionReceipt, Decision, PolicyEffect, ResultReview, ResultReviewDecision, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -305,6 +305,10 @@ export class Engine {
   /** A verified executor result waits for the owner; recovery can replace only the named stale transport report. */
   stageResultReview(ticketId: string, assignmentId: string, evidenceRef: string, summary: string, recovery?: ResultReportRecovery): ResultReview {
     return this.repo.atomic(() => this.reviews.stage(ticketId, assignmentId, evidenceRef, summary, undefined, recovery))
+  }
+  /** Only for remembering a negative match. Acceptance and continuation use the full execution context. */
+  departmentMatchContext(ticket: Ticket, assignment: Assignment): string {
+    return this.reviews.context(ticket, assignment, 'matching')
   }
   /** Accept evidence or start remaining work under the existing mandate, with stale decisions refused atomically. */
   resolveResultReview(ticketId: string, assignmentId: string, reviewId: string, decision: ResultReviewDecision): Ticket {
