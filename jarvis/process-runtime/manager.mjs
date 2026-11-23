@@ -915,17 +915,23 @@ export class ProcessManager {
     if ((await sourcePeer.call('artifact.authorize', input, 15000))?.authorized !== true) throw new Error('Artifact has no current task grant');
     current();
     const target = this.instance(input.artifact.instanceId), request = { artifact: input.artifact, offset: input.offset, limit: input.limit };
-    let result;
-    if (target.phase === 'running' && target.peer) {
+    const readLive = async () => {
       const peer = target.peer, producerGeneration = target.generation;
-      result = await peer.call('artifact.read', request, 30000);
-      if (target.peer !== peer || target.generation !== producerGeneration) throw new Error('Artifact producer generation changed during the read');
-    } else result = await this.exclusive(target, async () => {
-      if (target.phase !== 'stopped' || target.child || target.bridge || target.native || target.cleanupPending) await this.stopInstance(target);
+      const chunk = await peer.call('artifact.read', request, 30000);
+      if (target.phase !== 'running' || target.peer !== peer || target.generation !== producerGeneration) throw new Error('Artifact producer generation changed during the read');
+      return chunk;
+    };
+    const result = target.phase === 'running' && target.peer ? await readLive() : await this.exclusive(target, async () => {
+      current();
+      if (target.phase === 'running' && target.peer) return readLive();
+      if (target.child || target.bridge || target.native || target.cleanupPending || !['stopped', 'failed'].includes(target.phase))
+        throw new Error('Artifact producer lifecycle has not settled');
       const owner = target.management ?? await this.openManagement(target);
       try { return await owner.peer.call('artifact.read', request, 30000); }
       finally { await this.closeManagement(target); }
     }, { kind: 'management', queue: true });
+    current();
+    if ((await sourcePeer.call('artifact.authorize', input, 15000))?.authorized !== true) throw new Error('Artifact has no current task grant');
     current();
     return result;
   }
