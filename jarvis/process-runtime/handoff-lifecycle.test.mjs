@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { handoffLifecycle } from './handoff-lifecycle-fixture.mjs';
+import { handoffLifecycle, handoffStep } from './handoff-lifecycle-fixture.mjs';
 
 async function fixture(t, closeMode = 'normal', closeDelay = 0, timeouts = {}) {
   function launchChild() {
@@ -99,5 +99,29 @@ test('forced cleanup fences later recovery-owner spawns from a still-pending clo
   await assert.rejects(lifecycle.run(async () => {}), error => error.phase === 'shutdown');
   await assert.rejects(manager.openManagement(), /Forced test cleanup forbids opening another management owner/);
   assert.equal(children.length, 2, 'no additional OS process may be spawned after cleanup');
+  assertExited(children);
+});
+
+test('a late startup reply cannot start another owner or submit after the handoff deadline', { timeout: 10000 }, async t => {
+  const { lifecycle, manager, children } = await fixture(t, 'normal', 0, { handoffTimeoutMs: 30 });
+  const releaseStartup = Promise.withResolvers(), callbackSettled = Promise.withResolvers(), actions = [];
+  let callbackError;
+  try {
+    await assert.rejects(lifecycle.run(async signal => {
+      try {
+        await handoffStep(signal, () => { actions.push('start:author'); return releaseStartup.promise; });
+        await handoffStep(signal, async () => { actions.push('start:management'); await manager.openManagement(); });
+        await handoffStep(signal, () => { actions.push('submit'); });
+      } catch (error) { callbackError = error; throw error; }
+      finally { callbackSettled.resolve(); }
+    }), error => error.phase === 'handoff');
+  } finally {
+    // Return the startup reply only after the timeout has already closed both original OS owners.
+    releaseStartup.resolve(); await callbackSettled.promise;
+  }
+  t.diagnostic(JSON.stringify({ actions, actualProcessCount: children.length, callbackError: callbackError?.message }));
+  assert.deepEqual(actions, ['start:author']);
+  assert.equal(children.length, 2, 'a late reply must not spawn an additional OS owner');
+  assert.match(callbackError.message, /handoff timed out after 30ms/);
   assertExited(children);
 });

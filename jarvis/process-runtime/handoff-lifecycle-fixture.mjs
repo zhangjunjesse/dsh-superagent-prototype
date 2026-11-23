@@ -8,6 +8,14 @@ export const HANDOFF_TIMEOUT_MS = 30000;
 export const SHUTDOWN_TIMEOUT_MS = 60000;
 const CLEANUP_TIMEOUT_MS = 5000;
 
+/** Fence both entry and continuation: an accepted startup can reply after the handoff deadline and cleanup. */
+export async function handoffStep(signal, operation) {
+  signal.throwIfAborted();
+  const result = await operation();
+  signal.throwIfAborted();
+  return result;
+}
+
 async function phase(name, timeoutMs, operation, checkpoint) {
   const started = performance.now(), controller = new AbortController();
   checkpoint(`${name}-started`, { timeoutMs });

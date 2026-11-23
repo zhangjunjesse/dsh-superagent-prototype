@@ -7,7 +7,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ProcessManager } from './manager.mjs';
 import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
-import { handoffLifecycle } from './handoff-lifecycle-fixture.mjs';
+import { handoffLifecycle, handoffStep } from './handoff-lifecycle-fixture.mjs';
 
 for (const stoppedProducer of [false, true]) test(stoppedProducer
   ? 'a running receiving Worker reads the same multi-block version through reopened stopped-producer owners'
@@ -228,24 +228,25 @@ test('a waiting management task resumes once from the newer registered B and its
   let handoffEvidence;
   try {
     const shutdown = await lifecycle.run(async signal => {
-      await manager.start('author'); await manager.start('management');
-      await manager.gateway('management', { operation: 'submit', input: { operation: 'new', request: { quote: goal, summary: goal } },
-        origin: { conversationId: 'updated-handoff', userMessageId: 'original', text: goal, at: new Date().toISOString(), source: 'user' } });
+      await handoffStep(signal, () => manager.start('author')); await handoffStep(signal, () => manager.start('management'));
+      await handoffStep(signal, () => manager.gateway('management', { operation: 'submit', input: { operation: 'new', request: { quote: goal, summary: goal } },
+        origin: { conversationId: 'updated-handoff', userMessageId: 'original', text: goal, at: new Date().toISOString(), source: 'user' } }));
       const waiting = await until(signal, () => manager.state('management'), state => state.departmentWaits.length === 1 && !!waitId, 'management did not retain the original A review');
       const original = waiting.tickets[0], producer = (await manager.state('author')).tickets[0];
       assert.equal(waiting.departmentWaits[0].ticketId, original.id); assert.equal(waiting.departmentWaits[0].reviewId, firstReview.id);
       assert.equal(producer.ended, undefined); assert.equal(producer.attention, undefined); assert.equal(producer.assignments.length, 1);
       assert.equal(manager.instance('inspector').phase, 'stopped'); assert.deepEqual(workers.map(item => item.instanceId), ['author']);
       checkpoint('management-waiting-on-A', { waiting, producer });
-      releaseB.resolve();
+      signal.throwIfAborted(); releaseB.resolve();
       const updated = await until(signal, () => manager.state('management'), state => reportedB && state.delegations.outgoing.some(row =>
         row.snapshot?.summary?.includes(hashB) && row.snapshot.artifacts?.some(file => file.version?.sha256 === hashB)), 'registered B did not return through the original delegation');
       assert.equal(updated.tickets[0].id, original.id); assert.equal(updated.tickets[0].assignments.length, 1);
       assert.equal((await manager.state('author')).tickets[0].id, producer.id);
       assert.equal((await manager.state('author')).tickets[0].assignments.length, 1);
+      signal.throwIfAborted();
       checkpoint('registered-B-returned-before-inspector-start', { updated, firstReview });
       writeFileSync(sourceFile, 'unregistered source mutation after B');
-      await manager.start('inspector');
+      await handoffStep(signal, () => manager.start('inspector'));
       const completed = await until(signal, () => manager.state('management'), state => delivered && resumed.length === 1
         && state.tickets[0]?.ended?.outcome === 'completed', 'original management task did not accept the actual B inspection');
       const final = completed.tickets[0];
