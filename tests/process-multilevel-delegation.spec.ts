@@ -154,6 +154,26 @@ describe('nested organization delegation through the complete original runtimes'
     finally { renameSync(`${directory}-unavailable`, directory) }
     expect(h.calls.filter(call => call.role === 'worker')).toEqual([])
   })
+  it('returns a request for additional authority to the original group conversation while other chat continues', async () => {
+    const question = 'The approved tools cannot search the archive. Can you name the file to read within the original grant?'
+    const h = organizationChain(async turn => {
+      await expect(turn.authorize('grep')).rejects.toThrow()
+      await turn.tool('orchestrator_report', { state: 'blocked', summary: 'Need the group to choose how to continue.', human_action: question })
+    })
+    await h.nodes.group.chat({ id: 'original', text: 'Read the original marker and produce the authorized result in development.' })
+    const group = await h.until(value => value.tickets[0]?.attention?.question === question
+      && value.events.items.some(event => event.kind === 'question' && event.text.includes(question)))
+    for (const state of [group, await h.nodes.management.state(), await h.nodes.development.state()]) {
+      expect(state.tickets).toHaveLength(1)
+      expect(state.tickets[0]?.attention?.question).toBe(question)
+      expect(state.tickets[0]?.ended).toBeUndefined()
+    }
+    expect(group.events.items.filter(event => event.kind === 'question' && event.attentionId === group.tickets[0]!.attention!.id)).toHaveLength(1)
+    const reply = await h.nodes.group.chat({ id: 'unrelated', text: 'hello while waiting' })
+    expect(reply).toMatchObject({ status: 'complete', assistant: 'Hello, the task is still tracked.' })
+    expect(h.transport.filter(call => call.request.operation === 'submit')).toHaveLength(2)
+  }, 10000)
+
   it('routes once through management and development and reports the leaf result back in order', async () => {
     const h = organizationChain()
     const turn = await h.nodes.group.chat({ id: 'original', text: 'Read the original marker and produce the authorized result in development.' })
