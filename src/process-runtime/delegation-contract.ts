@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { WorkerToolSchema } from './worker-capabilities.ts'
 import { DelegationTaskContextSchema } from '../sources/delegation-context.ts'
+import { ArtifactVersionSchema } from './artifact-contract.ts'
 export { DelegationTaskContextSchema, type DelegationTaskContext } from '../sources/delegation-context.ts'
 
 const id = z.string().min(1).max(200)
@@ -67,9 +68,11 @@ export const DelegationRequestSchema = z.object({
 export type DelegationRequest = z.infer<typeof DelegationRequestSchema>
 export interface DelegationEnvelope { sourceInstanceId: string; request: DelegationRequest }
 export const VerifiedArtifactSchema = z.object({ instanceId: id, ticketId: id, title: z.string().min(1).max(1000),
-  url: z.string().min(1).max(15000), downloadUrl: z.string().min(1).max(15020) }).strict().refine(item => {
+  url: z.string().min(1).max(15000), downloadUrl: z.string().min(1).max(15020), assignmentId: id.optional(), version: ArtifactVersionSchema.optional() }).strict().refine(item => {
   const prefix = `/jarvis/api/system/${encodeURIComponent(item.instanceId)}/artifacts/${encodeURIComponent(item.ticketId)}/`
+  const path = item.version && item.assignmentId ? `@version/${encodeURIComponent(item.assignmentId)}/${item.version.bundle ?? item.version.sha256}/${item.version.path.split('/').map(encodeURIComponent).join('/')}` : undefined
   return item.url.startsWith(prefix) && item.url.length > prefix.length && !/[?#]/.test(item.url) && item.downloadUrl === `${item.url}?download=1`
+    && (!item.version || !!item.assignmentId && item.url === prefix + path)
 }, 'Artifact URL does not match its fixed instance and ticket')
 export type VerifiedArtifact = z.infer<typeof VerifiedArtifactSchema>
 export interface DelegationSnapshot {

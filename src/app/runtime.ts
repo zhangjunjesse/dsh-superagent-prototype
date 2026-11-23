@@ -13,7 +13,7 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, reasonText, type EngineForSettings, type EngineOptions, type Executor, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, reasonText, type Assignment, type EngineForSettings, type EngineOptions, type Executor, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -85,9 +85,10 @@ export interface RuntimeOptions {
     /** Refresh trusted availability before the synchronous target selection transaction. */
     prepare?(triggerId: string, target?: string): Promise<void>
     select(triggerId: string, target?: string): void
-    prepareReview?(ticketId: string, target?: string): Promise<void>
+    prepareReview?(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void>
   }
   reportArtifacts?: ExecutorToolsHost['reportArtifacts']
+  prepareHandoff?(ticket: Ticket, assignment: Assignment): Promise<unknown[]>
   /** Runs after Store/composition is established, before initialize resolves setup. */
   initialize?(runtime: Runtime): void
 }
@@ -186,7 +187,7 @@ export class Runtime extends Service implements SourceHost {
       this.githubConnection = new GithubConnection({ stateDir: machine.stateDir, settings: this.settings, lifetime: this.lifetime })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         native: options.native?.executor, workerEnvironment: () => setup.workerEnvironment,
-        localTicket: options.localTicket,
+        localTicket: options.localTicket, prepareHandoff: options.prepareHandoff,
         prepareCommand: (ticket, configured) => options.localTasks && sourceTrigger({ store }, ticket)?.source !== 'github' ? '' : configured,
         workspaceContext: options.localTasks ? ticket => ({ kind: sourceTrigger({ store }, ticket)?.source === 'github' ? 'github' : 'local',
           directory: ticket.execution?.directory ?? '', ...(sourceTrigger({ store }, ticket)?.source === 'github' ? { repository: setup.deployment.repository } : {}) }) : undefined,

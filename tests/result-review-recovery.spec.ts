@@ -30,7 +30,8 @@ function owner(store: Store) {
       authorize: (ticket, assignment, decision) => proxy.authorizeReview(ticket, assignment, decision) } })
   const send = vi.fn(async (request: DelegationRequest): Promise<DelegationSnapshot> => ({ delegationId: request.delegationId,
     parentTicketId: request.parentTicketId, parentAssignmentId: request.parentAssignmentId, childInstanceId: 'child',
-    ticketId: 'child-ticket', assignmentId: 'child-assignment', status: 'completed', summary: 'Repair revision abc, validation outstanding.', receipts: {} }))
+    ticketId: 'child-ticket', assignmentId: 'child-assignment', status: 'completed', summary: 'Repair revision abc, validation outstanding.', receipts: {},
+    ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
   proxy = new DelegationExecutor(config, store, engine, send, () => false, () => true)
   return { effects, engine, proxy, send, local }
 }
@@ -59,6 +60,7 @@ it('recovers the pending relay and one immutable continuation from the original 
   expect(recovered.proxy.list()[0]!.request).toEqual(originalBinding)
   const decision = { kind: 'continue' as const, summary: 'The exact revision needs validation.', instructions: 'Validate revision abc without repeating the repair.' }
   const current = () => openedOwner.store.tickets.get(ticketId)!
+  await recovered.proxy.prepareReview(ticketId, assignment.id, review.id)
   recovered.engine.resolveResultReview(ticketId, assignment.id, review.id, decision)
   recovered.engine.resolveResultReview(ticketId, assignment.id, review.id, decision)
   expect(recovered.local).toHaveBeenCalledTimes(1)

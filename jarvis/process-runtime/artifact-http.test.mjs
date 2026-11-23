@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import { handleArtifactRequest } from './artifact-http.mjs';
 
 test('verified local outputs open and download; undeclared files and path escapes never serve', async t => {
@@ -43,12 +44,24 @@ test('verified local outputs open and download; undeclared files and path escape
   mkdirSync(original); writeFileSync(join(original, 'result.html'), 'Original validated artifact');
   const db = new DatabaseSync(join(stateDir, 'orchestrator.sqlite'));
   db.exec('CREATE TABLE ticket (id TEXT PRIMARY KEY, value TEXT NOT NULL)');
-  db.prepare('INSERT INTO ticket VALUES (?,?)').run('ticket', JSON.stringify({ execution: { directory: original } }));
+  db.prepare('INSERT INTO ticket VALUES (?,?)').run('ticket', JSON.stringify({ execution: { directory: original }, assignments: [{ id: 'producer-a' }] }));
   db.close();
   index.tasks.ticket = { workspace: original, artifacts: [{ path: 'result.html' }] };
   writeFileSync(join(stateDir, 'task-files.json'), JSON.stringify(index));
   const historical = await fetch(url + 'result.html');
   assert.equal(historical.status, 200); assert.equal(await historical.text(), 'Original validated artifact');
+  const bytes = Buffer.from('Verified immutable result'), sha256 = createHash('sha256').update(bytes).digest('hex');
+  const snapshotDirectory = join(stateDir, 'task-artifact-versions', createHash('sha256').update('ticket').digest('hex'),
+    createHash('sha256').update('producer-a').digest('hex'), sha256);
+  mkdirSync(snapshotDirectory, { recursive: true }); writeFileSync(join(snapshotDirectory, 'result.html'), bytes);
+  index.tasks.ticket.versions = [{ path: 'result.html', assignmentId: 'producer-a', version: { path: 'result.html', sha256, size: bytes.length } }];
+  writeFileSync(join(stateDir, 'task-files.json'), JSON.stringify(index));
+  writeFileSync(join(original, 'result.html'), 'Later source mutation');
+  const versionUrl = `${url}@version/producer-a/${sha256}/result.html`, versioned = await fetch(versionUrl);
+  assert.equal(versioned.status, 200); assert.equal(await versioned.text(), bytes.toString());
+  assert.equal((await fetch(`${url}@version/other-assignment/${sha256}/result.html`)).status, 404);
+  writeFileSync(join(snapshotDirectory, 'result.html'), 'Corrupted snapshot');
+  assert.equal((await fetch(versionUrl)).status, 409);
   // Changing the external path in an artifact index alone cannot grant access.
   index.tasks.ticket = { workspace: root, artifacts: [{ path: 'secret.txt' }] };
   writeFileSync(join(stateDir, 'task-files.json'), JSON.stringify(index));

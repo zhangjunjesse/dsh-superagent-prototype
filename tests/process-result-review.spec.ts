@@ -46,6 +46,10 @@ it.each(['local', 'child'] as const)('reviews a repair, continues %s validation,
         return { status: 'complete', text: 'Work accepted.' }
       },
       cancel: async () => ({ cancelled: true }),
+      readArtifact: async input => {
+        nodes[id].authorizeArtifact(input)
+        return nodes[input.artifact.instanceId as 'parent' | 'child'].readArtifact({ artifact: input.artifact, offset: input.offset, limit: input.limit })
+      },
       delegationCatalog: async () => ({ targets: configs[id].delegationTargets ?? [],
         readyInstanceIds: id === 'parent' && (await nodes.child.delegationReadiness()).ready ? ['child'] : [] }),
       delegate: async request => {
@@ -103,8 +107,13 @@ it.each(['local', 'child'] as const)('reviews a repair, continues %s validation,
           const ticket = await turn.tool('orchestrator_read', { resource: `ticket/${card.ticket_id}` }) as { trigger_id: string }
           expect(await originalText(turn, `delegation/${ticket.trigger_id}/assignment`)).toContain(revision)
         }
-        validatedRevision = digest(repairedFile)
-        expect(readFileSync(repairedFile, 'utf8')).toBe('repaired-marker-v1\n')
+        const handoff = card.execution.handoff as { path: string; version: { sha256: string } }[]
+        expect(handoff).toHaveLength(1)
+        const received = join(turn.policy.cwd, handoff[0]!.path)
+        expect(received).not.toBe(repairedFile)
+        validatedRevision = digest(received)
+        expect(validatedRevision).toBe(handoff[0]!.version.sha256)
+        expect(readFileSync(received, 'utf8')).toBe('repaired-marker-v1\n')
         writeFileSync(join(turn.policy.cwd, 'validation.txt'), `tested_sha256=${validatedRevision}\nobserved=repaired-marker-v1\npassed=true\n`)
         await turn.tool('orchestrator_report', { state: 'ready', summary: `Validation passed for sha256 ${validatedRevision}; observed the repaired marker.`,
           artifacts: [{ path: 'validation.txt', title: 'Versioned validation evidence' }] })

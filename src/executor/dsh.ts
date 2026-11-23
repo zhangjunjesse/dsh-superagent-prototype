@@ -82,6 +82,7 @@ export interface ExecutorHost {
   workspaceContext?(ticket: Ticket): { kind: 'local' | 'github'; directory: string; repository?: string }
   /** False for an assignment owned by a configured child Executor, including during recovery. */
   localTicket?(ticket: Ticket): boolean
+  prepareHandoff?(ticket: Ticket, assignment: Assignment): Promise<unknown[]>
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
@@ -473,6 +474,8 @@ export class DshExecutor implements Executor {
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
     await this.stopped(ticket.id)
     if (!current()) return
+    const handoff = await this.host.prepareHandoff?.(ticket, assignment)
+    if (!current()) return
     // A message put back for this Assignment may still wait in the Session, kept by a restart's cancel or persisted across a
     // crash, where this launch's message would take it into a step beside the copy delivered next: that copy is the only one.
     await this.native.removePending(agent.id, (this.host.store.tickets.get(ticket.id)?.undelivered ?? []).map(id => this.host.sessions.promptedId(id)))
@@ -490,7 +493,7 @@ export class DshExecutor implements Executor {
     if (!current()) return
     const batch = told ? [] : batchOf(this.host, ticket).map(batchLine)
     const execution = this.host.workspaceContext?.(ticket)
-    const context = execution ? { execution } : {}
+    const context = execution ? { execution: { ...execution, ...(handoff?.length ? { handoff } : {}) } } : {}
     const continuation = assignment.continuation ? { remaining_work: capped(assignment.continuation.instructions, ASSIGNMENT_CHARS,
       `ticket/${ticket.id}/continuation/${assignment.id}`), review_id: assignment.continuation.reviewId,
       evidence: `ticket/${ticket.id}/assignments` } : {}

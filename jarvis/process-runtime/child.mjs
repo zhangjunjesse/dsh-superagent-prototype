@@ -27,6 +27,7 @@ async function initialize(config, managementOnly = false) {
         // admission is revoked, including a management-only recovery owner.
         delegate: input => managementOnly || closing ? peer.call('delegation.send', input) : native.wire.call('delegate', input),
         delegationCatalog: () => peer.call('delegation.catalog', {}, 15000),
+        readArtifact: input => peer.call('artifact.transfer', input, 30000),
       }, { native, managementOnly, adoption, capabilityHold, delegationLimits,
         startup: managementOnly ? undefined : async update => {
           await peer.call('runtime.startup', update, 5000);
@@ -59,6 +60,8 @@ const peer = new ProcessPeer(process, {
   'delegation.readiness': input => runtime ? runtime.delegationReadiness(input) : { ready: false },
   'lifecycle.delegation': input => runtime.lifecycleDelegation(input),
   'lifecycle.drain': () => runtime.drainDelegations(),
+  'artifact.authorize': input => requireRuntime().authorizeArtifact(input),
+  'artifact.read': input => runtime.readArtifact(input),
   management: input => requireRuntime().management(input),
   'capabilities.hold': input => requireRuntime().capabilitiesHold(input),
   'capabilities.activity': input => requireRuntime().capabilitiesActivity(input),

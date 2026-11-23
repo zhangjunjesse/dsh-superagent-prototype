@@ -24,6 +24,8 @@ import { originalConfigurationMigrations } from './original-config.ts'
 import { executionRoot } from '../app/execution-environment.ts'
 import { textPage } from '../app/context.ts'
 import { CapabilityHoldSchema, type CapabilityTask } from './capability-drain.ts'
+import { ArtifactReadSchema, ArtifactTransferSchema, artifactIdentity, type ArtifactChunk, type ArtifactRead } from './artifact-contract.ts'
+export { ArtifactReadSchema, ArtifactReferenceSchema, ArtifactTransferSchema } from './artifact-contract.ts'
 export { DelegationRequestSchema } from './delegation-contract.ts'
 export { WORKER_TOOL_NAMES, WorkerSkillsSchema, effectiveWorkerTools } from './worker-capabilities.ts'
 export { EngineConfigSchema, normalizeEngineConfig, defaultEngineConfig } from './engine-config.ts'
@@ -61,6 +63,8 @@ export interface ProcessHost {
   delegate?(request: DelegationRequest): Promise<DelegationSnapshot>
   /** Authenticated host observation; model tools cannot supply a catalog or readiness. */
   delegationCatalog?(): Promise<DelegationCatalog>
+  /** Private host transfer. Source authorization and producer registration are checked by the actual business owners. */
+  readArtifact?(input: ArtifactRead & { ticketId: string; assignmentId: string }): Promise<ArtifactChunk>
 }
 export interface ProcessToolCall {
   sessionKey: string; role: ProcessRole; requestId: string; name: string; args: unknown
@@ -422,6 +426,20 @@ export class ProcessRuntime {
     const artifacts = [...this.taskFiles.links(this.config.instanceId, ticketId).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId })),
       ...this.delegated.artifacts(ticketId)]
     return [...new Map(artifacts.map(item => [item.url, item])).values()]
+  }
+  /** The host checks this again for every transfer chunk; a model cannot supply an additional handoff grant. */
+  authorizeArtifact(raw: unknown): { authorized: true } {
+    const input = ArtifactTransferSchema.parse(raw)
+    const ticket = this.store.tickets.get(input.ticketId), assignment = ticket && latestAssignment(ticket)
+    if (!ticket || !liveTicket(ticket) || assignment?.id !== input.assignmentId || assignment.state === 'ended'
+      || !this.original.handoffArtifacts(ticket).some(item => artifactIdentity(item) === artifactIdentity(input.artifact))) throw new Error('Artifact has no authorized handoff in the current task assignment')
+    return { authorized: true }
+  }
+  /** Only fixed registered producer/task/assignment/version references are served; paths are derived under the producer root. */
+  readArtifact(raw: unknown): ArtifactChunk {
+    const input = ArtifactReadSchema.parse(raw)
+    if (input.artifact.instanceId !== this.config.instanceId) throw new Error('Artifact producer identity does not match this owner')
+    return this.taskFiles.read(input)
   }
   async delegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     await this.ready
