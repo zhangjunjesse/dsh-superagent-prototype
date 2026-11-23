@@ -7,6 +7,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ProcessManager } from './manager.mjs';
 import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
+import { handoffLifecycle } from './handoff-lifecycle-fixture.mjs';
 
 for (const stoppedProducer of [false, true]) test(stoppedProducer
   ? 'a running receiving Worker reads the same multi-block version through reopened stopped-producer owners'
@@ -101,7 +102,7 @@ for (const stoppedProducer of [false, true]) test(stoppedProducer
   } finally { await manager.close(); }
 });
 
-test('a waiting management task resumes once from the newer registered B and its inspector reads the exact bytes', { timeout: 30000 }, async t => {
+test('a waiting management task resumes once from the newer registered B and its inspector reads the exact bytes', async t => {
   const base = resolve('.artifacts/handoff/process'); mkdirSync(base, { recursive: true });
   const rootDir = mkdtempSync(join(base, 'updated-producer-')), workers = [], preparations = [], transfers = [], resumed = [];
   t.diagnostic(`Waiting management task and real B transfer evidence: ${rootDir}`);
@@ -121,7 +122,7 @@ test('a waiting management task resumes once from the newer registered B and its
   let sourceFile, waitId, firstReview, readyReview, received, reportedB = false, delivered = false;
   const log = row => appendFileSync(join(rootDir, 'trace.jsonl'), JSON.stringify({ at: new Date().toISOString(), ...row }) + '\n');
   const checkpoint = (phase, extra = {}) => {
-    const record = JSON.stringify({ phase, hashA, hashB, ...extra }, null, 2);
+    const record = JSON.stringify({ phase, at: new Date().toISOString(), hashA, hashB, ...extra }, null, 2);
     writeFileSync(join(rootDir, `${phase}.json`), record); writeFileSync(join(rootDir, 'progress.json'), record);
   };
   async function read(tool, resource) {
@@ -213,47 +214,54 @@ test('a waiting management task resumes once from the newer registered B and its
   manager.readArtifact = async (source, generation, input) => {
     transfers.push({ source: source.config.instanceId, input }); return transfer(source, generation, input);
   };
-  async function until(readValue, predicate, label) {
+  async function until(signal, readValue, predicate, label) {
     let value;
     for (let attempt = 0; attempt < 400; attempt++) {
+      signal.throwIfAborted();
       assert.deepEqual(native.errors.map(error => error.stack), []);
-      value = await readValue(); if (predicate(value)) return value;
-      await delay(25);
+      value = await readValue(); signal.throwIfAborted(); if (predicate(value)) return value;
+      await delay(25, undefined, { signal });
     }
     assert.fail(`${label}: ${JSON.stringify(value)}`);
   }
+  const lifecycle = handoffLifecycle(manager, checkpoint);
+  let handoffEvidence;
   try {
-    await manager.start('author'); await manager.start('management');
-    await manager.gateway('management', { operation: 'submit', input: { operation: 'new', request: { quote: goal, summary: goal } },
-      origin: { conversationId: 'updated-handoff', userMessageId: 'original', text: goal, at: new Date().toISOString(), source: 'user' } });
-    const waiting = await until(() => manager.state('management'), state => state.departmentWaits.length === 1 && !!waitId, 'management did not retain the original A review');
-    const original = waiting.tickets[0], producer = (await manager.state('author')).tickets[0];
-    assert.equal(waiting.departmentWaits[0].ticketId, original.id); assert.equal(waiting.departmentWaits[0].reviewId, firstReview.id);
-    assert.equal(producer.ended, undefined); assert.equal(producer.attention, undefined); assert.equal(producer.assignments.length, 1);
-    assert.equal(manager.instance('inspector').phase, 'stopped'); assert.deepEqual(workers.map(item => item.instanceId), ['author']);
-    checkpoint('management-waiting-on-A', { waiting, producer });
-    releaseB.resolve();
-    const updated = await until(() => manager.state('management'), state => reportedB && state.delegations.outgoing.some(row =>
-      row.snapshot?.summary?.includes(hashB) && row.snapshot.artifacts?.some(file => file.version?.sha256 === hashB)), 'registered B did not return through the original delegation');
-    assert.equal(updated.tickets[0].id, original.id); assert.equal(updated.tickets[0].assignments.length, 1);
-    assert.equal((await manager.state('author')).tickets[0].id, producer.id);
-    assert.equal((await manager.state('author')).tickets[0].assignments.length, 1);
-    checkpoint('registered-B-returned-before-inspector-start', { updated, firstReview });
-    writeFileSync(sourceFile, 'unregistered source mutation after B');
-    await manager.start('inspector');
-    const completed = await until(() => manager.state('management'), state => delivered && resumed.length === 1
-      && state.tickets[0]?.ended?.outcome === 'completed', 'original management task did not accept the actual B inspection');
-    const final = completed.tickets[0];
-    assert.equal(delivered, true); assert.deepEqual(native.errors, []); assert.deepEqual(received, bytesB);
-    assert.equal(final.id, original.id); assert.equal(final.decisionId, original.decisionId); assert.deepEqual(final.mandate, original.mandate);
-    assert.equal(final.assignments.length, 2); assert.equal(final.assignments[1].executionTarget, 'inspector');
-    assert.deepEqual(workers.map(item => item.instanceId), ['author', 'inspector']);
-    assert.deepEqual(preparations.map(item => item.instanceId), ['author', 'inspector']); assert.equal(resumed.length, 1);
-    assert.equal(completed.delegations.outgoing.filter(row => row.request.targetInstanceId === 'inspector').length, 1);
-    assert.equal(completed.departmentWaits.length, 0);
-    assert.ok(transfers.length >= 2); assert.ok(transfers.some(item => item.input.offset === 262144));
-    assert.ok(transfers.every(item => item.source === 'inspector' && item.input.artifact.instanceId === 'author' && item.input.artifact.version.sha256 === hashB));
-    checkpoint('complete', { original, completed, firstReview, readyReview, workers, preparations, resumed, transfers, receivedBytes: received.length });
+    const shutdown = await lifecycle.run(async signal => {
+      await manager.start('author'); await manager.start('management');
+      await manager.gateway('management', { operation: 'submit', input: { operation: 'new', request: { quote: goal, summary: goal } },
+        origin: { conversationId: 'updated-handoff', userMessageId: 'original', text: goal, at: new Date().toISOString(), source: 'user' } });
+      const waiting = await until(signal, () => manager.state('management'), state => state.departmentWaits.length === 1 && !!waitId, 'management did not retain the original A review');
+      const original = waiting.tickets[0], producer = (await manager.state('author')).tickets[0];
+      assert.equal(waiting.departmentWaits[0].ticketId, original.id); assert.equal(waiting.departmentWaits[0].reviewId, firstReview.id);
+      assert.equal(producer.ended, undefined); assert.equal(producer.attention, undefined); assert.equal(producer.assignments.length, 1);
+      assert.equal(manager.instance('inspector').phase, 'stopped'); assert.deepEqual(workers.map(item => item.instanceId), ['author']);
+      checkpoint('management-waiting-on-A', { waiting, producer });
+      releaseB.resolve();
+      const updated = await until(signal, () => manager.state('management'), state => reportedB && state.delegations.outgoing.some(row =>
+        row.snapshot?.summary?.includes(hashB) && row.snapshot.artifacts?.some(file => file.version?.sha256 === hashB)), 'registered B did not return through the original delegation');
+      assert.equal(updated.tickets[0].id, original.id); assert.equal(updated.tickets[0].assignments.length, 1);
+      assert.equal((await manager.state('author')).tickets[0].id, producer.id);
+      assert.equal((await manager.state('author')).tickets[0].assignments.length, 1);
+      checkpoint('registered-B-returned-before-inspector-start', { updated, firstReview });
+      writeFileSync(sourceFile, 'unregistered source mutation after B');
+      await manager.start('inspector');
+      const completed = await until(signal, () => manager.state('management'), state => delivered && resumed.length === 1
+        && state.tickets[0]?.ended?.outcome === 'completed', 'original management task did not accept the actual B inspection');
+      const final = completed.tickets[0];
+      assert.equal(delivered, true); assert.deepEqual(native.errors, []); assert.deepEqual(received, bytesB);
+      assert.equal(final.id, original.id); assert.equal(final.decisionId, original.decisionId); assert.deepEqual(final.mandate, original.mandate);
+      assert.equal(final.assignments.length, 2); assert.equal(final.assignments[1].executionTarget, 'inspector');
+      assert.deepEqual(workers.map(item => item.instanceId), ['author', 'inspector']);
+      assert.deepEqual(preparations.map(item => item.instanceId), ['author', 'inspector']); assert.equal(resumed.length, 1);
+      assert.equal(completed.delegations.outgoing.filter(row => row.request.targetInstanceId === 'inspector').length, 1);
+      assert.equal(completed.departmentWaits.length, 0);
+      assert.ok(transfers.length >= 2); assert.ok(transfers.some(item => item.input.offset === 262144));
+      assert.ok(transfers.every(item => item.source === 'inspector' && item.input.artifact.instanceId === 'author' && item.input.artifact.version.sha256 === hashB));
+      handoffEvidence = { original, completed, firstReview, readyReview, workers, preparations, resumed, transfers, receivedBytes: received.length };
+      checkpoint('handoff-verified', handoffEvidence);
+    }, () => releaseB.resolve());
+    assert.deepEqual(shutdown.processes.filter(row => row.owner === 'business').map(row => row.instanceId).sort(), ['author', 'inspector', 'management']);
+    checkpoint('complete', { ...handoffEvidence, shutdown });
   } catch (error) { checkpoint('failed', { error: error.stack, firstReview, readyReview, workers, transfers }); throw error; }
-  finally { releaseB.resolve(); await manager.close(); }
 });
