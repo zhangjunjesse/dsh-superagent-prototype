@@ -69,8 +69,9 @@ test('a group cancellation survives a lost leaf acknowledgement and leaves unrel
       return original(source, generation, request, options);
     };
     const text = 'Cancel only this task';
-    await manager.gateway('alpha', { operation:'submit', input: { operation:'stop', targetToken:work.targetToken, request:{quote:text,summary:text} },
-      origin:{conversationId:'controlled:alpha',userMessageId:'cancel-1',text,at:new Date().toISOString(),source:'user'} });
+    const cancellation = await manager.gateway('alpha', { operation:'submit', input: { operation:'stop', targetToken:work.targetToken, request:{quote:text,summary:text} },
+      origin:{conversationId:'controlled:alpha',userMessageId:'cancel-1',selectedWorkRef:group.workRef,text,at:new Date().toISOString(),source:'user'} });
+    assert.equal(cancellation.status, 'queued');
     await until(query, item => observed && item.status === 'cancelling');
     assert.equal((await manager.state('gamma')).tickets.every(item => !item.ended), true);
     connected = true;
