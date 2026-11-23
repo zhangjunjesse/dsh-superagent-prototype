@@ -344,6 +344,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
 | `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
+| `src/app/department-requirement.ts` | Required department responsibility, tools and remaining instructions used by the original routing and review tools |
 | `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role |
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
@@ -388,14 +389,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/jarvis-gateway/index.ts` | Optional same-process Gateway plugin, configuration, Source registration, service exposure and bounded reconciliation lifecycle |
-| `src/process-runtime/runtime.ts` | Independent organization entry, durable user conversations and the complete original Runtime with single-hop delegation |
+| `src/process-runtime/runtime.ts` | Independent organization entry, durable user conversations, delegated results and scoped cancellation through each business owner |
 | `src/process-runtime/original-runtime.ts` | Original Runtime composition, native-port adaptation, source registration, management lifecycle and verified root adoption |
 | `src/process-runtime/original-config.ts` | Lossless legacy configuration archive and original Settings/Prompts initialization and migration through their real version mechanisms |
 | `src/process-runtime/engine-config.ts` | Legacy five-section schema and defaults retained for validation and migration archives |
 | `src/process-runtime/task-files.ts` | Durable deliverables and file access bound to the original Core execution directory |
 | `src/process-runtime/worker-capabilities.ts` | Shared supported Worker tool and selected-skill configuration schemas |
 | `src/process-runtime/capability-drain.ts` | Durable configuration admission holds, exact active-work projection and confirmed stopping through the original Runtime and Engine |
-| `src/process-runtime/delegation-contract.ts` | Strict single-hop machine command, capability catalog and task snapshot contracts |
+| `src/process-runtime/delegation-contract.ts` | Machine commands, direct capability catalogs, linked assignments and the ancestry of verified results |
+| `src/process-runtime/department-waits.ts` | Original ticket waits, durable readiness notifications and authority checks before a department can take over |
+| `src/process-runtime/artifact-contract.ts` | Producer, assignment, digest and chunk bounds for versioned handoff files |
 | `src/process-runtime/delegation-ingress.ts` | Durable authenticated child ingress, isolated preparation, core admission and command receipts |
 | `src/process-runtime/delegation-executor.ts` | Fixed parent Assignment to child binding, proxy controls, result reconciliation and completion fences |
 | `src/jarvis-gateway/contracts.ts` | Submit/query schemas, trusted user-turn identity, immutable commands and targets, feedback delivery contracts, reference matching and stable hashes |
@@ -465,6 +468,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/process-delegation-races.spec.ts` | Late input and rejected-control completion fences, stop during missing-query, transport failure visibility and recovery |
 | `tests/process-result-review.spec.ts` | Original native main Session judges a partial repair, continues local or child validation, checks the actual file revision, retains evidence and accepts before the original Channel receives a result |
 | `tests/process-multilevel-delegation.spec.ts` | Two-hop admission with ancestor authority, leaf execution, management review and restart without duplicate delivery |
+| `tests/process-department-waits.spec.ts` | Waiting before execution or after partial delivery, matching a newly ready direct department and resuming the same ticket |
+| `tests/process-handoff.spec.ts` | Verified producer cleanup, retries and handoff of immutable files to a different authorized Worker |
 | `tests/process-topology.spec.ts` | Idle and busy organization moves, frozen admission and restart with the committed parent |
 | `tests/result-review-recovery.spec.ts` | Real SQLite/Effects resume one pending review and one immutable continuation; followed-thread close cannot bypass parent acceptance |
 | `tests/process-live-routing.spec.ts` | Live child discovery, readiness at selection and admission, and continuity of existing assignments |

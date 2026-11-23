@@ -205,7 +205,8 @@ export class OriginalProcess {
           prepareReview: (id, target, assignmentId, reviewId) => this.prepareReview(id, target, assignmentId, reviewId),
         },
         executor: local => ({
-          requestCancellation: ticket => this.delegated.requestCancellation(ticket.id),
+          requestCancellation: ticket => this.delegated.requestCancellation(ticket.id)
+            || !this.delegated.remote(ticket) && ticket.assignments.some(assignment => assignment.startedAt),
           start: (ticket, assignment) => this.delegated.remote(ticket, assignment) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
           stop: (ticket, assignment, reason) => {
