@@ -145,6 +145,11 @@ const confirmedCapabilityWork = (fresh, expected) => fresh.instances.every(item 
   return prior && prior.ownerId === item.ownerId && prior.generation === item.generation && item.work.every(work => prior.work.some(old => old.id === work.id && old.kind === work.kind));
 });
 const capabilityConflict = message => Object.assign(new Error(message), { status: 409 });
+function topologyBlocked(tasks) {
+  const status = { awaiting_input: '等待人工', blocked: '等待处理', stopping: '取消收尾中', running: '执行中', queued: '排队中', preparing: '交接中' };
+  const labels = tasks.slice(0, 12).map(task => `${task.name}：${String(task.title || task.kind || '未结束工作').slice(0, 200)}（${status[task.status] || task.status || '待收尾'}${task.ticketId ? `，工单 ${task.ticketId}` : ''}）`);
+  return capabilityConflict(`请等待相关组织的旧工单与会话结束后再移动：${labels.join('；')}${tasks.length > 12 ? `；另有 ${tasks.length - 12} 项` : ''}。旧工单继续沿原路径处理。`);
+}
 
 /** DSH owns this manager; each configured business runtime has its own OS process and durable state. */
 export class ProcessManager {
@@ -156,6 +161,7 @@ export class ProcessManager {
     this.instances = configuration(config.instances ?? [], this.rootDir); this.closing = false; this.reconfiguring = false;
     this.capabilityHolds = new Map(); this.foregroundRequests = new Map(); this.capabilitySnapshots = new Map(); this.capabilityOwnerId = randomUUID(); this.capabilityStopsStarted = new Set();
     this.capabilityTransitions = new Set();
+    this.topologyTransitions = new Set();
     this.lifecycleParticipants = new Map(Object.entries(lifecycleParticipants)); this.lifecycleOwnerId = randomUUID();
     const holds = Array.isArray(initialCapabilityHolds) ? initialCapabilityHolds : Object.entries(initialCapabilityHolds).map(([instanceId, operationId]) => ({ instanceId, operationId }));
     for (const hold of holds) {
@@ -316,6 +322,110 @@ export class ProcessManager {
     this.reconfiguration = operation;
     try { return await operation; }
     finally { this.reconfiguring = false; if (this.reconfiguration === operation) this.reconfiguration = undefined; }
+  }
+  /** Move an existing organization under a fenced, fully inspected graph without replacing its identity. */
+  async reconfigureTopology(rawInstances, { persist = () => {}, inspectIds = [] } = {}) {
+    if (this.closing || this.reconfiguring) throw capabilityConflict('组织关系正在更新，请稍后重试');
+    const next = configuration(rawInstances, this.rootDir), changed = this.affectedInstances(rawInstances);
+    if (next.size !== this.instances.size) throw new Error('A topology move cannot add or remove organizations');
+    for (const [id, item] of this.instances) {
+      const config = next.get(id)?.config;
+      if (!config || !sameConfiguration(item.config, { ...config, organizationName: item.config.organizationName,
+        brainName: item.config.brainName, description: item.config.description,
+        allowedParents: item.config.allowedParents, delegationTargets: item.config.delegationTargets })) {
+        throw new Error('A topology move cannot change instance identity, workspace or Worker permissions');
+      }
+    }
+    const items = [...new Set([...changed, ...inspectIds])].map(id => this.instance(id));
+    for (const item of items) {
+      this.capabilityLifecycle(item);
+      if (item.operation || item.cleanupPending || !['running', 'stopped'].includes(item.phase)
+        || ['requested', 'restarting'].includes(this.restartIntent(item)?.phase)) throw capabilityConflict('相关组织正在启停、重启或清理，请完成后再移动');
+    }
+    const operationId = `topology:${randomUUID()}`, owners = [], applied = [], originals = new Map(items.map(item => [item, item.config]));
+    this.reconfiguring = true;
+    for (const item of items) {
+      const id = item.config.instanceId;
+      this.capabilityTransitions.add(id);
+    }
+    const configure = async (owner, instances) => {
+      const config = instances.get(owner.item.config.instanceId).config;
+      const result = await owner.peer.call('topology.configure', { operationId, allowedParents: config.allowedParents,
+        delegationTargets: ownerTargets(config, owner.metadata), delegationLimits: delegationLimits(instances, config) });
+      if (!result?.configured || result.instanceId !== config.instanceId) throw new Error('Organization topology acknowledgement differs from its owner');
+    };
+    let committed = false;
+    try {
+      const blockers = [];
+      for (const item of items) {
+        const id = item.config.instanceId;
+        let peer = item.peer, metadata = item.runtimeMetadata, native = item.native;
+        if (item.phase === 'stopped' && existsSync(join(item.config.stateDir, 'orchestrator.sqlite'))) {
+          const management = item.management ?? await this.openManagement(item);
+          clearTimeout(management.idleTimer); peer = management.peer; metadata = management.metadata; native = management.native;
+        }
+        if (peer) {
+          const owner = { item, peer, metadata, generation: item.generation, prepared: false };
+          owners.push(owner);
+          const snapshot = await peer.call('topology.activity', {});
+          if (snapshot?.instanceId !== id || !Array.isArray(snapshot.tasks) || typeof snapshot.busy !== 'boolean') throw new Error('Unconfirmed organization topology work');
+          blockers.push(...snapshot.tasks.map(task => ({ ...task, instanceId: id, name: item.config.organizationName })));
+          if (snapshot.busy && !snapshot.tasks.length) throw new Error('Unconfirmed organization topology work');
+        } else if (item.phase !== 'stopped') throw new Error('Organization topology owner is unavailable');
+        for (const port of [native, item.bridge, this.lifecycleParticipants.get(id)]) if (port?.capabilityActivity) {
+          const activity = await port.capabilityActivity();
+          if (!activity || !Array.isArray(activity.work) || typeof activity.busy !== 'boolean') throw new Error('Unconfirmed native organization work');
+          blockers.push(...activity.work.map(task => ({ ...task, instanceId: id, name: item.config.organizationName })));
+          if (activity.busy && !activity.work.length) throw new Error('Unconfirmed native organization work');
+        }
+        for (const task of this.foregroundRequests.values()) if (task.instanceId === id) blockers.push({ ...task, name: item.config.organizationName });
+      }
+      if (blockers.length) throw topologyBlocked(blockers);
+      for (const owner of owners) {
+        owner.prepareSent = true;
+        const snapshot = await owner.peer.call('topology.prepare', { operationId });
+        owner.prepared = snapshot?.prepared === true;
+        if (snapshot?.busy) throw topologyBlocked(snapshot.tasks.map(task => ({ ...task, name: owner.item.config.organizationName })));
+        if (!owner.prepared || snapshot?.instanceId !== owner.item.config.instanceId || !Array.isArray(snapshot.tasks)) throw new Error('Unconfirmed organization topology freeze');
+      }
+      for (const item of items) {
+        const id = item.config.instanceId, hold = { operationId, frozen: true };
+        this.topologyTransitions.add(id);
+        item.bridge?.setCapabilityHold?.(hold); item.native?.setCapabilityHold?.(hold); this.lifecycleParticipants.get(id)?.setCapabilityHold?.(hold);
+      }
+      for (const owner of owners) { applied.push(owner); await configure(owner, next); }
+      // Every affected original owner is still frozen; commit and manager policy change share one turn.
+      for (const item of items) item.config = next.get(item.config.instanceId).config;
+      try { this.record(); persist(); committed = true; }
+      catch (error) { for (const [item, config] of originals) item.config = config; this.record(); throw error; }
+      for (const owner of owners) if (owner.metadata) owner.metadata.delegationTargets = ownerTargets(owner.item.config, owner.metadata)
+        .map(({ instanceId, organizationName, description }) => ({ instanceId, organizationName, description }));
+      return this.status();
+    } catch (error) {
+      if (!committed) for (const owner of applied.reverse()) {
+        try { await configure(owner, this.instances); }
+        catch (rollback) {
+          owner.item.error = `Organization topology rollback needs cleanup: ${rollback.message}`;
+          if (owner.item.phase === 'running') await this.stopInstance(owner.item).catch(() => {});
+        }
+      }
+      throw error;
+    } finally {
+      for (const owner of owners) {
+        try { if (owner.prepareSent) await owner.peer.call('topology.release', { operationId }); }
+        catch (error) {
+          owner.item.error = `Organization topology release needs cleanup: ${error.message}`;
+          if (owner.item.phase === 'running') await this.stopInstance(owner.item).catch(() => {});
+        }
+        if (owner.item.management) await this.closeManagement(owner.item).catch(() => {});
+      }
+      for (const item of items) {
+        const id = item.config.instanceId;
+        item.bridge?.setCapabilityHold?.(undefined); item.native?.setCapabilityHold?.(undefined); this.lifecycleParticipants.get(id)?.setCapabilityHold?.(undefined);
+        this.topologyTransitions.delete(id); this.capabilityTransitions.delete(id);
+      }
+      this.reconfiguring = false;
+    }
   }
   /** Include parents whose derived delegation catalog changes with a child's capabilities. */
   affectedInstances(rawInstances) {
@@ -683,7 +793,7 @@ export class ProcessManager {
     this.event(item, 'start');
     try {
       const hold = this.capabilityHolds.get(item.config.instanceId);
-      const result = await item.peer.call('initialize', { ...item.config, ...(hold ? { capabilityHold: { ...hold } } : {}) }, 240000);
+      const result = await item.peer.call('initialize', { ...item.config, delegationLimits: delegationLimits(this.instances, item.config), ...(hold ? { capabilityHold: { ...hold } } : {}) }, 240000);
       if (this.closing || item.child !== child || item.generation !== generation || item.phase !== 'starting' || result?.pid !== child.pid || result?.instanceId !== item.config.instanceId || child.exitCode !== null) throw new Error('Instance initialization identity mismatch');
       item.phase = 'running'; this.record();
       const participant = this.lifecycleParticipants.get(item.config.instanceId);
@@ -711,7 +821,8 @@ export class ProcessManager {
     const ready = await Promise.all(source.config.delegationTargets.map(async capability => {
       const id = capability.instanceId, target = this.instances.get(id), peer = target?.peer;
       const available = () => peer && this.instances.get(id) === target && target.peer === peer && target.phase === 'running'
-        && !target.cleanupPending && !this.capabilityHolds.has(id) && target.config.allowedParents.includes(source.config.instanceId);
+        && !target.cleanupPending && !this.capabilityHolds.has(id) && !this.topologyTransitions.has(id)
+        && !this.topologyTransitions.has(source.config.instanceId) && target.config.allowedParents.includes(source.config.instanceId);
       if (!capability.tools.length || !available()) return;
       try {
         const value = await peer.call('delegation.readiness', {}, 3000);
@@ -735,11 +846,15 @@ export class ProcessManager {
     if (request.path.at(-1) !== sourceId) throw new Error('Delegation path must end at the authenticated source instance');
     const capability = source.config.delegationTargets.find(target => target.instanceId === request.targetInstanceId);
     const target = this.instances.get(request.targetInstanceId);
-    if (!capability || !target?.config.allowedParents.includes(sourceId)) throw new Error('Delegation relationship is not mutually allowed');
-    for (const [index, id] of request.path.entries()) {
-      const childId = request.path[index + 1] ?? request.targetInstanceId, parent = this.instances.get(id), child = this.instances.get(childId);
-      if (!parent?.config.delegationTargets.some(target => target.instanceId === childId) || !child?.config.allowedParents.includes(id))
-        throw new Error('Delegation lineage no longer matches the current direct organization relationships');
+    // A historical query or stop is checked against the receiving ticket's immutable parent binding.
+    if (!target || !control && (!capability || !target.config.allowedParents.includes(sourceId))) throw new Error('Delegation relationship is not mutually allowed');
+    if (!control) {
+      for (const [index, id] of request.path.entries()) {
+        const childId = request.path[index + 1] ?? request.targetInstanceId, parent = this.instances.get(id), child = this.instances.get(childId);
+        if (this.topologyTransitions.has(id) || this.topologyTransitions.has(childId)) throw capabilityConflict('组织关系正在移动，请稍后再派工');
+        if (!parent?.config.delegationTargets.some(target => target.instanceId === childId) || !child?.config.allowedParents.includes(id))
+          throw new Error('Delegation lineage no longer matches the current direct organization relationships');
+      }
     }
     // The child verifies the immutable identity and grant of each follow-up. Its execution policy intersects that grant with current permissions.
     if (request.operation === 'submit' && request.tools.some(tool => !capability.tools.includes(tool))) throw new Error('Delegation tools exceed the parent and child intersection');
@@ -828,7 +943,7 @@ export class ProcessManager {
     try {
       owner.native = this.nativeFactory(item.config, peer, { adoption, managementOnly: true, isCurrent: () => owner.active && !owner.ended });
       this.event(item, 'management-open', { managementPid: child.pid });
-      const initialized = await peer.call('initializeManagement', item.config, 240000);
+      const initialized = await peer.call('initializeManagement', { ...item.config, delegationLimits: delegationLimits(this.instances, item.config) }, 240000);
       if (initialized?.pid !== child.pid || initialized?.instanceId !== item.config.instanceId) throw new Error('Management instance identity mismatch');
       owner.phase = 'ready'; this.record(); return owner;
     } catch (error) { await this.closeManagement(item); throw error; }

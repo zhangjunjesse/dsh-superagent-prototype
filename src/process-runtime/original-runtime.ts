@@ -52,6 +52,8 @@ export interface ProcessRuntimeOptions {
   restart?(): void;
   /** Installed from durable host coordination before original Sources or effects can admit work. */
   capabilityHold?: CapabilityHold;
+  /** Rebuild current admission from the host's committed graph after any interrupted move. */
+  delegationLimits?: DelegationLimit[];
   /** Stage-only observation of the original setup and native Session initialization. */
   startup?: StartupObserver;
 }
@@ -96,6 +98,24 @@ export class OriginalProcess {
   private quiescing?: Promise<void>
   private readyTargets = new Set<string>()
   private catalogRefresh?: Promise<void>
+
+  /** Settle a catalog read admitted before the host fenced the graph. */
+  async freezeTopology(operationId: string): Promise<void> {
+    this.capabilityDrain.freezeTopology(operationId)
+    await this.catalogRefresh
+  }
+  /** A private host operation changes relationships without replacing task or Session owners. */
+  configureTopology(input: { operationId: string; allowedParents: string[]; delegationTargets: Capability[]; delegationLimits: DelegationLimit[] }): void {
+    this.capabilityDrain.authorizeTopology(input.operationId)
+    if (input.delegationTargets.some(target => target.instanceId === this.config.instanceId || target.tools.some(tool => !this.config.workerTools.includes(tool)))
+      || input.allowedParents.includes(this.config.instanceId)) throw new Error('Organization topology exceeds the current capability or identity')
+    const previous = this.config.allowedParents
+    this.config.allowedParents = [...input.allowedParents]
+    try { this.inbound.configureTopology(input.delegationLimits) }
+    catch (error) { this.config.allowedParents = previous; throw error }
+    this.config.delegationTargets = structuredClone(input.delegationTargets)
+    this.readyTargets = new Set()
+  }
 
   constructor(readonly config: ProcessRuntimeConfig, private readonly host: ProcessHost, readonly options: ProcessRuntimeOptions, preparation: Preparation) {
     if (!options?.native) throw new Error('The original complete task runtime requires its shared DSH native ports')
@@ -198,6 +218,7 @@ export class OriginalProcess {
       this.unregister = runtime.sources.register(kind)
       this.inbound = new InboundDelegations(config, runtime.store, runtime.engine,
         { ...preparation, admitted: id => this.capabilityDrain.prepare(id), acceptNew: () => this.delegationReady() })
+      if (options.delegationLimits) this.inbound.configureTopology(options.delegationLimits)
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
         () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound)
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
@@ -284,7 +305,7 @@ export class OriginalProcess {
   /** The original admission owner is available without consuming or disturbing current work. */
   delegationReady(): boolean {
     const available = !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
-      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId
+      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId && !this.capabilityDrain.frozen
     if (!available) return false
     try { return [this.config.stateDir, this.config.workspace, executionRoot(this.runtime.store.settings(), this.runtime.machine.stateDir)]
       .every(directory => statSync(directory).isDirectory()) }

@@ -133,7 +133,7 @@
   const workerCapacity = n => maxWorkersOf(n)===undefined?'并发上限未同步':`并发上限 ${maxWorkersOf(n)}`;
   const workerCapacityDetail = n => maxWorkersOf(n)===undefined?'实际并发上限未同步':`按任务自动分配 · 最多同时执行 ${maxWorkersOf(n)} 个任务`;
   const configurationNode = value => { const {execution,executionError,...saved}=value; return saved; };
-  const organizationFields = ['name','brainName','description','capabilities','model'];
+  const organizationFields = ['name','brainName','description','capabilities','model','parent'];
   const sameField = (key, left, right) => key==='model'
     ? ['provider','model','reasoningEffort'].every(part=>left?.[part]===right?.[part]) : left===right;
   const organizationChanges = (value, original) => Object.fromEntries(organizationFields
@@ -832,7 +832,7 @@
     const n = editor.value, tabs = editorTabs(n); if (!tabs.some(([id])=>id===editorTab)) editorTab = 'basic';
     const title = editor.isNew ? '添加下级 SuperJarvis' : organizationMode() ? n.name+' · 设置' : '实例配置';
     const embedded=organizationMode() && editorTab==='engine' && !editor.isNew;
-    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'组织信息可在运行时保存，页面名称立即更新；大脑名称和路由说明在下次启动后生效。修改模型须先停止当前组织，保存后下次启动生效。':'修改运行中的实例前，请先停止该实例';
+    const saveNote=!connected()?'尚未应用到运行环境':editor.isNew?'可在集团运行时添加下级，当前对话和任务继续运行。保存后下级尚未启动，请进入下级的运行状态，启动后即可接单。':organizationMode()?'组织信息可在运行时保存，页面名称立即更新；大脑名称和路由说明在下次启动后生效。修改模型须先停止当前组织，保存后下次启动生效。更换上级须等相关旧工单与会话收尾，新关系保存后立即生效。':'修改运行中的实例前，请先停止该实例';
     if (embedded && engineMount?.id===n.id && engineMount.target.isConnected) {
       engineMount.controller?.update(engineLocation()); return;
     }
@@ -845,8 +845,8 @@
   }
   function editorFields(n) {
     if (editorTab === 'basic') {
-      const candidates = state.nodes.filter(item=>item.kind!=='worker' && item.id!==n.id && !ancestry(item.id).some(a=>a.id===n.id) && (!connected()||item.id===rootId()));
-      return section('','',`<div class="field-grid">${field('组织名称','name',n.name,{required:true,max:40,placeholder:'例如：研发',help:'例如研发中心，用于拓扑分组和组织层级。'})}${organizationMode()?'':field('大脑名称','brainName',n.brainName,{required:true,max:40,placeholder:'贾维斯',help:'组织内负责协调工作的助手，与组织名称独立。'})}${n.kind!=='root'&&!connected()?selectField('上级实例','parent',n.parent,candidates.map(item=>[item.id,ancestry(item.id).map(a=>a.name).join(' / ')]),'决定拓扑归属，不改变实例身份。'):''}${field('职责','description',n.description,{wide:true,max:180,placeholder:'这个组织负责什么？'})}${field('能力标签','capabilities',n.capabilities,{wide:true,placeholder:'开发、测试、代码审查',help:n.kind==='root'?'描述本实例能力；标签不会自动启用工具或技能。':'供上级 Router 判断是否交给本实例；标签不会自动启用工具或技能。'})}</div><details class="identity-details"><summary>实例标识</summary><div class="field-grid">${field('实例 ID','instance-display',n.id,{readonly:true,help:'系统标识固定，修改名称不影响关联。'})}</div></details>`)+(connected()&&!organizationMode()?brainModelFields(n)+section('Router 模型','负责任务判断与分派，选择本地 Worker 或下级实例。',modelFields(n,'router')):'');
+      const candidates = state.nodes.filter(item=>item.kind!=='worker' && item.id!==n.id && !ancestry(item.id).some(a=>a.id===n.id));
+      return section('','',`<div class="field-grid">${field('组织名称','name',n.name,{required:true,max:40,placeholder:'例如：研发',help:'例如研发中心，用于拓扑分组和组织层级。'})}${organizationMode()?'':field('大脑名称','brainName',n.brainName,{required:true,max:40,placeholder:'贾维斯',help:'组织内负责协调工作的助手，与组织名称独立。'})}${n.kind!=='root'&&(!connected()||!editor.isNew)?selectField('直属上级','parent',n.parent,candidates.map(item=>[item.id,ancestry(item.id).map(a=>a.name).join(' / ')]),'旧工单与会话结束后才能移动。工作区、权限身份、历史工单和成果保持；新派工按新归属校验。'):''}${field('职责','description',n.description,{wide:true,max:180,placeholder:'这个组织负责什么？'})}${field('能力标签','capabilities',n.capabilities,{wide:true,placeholder:'开发、测试、代码审查',help:n.kind==='root'?'描述本实例能力；标签不会自动启用工具或技能。':'供上级 Router 判断是否交给本实例；标签不会自动启用工具或技能。'})}</div><details class="identity-details"><summary>实例标识</summary><div class="field-grid">${field('实例 ID','instance-display',n.id,{readonly:true,help:'系统标识固定，修改名称不影响关联。'})}</div></details>`)+(connected()&&!organizationMode()?brainModelFields(n)+section('Router 模型','负责任务判断与分派，选择本地 Worker 或下级实例。',modelFields(n,'router')):'');
     }
     if (editorTab === 'brain') return section('贾维斯','负责接收上级交办，理解任务要求。',field('助手名称','brainName',n.brainName,{required:true,max:40}))+brainModelFields(n);
     if (editorTab === 'engine') return engineFields(n);
@@ -1032,7 +1032,7 @@
       if (scoped) {
         const matches=actual=>actual?.available && Number.isSafeInteger(actual.revision) && actual.revision>=editing.revision+1
           && actual.nodes?.some(item=>item.id===value.id && Object.entries(changes).every(([key,next])=>sameField(key,item[key],next)));
-        if (snapshot.revision!==editing.revision+1 || snapshot.saved?.instanceId!==value.id || snapshot.saved?.effect!=='next-start'
+        if (snapshot.revision!==editing.revision+1 || snapshot.saved?.instanceId!==value.id || snapshot.saved?.effect!==(Object.hasOwn(changes,'parent')?'immediate':'next-start')
           || !Array.isArray(snapshot.saved.fields) || JSON.stringify([...snapshot.saved.fields].sort())!==JSON.stringify(Object.keys(changes).sort())
           || !matches(snapshot)) throw new Error('暂时无法确认保存结果，请重新读取后核对。');
         committed=true;
@@ -1043,7 +1043,7 @@
       installSnapshot(snapshot); service.conflict=null;
       if (editor===editing) { editor=null; navigate(editorReturn); }
       announce(editing.isNew?'下级 SuperJarvis 已添加，尚未启动；进入下级的运行状态，启动后即可接单。':scoped
-        ?Object.hasOwn(changes,'model')?'组织模型已保存，下次启动后生效。':'组织信息已保存，页面已更新；运行中的大脑与路由信息下次启动后生效。':savedConfigurationText());
+        ?Object.hasOwn(changes,'parent')?'组织上级已更新，新派工按新归属处理；原工作区、权限身份和历史保留。':Object.hasOwn(changes,'model')?'组织模型已保存，下次启动后生效。':'组织信息已保存，页面已更新；运行中的大脑与路由信息下次启动后生效。':savedConfigurationText());
     } catch (error) {
       if (editor!==editing) { announce(error.message||'配置保存失败，请重试。'); return; }
       const uncertain=scoped && (!error.status || error.status>=500);

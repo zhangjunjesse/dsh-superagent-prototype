@@ -374,6 +374,7 @@ export class ProcessRuntime {
         cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0), limit: z.number().int().min(1).max(50).default(20) }).strict(),
     ]).parse(raw)
     if (request.operation === 'submit') {
+      if (this.original.capabilityDrain.frozen) throw new Error('Task submission is frozen while organization configuration changes')
       const result = this.gateway.submit(request.input, request.origin)
       return result
     }
@@ -513,6 +514,68 @@ export class ProcessRuntime {
         assignmentId: row.request.parentAssignmentId, status: 'stopping', reasons: ['delegation_stop_pending'] })
     }
     return this.original.capabilityDrain.snapshot(this.config.instanceId, extra)
+  }
+  /** Unlike Worker maintenance, a graph move must also wait for parked business tickets. */
+  private topologySnapshot() {
+    const activity = this.capabilitySnapshot(), tasks = [...activity.tasks, ...activity.waitingTasks]
+    for (const row of this.delegated.list()) {
+      if (!row.stopped || row.snapshot?.executionStopped === true) continue
+      const id = `ticket:${row.request.parentTicketId}:${row.request.parentAssignmentId}`
+      if (!tasks.some(task => task.id === id)) tasks.push({ id, kind: 'ticket', title: 'Delegated task cleanup is not confirmed',
+        ticketId: row.request.parentTicketId, assignmentId: row.request.parentAssignmentId,
+        status: 'stopping', reasons: ['delegation_stop_pending'] })
+    }
+    for (const row of this.inbound.activity()) {
+      if (row.phase === 'stopped' || ['completed', 'stopped'].includes(row.status) || row.ticketId) continue
+      if (!tasks.some(task => task.delegationId === row.id)) tasks.push({ id: `delegation:${row.id}`, kind: 'delegation',
+        title: row.title, delegationId: row.id, status: row.phase, reasons: ['unfinished_delegation'] })
+    }
+    for (const thread of this.store.threads.active()) for (const id of thread.pending) {
+      if (tasks.some(task => task.triggerId === id)) continue
+      const trigger = this.store.triggers.get(id)
+      tasks.push({ id: `pending:${id}`, kind: 'assessment', title: trigger?.text.slice(0, 200) ?? 'Pending task',
+        triggerId: id, status: 'queued', reasons: ['pending_admission'] })
+    }
+    return { instanceId: this.config.instanceId, busy: tasks.length > 0, tasks }
+  }
+  /** Private host IPC: observe unfinished work without disturbing an active owner. */
+  async topologyActivity() {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    return this.topologySnapshot()
+  }
+  async topologyPrepare(raw: unknown) {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    const { operationId } = z.object({ operationId: z.string().min(1).max(200) }).strict().parse(raw)
+    const before = this.topologySnapshot()
+    if (before.busy) return { ...before, prepared: false }
+    try {
+      await this.original.freezeTopology(operationId)
+      return { ...this.topologySnapshot(), prepared: true }
+    } catch (error) {
+      try { this.original.capabilityDrain.releaseTopology(operationId) } catch { /* Keep another maintenance owner's fence intact. */ }
+      throw error
+    }
+  }
+  /** Private host IPC: update only the graph while all original work is fenced and drained. */
+  async topologyConfigure(raw: unknown) {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    const ids = z.array(z.string().min(1).max(200)).refine(value => new Set(value).size === value.length)
+    const input = z.object({ operationId: z.string().min(1).max(200), allowedParents: ids,
+      delegationTargets: z.array(CapabilitySchema).refine(value => new Set(value.map(target => target.instanceId)).size === value.length),
+      delegationLimits: z.array(z.object({ sourceInstanceId: z.string().min(1).max(200), tools: z.array(WorkerToolSchema) }).strict()) }).strict().parse(raw)
+    this.original.capabilityDrain.authorizeTopology(input.operationId)
+    if (this.topologySnapshot().busy) throw new Error('Organization topology must wait for unfinished work')
+    this.original.configureTopology(input)
+    return { configured: true, instanceId: this.config.instanceId }
+  }
+  async topologyRelease(raw: unknown) {
+    await this.ready
+    const { operationId } = z.object({ operationId: z.string().min(1).max(200) }).strict().parse(raw)
+    this.original.capabilityDrain.releaseTopology(operationId)
+    return { released: true, instanceId: this.config.instanceId }
   }
   async capabilitiesFreeze(raw: unknown) {
     await this.ready
