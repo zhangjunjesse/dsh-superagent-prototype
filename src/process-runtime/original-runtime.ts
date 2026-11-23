@@ -167,6 +167,7 @@ export class OriginalProcess {
           prepareReview: async (_id, target) => { if (target) await this.refreshDelegationCatalog() },
         },
         executor: local => ({
+          requestCancellation: ticket => this.delegated.requestCancellation(ticket.id),
           start: (ticket, assignment) => this.delegated.remote(ticket, assignment) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
           stop: (ticket, assignment, reason) => {

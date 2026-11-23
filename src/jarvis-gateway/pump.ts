@@ -60,6 +60,10 @@ export function snapshotEvents(work: WorkLink, ticket: Ticket): GatewayEvent[] {
     events.push({ id: key, semanticKey: key, workRef: work.workRef, conversationId: work.conversationId,
       kind, text, at: ticket.updatedAt, actionable: true, ...extra })
   }
+  if (ticket.cancellation) {
+    add('receipt', ticket.ended ? 'cancelled' : 'cancelling', ticket.ended ? '已取消' : '正在取消，等待确认', { actionable: false })
+    return events
+  }
   if (!ticket.ended && ticket.attention && !ticket.attention.answeredBy) add('question',ticket.attention.id,ticket.attention.question,{ attentionId: ticket.attention.id })
   const assignment = latestAssignment(ticket), report = assignment?.report
   if (assignment && report && ['ready','failed','blocked'].includes(report.state)) {

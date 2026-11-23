@@ -8,19 +8,25 @@ import { controlledNativeFactory } from './controlled-native-fixture.mjs';
 
 const artifacts = resolve('.artifacts/process-runtime/delegation-lifecycle');
 mkdirSync(artifacts, { recursive: true });
-function fixture() {
+function fixture({ nested = false } = {}) {
   const rootDir = mkdtempSync(join(artifacts, 'run-')), turns = [];
   const instances = ['alpha', 'beta', 'gamma'].map(instanceId => ({ instanceId, organizationName: instanceId,
     stateDir: join(rootDir, instanceId, 'state'), workspace: join(rootDir, instanceId, 'work'),
     model: { provider: 'controlled', model: 'controlled' }, workerTools: ['read'], maxWorkers: 3,
-    ...(instanceId === 'alpha' ? { children: ['beta'] } : instanceId === 'beta' ? { parents: ['alpha'] } : {}) }));
+    ...(instanceId === 'alpha' ? { children: ['beta'] } : instanceId === 'beta' ? { parents: ['alpha'], children: nested ? ['gamma'] : [] }
+      : nested ? { parents: ['beta'] } : {}) }));
   const native = controlledNativeFactory(async ({ config, sessionId, text, policy, tool }) => {
     if (!text.startsWith('{')) return;
     const input = JSON.parse(text);
     if (policy.role === 'orchestrator' && input.kind === 'candidate') {
       turns.push({ instanceId: config.instanceId, role: 'router', sessionId });
+      if (input.dispatch?.operation === 'stop') {
+        await tool('orchestrator_route', { decisions: [{ kind: 'stop', trigger_id: input.trigger_id, ticket_id: input.dispatch.target_ticket_id }] });
+        return;
+      }
       await tool('orchestrator_route', { decisions: [{ kind: 'accept', trigger_id: input.trigger_id, title: `Task at ${config.instanceId}`,
-        worktree_name: `task-${turns.length}`, acknowledgement: 'Accepted bounded task.', ...(config.instanceId === 'alpha' ? { target_instance_id: 'beta' } : {}) }] });
+        worktree_name: `task-${turns.length}`, acknowledgement: 'Accepted bounded task.', ...(config.instanceId === 'alpha' ? { target_instance_id: 'beta' }
+          : nested && config.instanceId === 'beta' ? { target_instance_id: 'gamma' } : {}) }] });
     } else if (policy.role === 'worker' && input.ticket_id) {
       turns.push({ instanceId: config.instanceId, role: 'worker', sessionId });
       await tool('orchestrator_report', { state: 'blocked', summary: 'Task remains open awaiting an authorized follow-up.' });
@@ -41,9 +47,42 @@ async function until(read, check) {
 }
 async function submit(manager, id, message) {
   const text = `Read the bounded ${message} task.`;
-  await manager.gateway(id, { operation: 'submit', input: { operation: 'new', request: { quote: text, summary: text } },
+  return manager.gateway(id, { operation: 'submit', input: { operation: 'new', request: { quote: text, summary: text } },
     origin: { conversationId: `controlled:${id}`, userMessageId: message, text, at: new Date().toISOString(), source: 'user' } });
 }
+
+test('a group cancellation survives a lost leaf acknowledgement and leaves unrelated leaf work running', { timeout: 60000 }, async () => {
+  const h = fixture({ nested: true }), manager = h.create(), original = manager.delegate.bind(manager);
+  let connected = false, observed = false;
+  try {
+    for (const id of ['gamma','beta','alpha']) await manager.start(id);
+    await submit(manager, 'gamma', 'unrelated');
+    const group = await submit(manager, 'alpha', 'cancel-this');
+    const middle = await until(() => manager.state('beta'), s => s.delegations.outgoing.some(row => row.snapshot?.status === 'blocked'));
+    const leaf = middle.delegations.outgoing[0].snapshot.ticketId;
+    const query = () => manager.gateway('alpha', { operation:'query', input:{operation:'get', workRef:group.workRef} });
+    const work = await until(query, item => item.targetToken);
+    manager.delegate = async (source, generation, request, options) => {
+      if (!connected && source.config.instanceId === 'beta' && request.operation === 'stop') {
+        observed = true; throw new Error('Leaf stop acknowledgement unavailable');
+      }
+      return original(source, generation, request, options);
+    };
+    const text = 'Cancel only this task';
+    const cancellation = await manager.gateway('alpha', { operation:'submit', input: { operation:'stop', targetToken:work.targetToken, request:{quote:text,summary:text} },
+      origin:{conversationId:'controlled:alpha',userMessageId:'cancel-1',selectedWorkRef:group.workRef,text,at:new Date().toISOString(),source:'user'} });
+    assert.equal(cancellation.status, 'queued');
+    await until(query, item => observed && item.status === 'cancelling');
+    assert.equal((await manager.state('gamma')).tickets.every(item => !item.ended), true);
+    connected = true;
+    await until(query, item => item.status === 'stopped');
+    const rootState = await manager.state('alpha'), middleState = await manager.state('beta'), leafState = await manager.state('gamma');
+    for (const state of [rootState, middleState]) assert.equal(state.delegations.outgoing[0].snapshot.executionStopped, true);
+    assert.equal(leafState.tickets.find(item => item.id === leaf).ended.outcome, 'stopped');
+    assert.equal(leafState.tickets.filter(item => item.id !== leaf && !item.ended).length, 1);
+    writeFileSync(join(h.rootDir, 'task-cancellation.json'), JSON.stringify({ workRef:group.workRef, rootState, middleState, leafState },null,2));
+  } finally { connected = true; manager.delegate = original; await manager.close(); }
+});
 
 test('real parent stop waits for its exact child acknowledgement and preserves unrelated work in the same child and another instance', { timeout: 20000 }, async () => {
   const h = fixture(), manager = h.create(), acknowledged = Promise.withResolvers(), release = Promise.withResolvers();

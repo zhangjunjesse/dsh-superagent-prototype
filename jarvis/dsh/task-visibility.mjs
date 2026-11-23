@@ -43,6 +43,7 @@ const assignmentView = assignment => assignment ? { id: assignment.id, state: as
   startedAt: time(assignment.startedAt), endedAt: time(assignment.endedAt) } : null;
 function recordedState(ticket) {
   const stage = ticketStage(ticket);
+  if (ticket.cancellation) return { status: ticket.ended ? 'stopped' : 'waiting', statusLabel: ticket.ended ? '已取消' : '正在取消，等待确认', stage };
   if (ticket.ended) {
     const outcome = ticket.ended.outcome;
     return { status: ['completed', 'merged'].includes(outcome) ? 'completed' : 'stopped',
@@ -227,7 +228,7 @@ class TaskRead {
         ticketId: null, workerId: null, assignmentId: null, assignment: null };
       progress = next?.progress ?? hop.report ?? progress;
       if (next?.updatedAt && (!updatedAt || next.updatedAt > updatedAt)) updatedAt = next.updatedAt;
-      if (ticket.ended) continue;
+      if (ticket.ended || ticket.cancellation) continue;
       if (candidate?.ended || !candidate && ['stopped', 'completed'].includes(status)) {
         state = this.fresh(source, { status: 'waiting', statusLabel: '执行方已结束，等待任务汇总', stage: state.stage });
       } else if (next) {

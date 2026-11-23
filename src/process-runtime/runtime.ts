@@ -165,7 +165,14 @@ export class ProcessRuntime {
   }
   private async tick(): Promise<void> {
     if (this.stopping || this.closed) return
-    return this.ticking ??= (async () => { this.inbound.tick(); await this.pump.tick(); await this.delegated.tick() })().finally(() => { this.ticking = undefined })
+    return this.ticking ??= (async () => {
+      this.inbound.tick(); await this.pump.tick(); await this.delegated.tick()
+      for (const ticket of this.store.tickets.cancelling()) {
+        if (this.delegated.list().some(row => row.request.parentTicketId === ticket.id && row.snapshot?.executionStopped !== true)) continue
+        await this.stopNativeTicket(ticket.id)
+        this.engine.confirmCancellation(ticket.id)
+      }
+    })().finally(() => { this.ticking = undefined })
   }
   private recover(): void {
     this.inbound.recover()
@@ -434,10 +441,25 @@ export class ProcessRuntime {
     await this.ready
     if (!['query', 'stop'].includes(envelope.request.operation) || this.closed) throw new Error('Lifecycle delegation permits bound query and stop only')
     const snapshot = await this.inbound.receiveLifecycle(envelope)
-    if (envelope.request.operation !== 'stop' || !['stopped', 'completed', 'missing'].includes(snapshot.status)) return this.delegationResult(snapshot)
+    if (envelope.request.operation !== 'stop') return this.delegationResult(snapshot)
+    const ticket = snapshot.ticketId && this.store.tickets.get(snapshot.ticketId)
+    if (!['stopped', 'completed', 'missing'].includes(snapshot.status) && !(ticket && ticket.cancellation)) return this.delegationResult(snapshot)
     await this.inbound.idle(envelope.request.delegationId)
-    if (snapshot.ticketId && !this.options.managementOnly) {
-      const sessionId = `worker-${snapshot.ticketId}`
+    if (snapshot.ticketId) {
+      await this.delegated.shutdown(snapshot.ticketId)
+      await this.stopNativeTicket(snapshot.ticketId)
+      this.engine.confirmCancellation(snapshot.ticketId)
+    }
+    await this.options.native.sessions.flush()
+    const verified = await this.inbound.receiveLifecycle({ ...envelope, request: { ...envelope.request, operation: 'query' } })
+    return { ...this.delegationResult(verified), executionStopped: true }
+  }
+  private async stopNativeTicket(ticketId: string): Promise<void> {
+    const sessionId = `worker-${ticketId}`
+    if (this.options.managementOnly) {
+      await this.options.native.executor.stopBackground(sessionId, 'Owning parent organization stopped', false)
+    }
+    if (!this.options.managementOnly) {
       const loaded = this.options.native.executor.current(sessionId)
       if (loaded) await this.options.native.executor.cancel(sessionId, false)
       // Persisted Session ownership outlives an in-memory Agent. Its background
@@ -451,13 +473,16 @@ export class ProcessRuntime {
       }
     }
     await this.options.native.sessions.flush()
-    return { ...this.delegationResult(snapshot), executionStopped: true }
   }
   /** A stopped management owner can finish persisted controls without starting Sources, Router or Workers. */
   async drainDelegations(): Promise<void> {
     await this.ready
     await this.original.beginShutdown()
     await this.delegated.shutdown()
+    for (const ticket of this.store.tickets.cancelling()) {
+      await this.stopNativeTicket(ticket.id)
+      this.engine.confirmCancellation(ticket.id)
+    }
   }
   /** Installs or releases the durable owner admission fence before reporting activity. */
   async capabilitiesHold(raw: unknown) {

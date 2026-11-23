@@ -37,6 +37,7 @@ export function controlledNativeFactory(onTurn) {
         if (!decision.revoked) throw new Error('Controlled native delivery already has an accepted owner receipt');
         row.state = 'revoked'; return { revoked: true };
       }
+      if (managementOnly && method === 'stopBackground' && input.keepInbox === false && input.sessionId?.startsWith('worker-')) return;
       if (managementOnly) throw new Error('Management-only test cannot start native work');
       if (method === 'delegate') return peer.handlers['delegation.send'](input);
       if (method === 'attach') {

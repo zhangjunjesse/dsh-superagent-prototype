@@ -17,10 +17,11 @@ export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) 
 }
 /** The states a ticket card shows: an open ticket's stage (docs/003), and an ended ticket's outcome. */
 export const TICKET_STATES = ['person/delivery', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'working', 'working/queued', 'idle',
-  'completed', 'merged', 'closed', 'dropped', 'stopped'] as const
+  'completed', 'merged', 'closed', 'dropped', 'stopped', 'cancelling'] as const
 export type TicketCardState = typeof TICKET_STATES[number]
 function cardState(ticket: Ticket): TicketCardState {
   if (ticket.ended) return ticket.ended.outcome
+  if (ticket.cancellation) return 'cancelling'
   const stage = ticketStage(ticket)
   if (stage.stage === 'person') return `person/${stage.action}`
   return stage.stage === 'idle' ? 'idle' : stage.stage === 'working' && stage.action ? 'working/queued' : 'working'

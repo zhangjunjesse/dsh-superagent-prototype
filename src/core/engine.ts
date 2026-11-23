@@ -208,6 +208,8 @@ export class Engine {
    * @throws UserError when the ticket is unknown.
    */
   stopTicket(ticketId: string, reason?: string): Ticket { return this.repo.atomic(() => this.tickets.stop(ticketId, reason)) }
+  /** Invoked by the bound executor after all of this ticket's stop acknowledgements have been persisted. */
+  confirmCancellation(ticketId: string): void { this.repo.atomic(() => this.tickets.confirmCancellation(ticketId)) }
   /**
    * A person retries a ticket whose worker reported failed or blocked (or whose input delivery failed): the stalled
    * Assignment ends and a new one starts under the same Mandate.

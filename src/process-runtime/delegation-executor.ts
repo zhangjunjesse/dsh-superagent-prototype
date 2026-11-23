@@ -11,7 +11,7 @@ export interface DelegationBinding {
   request: DelegationRequest; accepted?: boolean; stopped?: boolean; finished?: boolean;
   commands: Record<string, { request: DelegationRequest; inputId?: string; settled?: boolean; rejected?: boolean }>;
   snapshot?: DelegationSnapshot; reportHash?: string; question?: { parentId: string; childId: string }; error?: string;
-  retryAt?: number; failures?: number;
+  retryAt?: number; failures?: number; submitAttempted?: boolean;
   reviewId?: string;
 }
 const selections = family<string, [string]>('process-delegation:route:')
@@ -69,7 +69,7 @@ export class DelegationExecutor {
     const request: DelegationRequest = DelegationRequestSchema.parse({ targetInstanceId: capability.instanceId, delegationId, parentTicketId: ticket.id,
       parentAssignmentId: assignment.id, parentDecisionId: ticket.decisionId, operation: 'submit', commandId: key(delegationId, 'submit'),
       text: ticket.title, tools, path: inherited?.path ?? [this.config.instanceId], lineage: inherited?.lineage ?? [], taskContext })
-    this.store.set(name, { request, commands: {} })
+    this.store.set(name, { request, commands: {}, submitAttempted: false })
   }
   stop(ticket: Ticket, assignment: Assignment): void {
     const name = this.name(ticket.id, assignment.id), row = this.store.get(name)
@@ -136,10 +136,23 @@ export class DelegationExecutor {
     }
   }
   /** Mark the original fixed bindings before awaiting any remote control. */
-  async shutdown(): Promise<void> {
+  requestCancellation(ticketId: string): boolean {
+    const pending = this.list().filter(row => row.request.parentTicketId === ticketId && row.snapshot?.executionStopped !== true)
+    for (const row of pending) this.store.set(this.name(ticketId, row.request.parentAssignmentId),
+      { ...row, stopped: true, finished: false, retryAt: undefined })
+    return pending.length > 0
+  }
+  private stoppedSnapshot(row: Binding, snapshot: DelegationSnapshot): DelegationSnapshot {
+    if (snapshot.status === 'missing' && row.submitAttempted === false && !row.accepted && !row.snapshot?.ticketId)
+      return { ...snapshot, executionStopped: true }
+    if (!['stopped', 'completed'].includes(snapshot.status) || snapshot.executionStopped !== true)
+      throw new Error('Bound child stop has not acknowledged execution cleanup')
+    return snapshot
+  }
+  async shutdown(ticketId?: string): Promise<void> {
     // A completed business report can precede native job/subagent cleanup.
     // Only a verified lifecycle acknowledgement releases this parent's ownership.
-    const rows = this.list().filter(row => !row.finished || row.snapshot?.executionStopped !== true)
+    const rows = this.list().filter(row => (!ticketId || row.request.parentTicketId === ticketId) && (!row.finished || row.snapshot?.executionStopped !== true))
     for (const row of rows) {
       const ticket = this.current(row)
       if (ticket) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
@@ -155,9 +168,8 @@ export class DelegationExecutor {
         if (snapshot.status !== 'missing') {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
           snapshot = await this.send(request); this.verify(row, snapshot)
-          if (!['stopped', 'completed'].includes(snapshot.status) || snapshot.executionStopped !== true) throw new Error('Bound child stop has not acknowledged execution cleanup')
         }
-        this.store.set(name, { ...this.store.get(name)!, stopped: true, finished: true, snapshot: { ...snapshot, executionStopped: true }, error: undefined, retryAt: undefined })
+        this.store.set(name, { ...this.store.get(name)!, stopped: true, finished: true, snapshot: this.stoppedSnapshot(row, snapshot), error: undefined, retryAt: undefined })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         this.store.set(name, { ...this.store.get(name)!, stopped: true, error: message })
@@ -223,8 +235,12 @@ export class DelegationExecutor {
         if (!this.current(row)) { row.stopped = true; this.store.set(name, row) }
         // Query before every possible submit: a lost acknowledgement never creates another task.
         if (snapshot.status === 'missing') {
-          if (row.stopped) { row.finished = true; this.store.set(name, row); continue }
+          if (row.stopped) {
+            this.store.set(name, { ...row, finished: true, snapshot: this.stoppedSnapshot(row, snapshot) }); continue
+          }
           if (this.frozen()) continue
+          row.submitAttempted = true
+          this.store.set(name, row)
           snapshot = await this.send(row.request); this.verify(row, snapshot)
         }
         // Reload because a human stop or a new input can arrive while the IPC request is in flight.
@@ -233,7 +249,8 @@ export class DelegationExecutor {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
           snapshot = await this.send(request); this.verify(row, snapshot)
           row.snapshot = snapshot
-          if (snapshot.status === 'stopped' || snapshot.status === 'completed' || snapshot.receipts[request.commandId] === 'ignored') row.finished = true
+          this.stoppedSnapshot(row, snapshot)
+          row.finished = true
         } else {
           const current = this.current(row)
           if (!current) continue
