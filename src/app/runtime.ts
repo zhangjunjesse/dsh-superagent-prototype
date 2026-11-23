@@ -72,7 +72,7 @@ export interface RuntimeOptions {
   localTicket?(ticket: Ticket): boolean
   workerTools?(ticket: Ticket): readonly string[]
   workerSkills?(ticket: Ticket): readonly string[]
-  engine?: Pick<EngineOptions, 'delegation' | 'resumeCompletedCommands' | 'admission'>
+  engine?: Pick<EngineOptions, 'delegation' | 'resumeCompletedCommands' | 'admission' | 'resultReview'>
   /** Freezes launches/continuations for an exact forced-stop confirmation; replies remain available. */
   executionHeld?(): boolean
   /** Exact owner check for durable cancellation of an already staged/accepted native input. */
@@ -85,6 +85,7 @@ export interface RuntimeOptions {
     /** Refresh trusted availability before the synchronous target selection transaction. */
     prepare?(triggerId: string, target?: string): Promise<void>
     select(triggerId: string, target?: string): void
+    prepareReview?(ticketId: string, target?: string): Promise<void>
   }
   reportArtifacts?: ExecutorToolsHost['reportArtifacts']
   /** Runs after Store/composition is established, before initialize resolves setup. */
@@ -232,7 +233,7 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
-        prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select,
+        prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select, prepareReview: options.routing?.prepareReview,
         reportArtifacts: options.reportArtifacts,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),

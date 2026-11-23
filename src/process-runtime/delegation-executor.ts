@@ -1,5 +1,5 @@
 /** Proxy executor: persistent bindings and polling, without occupying a local Worker slot. */
-import { Engine, key, latestAssignment, liveTicket, type Assignment, type Ticket } from '../core/index.ts'
+import { Engine, key, latestAssignment, liveTicket, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
@@ -12,6 +12,7 @@ export interface DelegationBinding {
   commands: Record<string, { request: DelegationRequest; inputId?: string; settled?: boolean; rejected?: boolean }>;
   snapshot?: DelegationSnapshot; reportHash?: string; question?: { parentId: string; childId: string }; error?: string;
   retryAt?: number; failures?: number;
+  reviewId?: string;
 }
 const selections = family<string, [string]>('process-delegation:route:')
 type Binding = DelegationBinding
@@ -39,13 +40,16 @@ export class DelegationExecutor {
       throw new Error('The selected child has no capability within the original task grant')
     this.store.set(selections(triggerId), selection)
   }
-  remote(ticket: Ticket): boolean {
-    const selection = this.store.get(selections(ticket.origin.triggerId))
+  private target(ticket: Ticket, assignment = latestAssignment(ticket)): string | undefined {
+    return assignment?.executionTarget ?? this.selected(ticket.origin.triggerId)
+  }
+  remote(ticket: Ticket, assignment = latestAssignment(ticket)): boolean {
+    const selection = this.target(ticket, assignment)
     return !!selection && selection !== 'local'
   }
   private name(ticketId: string, assignmentId: string) { return outgoing(key(ticketId, assignmentId)) }
   start(ticket: Ticket, assignment: Assignment): void {
-    const target = this.store.get(selections(ticket.origin.triggerId)), capability = this.config.delegationTargets?.find(item => item.instanceId === target)
+    const target = this.target(ticket, assignment), capability = this.config.delegationTargets?.find(item => item.instanceId === target)
     if (!capability) throw new Error('The fixed child target is no longer configured')
     const name = this.name(ticket.id, assignment.id)
     if (this.store.get(name)) return
@@ -56,8 +60,11 @@ export class DelegationExecutor {
     const source = this.store.triggers.get(ticket.origin.triggerId)
     if (!source) throw new Error('A delegated task requires its actual original source record')
     const inherited = this.incoming?.forward(ticket, assignment)
+    const remaining = assignment.continuation ? `\n\n${JSON.stringify({ remaining_work: assignment.continuation,
+      previous_results: ticket.assignments.flatMap(item => item.resultReviews ?? []),
+      inputs: ticket.inputs.map(input => ({ ...input, ...(input.kind === 'trigger' ? { source: this.store.triggers.get(input.triggerId) } : {}) })) })}` : ''
     const taskContext = DelegationTaskContextSchema.parse({ scope: ticket.mandate.scope, strength: ticket.mandate.strength,
-      assignment: ticket.execution?.assignment ?? '', source: inherited?.source ?? { triggerId: source.id, kind: source.source, actor: source.actor,
+      assignment: (ticket.execution?.assignment ?? '') + remaining, source: inherited?.source ?? { triggerId: source.id, kind: source.source, actor: source.actor,
         human: source.human, at: source.at, text: source.text, ...(source.url ? { url: source.url } : {}) } })
     const request: DelegationRequest = DelegationRequestSchema.parse({ targetInstanceId: capability.instanceId, delegationId, parentTicketId: ticket.id,
       parentAssignmentId: assignment.id, parentDecisionId: ticket.decisionId, operation: 'submit', commandId: key(delegationId, 'submit'),
@@ -68,10 +75,38 @@ export class DelegationExecutor {
     const name = this.name(ticket.id, assignment.id), row = this.store.get(name)
     if (!row || row.finished) return
     // Completion of this proxy's own verified report is not a new stop request.
-    if (row.snapshot?.status === 'completed' && assignment.report?.state === 'ready') return
+    if (row.snapshot?.status === 'completed' && (assignment.report?.state === 'ready' || assignment.endedReason === 'continuedAfterReview')) {
+      row.finished = true; this.store.set(name, row); return
+    }
     row.stopped = true; this.store.set(name, row)
   }
   owns(ticket: Ticket): boolean { return this.remote(ticket) }
+  /** A result identity includes its actual producer and artifact references, never the child's completion word alone. */
+  private evidence(snapshot: DelegationSnapshot): string {
+    return fingerprint([snapshot.delegationId, snapshot.childInstanceId, snapshot.ticketId, snapshot.assignmentId,
+      snapshot.status, snapshot.summary, verifiedDelegationArtifacts(snapshot)])
+  }
+  /** Included in the Core review CAS so changed evidence, transport uncertainty or narrowed capabilities invalidate it. */
+  reviewContext(ticket: Ticket, assignment: Assignment): unknown {
+    const target = this.target(ticket, assignment), row = this.store.get(this.name(ticket.id, assignment.id))
+    return { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
+      ...(row ? { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped, error: row.error } : {}) }
+  }
+  authorizeReview(ticket: Ticket, assignment: Assignment, decision: ResultReviewDecision): void {
+    const ceiling = this.toolsFor?.(ticket) ?? this.config.workerTools
+    if (!ceiling.length) throw new Error('The original task has no remaining execution capability')
+    if (this.remote(ticket, assignment)) {
+      const row = this.store.get(this.name(ticket.id, assignment.id))
+      if (!row || row.stopped || row.error || row.request.parentDecisionId !== ticket.decisionId || row.snapshot?.status !== 'completed') throw new Error('The child result no longer has an available current binding')
+      this.verify(row, row.snapshot)
+    }
+    if (decision.kind !== 'continue' || !decision.targetInstanceId) return
+    const target = this.config.delegationTargets?.find(item => item.instanceId === decision.targetInstanceId)
+    if (!this.send || !target || !this.ready(target.instanceId)) throw new Error('The selected child is not ready for remaining work')
+    if (ticket.mandate.basis.via === 'delegation' && !this.incoming?.forward(ticket, assignment))
+      throw new Error('The original parent binding is unavailable for remaining work')
+    if (!target.tools.some(tool => this.config.workerTools.includes(tool) && ceiling.includes(tool))) throw new Error('Remaining work has no common authorized capability')
+  }
   private current(row: Binding): Ticket | undefined {
     const ticket = this.store.tickets.get(row.request.parentTicketId)
     return ticket && liveTicket(ticket) && latestAssignment(ticket)?.id === row.request.parentAssignmentId && latestAssignment(ticket)?.state !== 'ended' ? ticket : undefined
@@ -154,14 +189,18 @@ export class DelegationExecutor {
     // Never accept a result while a newer user input is still awaiting child admission.
     const outstanding = Object.values(row.commands).some(command => !command.settled || command.rejected)
     if (snapshot.status === 'completed' && outstanding) {
-      this.engine.report(ticket.id, { state: 'blocked', summary: 'Child completed before the newer input was admitted; review the result and pending request.' }); return
+      this.engine.report(ticket.id, { state: 'blocked', summary: 'Child completed before the newer input was admitted; review the result and pending request.' })
     }
     const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question])
-    if (hash === row.reportHash) return
+    if (hash === row.reportHash && snapshot.status !== 'completed') return
     if (snapshot.status === 'completed' && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim()) {
-      // Record evidence identity before Engine calls stop during terminal reporting.
-      row.finished = true; this.store.set(this.name(ticket.id, assignmentId), row)
-      this.engine.report(ticket.id, { state: 'ready', summary: snapshot.summary, question: null })
+      // Persist the transport binding in the same transaction as the review relay; completion remains the parent's decision.
+      delete row.error
+      this.store.set(this.name(ticket.id, assignmentId), row)
+      const evidence = this.evidence(snapshot)
+      const summary = `${snapshot.summary}\n\n${JSON.stringify({ producer: { instanceId: snapshot.childInstanceId,
+        ticketId: snapshot.ticketId, assignmentId: snapshot.assignmentId }, evidence_ref: evidence, artifacts: verifiedDelegationArtifacts(snapshot) })}`
+      row.reviewId = this.engine.stageResultReview(ticket.id, assignmentId, evidence, summary).id
     } else if (['blocked', 'failed', 'stopped'].includes(snapshot.status)) {
       this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed',
         summary: snapshot.summary ?? `Child delegation ${snapshot.status}`, question: snapshot.question?.text ?? null })
@@ -208,7 +247,7 @@ export class DelegationExecutor {
           // A stop during control delivery fences late reports as well.
           const latest = this.store.get(name)!
           if (latest.stopped) { row.stopped = true; this.store.set(name, row); continue }
-          this.apply(row, snapshot)
+          this.store.atomic(() => { this.apply(row, snapshot); this.store.set(name, row) })
         }
         delete row.error; delete row.retryAt; delete row.failures; this.store.set(name, row)
       } catch (error) {
@@ -241,11 +280,11 @@ export class DelegationExecutor {
     return [...new Map(paths.map(path => [fingerprint(path), path])).values()]
   }
   artifacts(ticketId: string): VerifiedArtifact[] {
-    const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
-    if (!ticket || !assignment) return []
-    const row = this.store.get(this.name(ticketId, assignment.id))
-    if (!row?.snapshot) return []
-    this.verify(row, row.snapshot)
-    return verifiedDelegationArtifacts(row.snapshot)
+    const artifacts = new Map<string, VerifiedArtifact>()
+    for (const row of this.list().filter(item => item.request.parentTicketId === ticketId && item.snapshot)) {
+      this.verify(row, row.snapshot!)
+      for (const artifact of verifiedDelegationArtifacts(row.snapshot!)) artifacts.set(artifact.url, artifact)
+    }
+    return [...artifacts.values()]
   }
 }

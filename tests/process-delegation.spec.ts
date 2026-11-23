@@ -60,7 +60,7 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
     const native = controlledNative(async turn => {
       if (!turn.text.startsWith('{')) return
       const input = JSON.parse(turn.text)
-      if (turn.policy.role === 'orchestrator' && input.kind !== 'candidate' || turn.policy.role === 'worker' && !input.ticket_id && !input.trigger_id) return
+      if (turn.policy.role === 'orchestrator' && !['candidate', 'result_review'].includes(input.kind) || turn.policy.role === 'worker' && !input.ticket_id && !input.trigger_id) return
       const request = processRunOf(turn, turn.policy); calls.push({ instance: id, request })
       if (turn.policy.role === 'orchestrator') {
         await routeOriginal(turn, 'Read delegated bounded files', id === 'parent' && !String(input.text).includes('local-only') ? 'child' : undefined)

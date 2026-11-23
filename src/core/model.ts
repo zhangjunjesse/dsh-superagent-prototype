@@ -294,7 +294,25 @@ export interface Assignment {
    * into a step before, the worker read.
    */
   idleAt?: string
+  /** A continuation chooses its own executor; absent only for the original trigger-bound route. */
+  executionTarget?: string
+  /** Remaining work under the original mandate, without replacing the original executor instructions. */
+  continuation?: { reviewId: string; instructions: string }
+  /** Evidence and main-Session judgements remain attached to the assignment that produced them. */
+  resultReviews?: ResultReview[]
 }
+/** A result held for the owning main Session, bound to immutable evidence and the complete current task context. */
+export interface ResultReview {
+  id: string
+  evidenceRef: string
+  contextRef: string
+  summary: string
+  at: string
+  decision?: ResultReviewDecision & { at: string; assignmentId?: string }
+}
+export type ResultReviewDecision =
+  | { kind: 'accept'; summary: string }
+  | { kind: 'continue'; summary: string; instructions: string; targetInstanceId?: string }
 /** Stable identity derived from the actual saved report, shared by snapshots and Outbox context. */
 export function reportReference(assignment: Pick<Assignment, 'id' | 'report'>): string | undefined {
   const report = assignment.report
