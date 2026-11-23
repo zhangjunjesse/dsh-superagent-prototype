@@ -206,8 +206,13 @@ describe('in-place original Worker capability configuration', () => {
     targets = [{ ...child, tools: ['read', 'write'] }]
     await runtime.capabilitiesConfigure({ operationId: 'change', workerTools: ['read', 'write'], workerSkills: [], delegationTargets: targets, delegationLimits: [] })
     await runtime.capabilitiesHold({ operationId: 'change', held: false })
-    expect(await runtime.management({ method: 'POST', path: `tickets/${ticket.id}/retry` })).toMatchObject({ status: 200, body: { retried: true } })
+    expect(await runtime.management({ method: 'POST', path: `tickets/${ticket.id}/retry` }))
+      .toMatchObject({ status: 200, body: { retried: false, pending: true } })
     await wait(() => expect(new Set(sent.map(request => request.parentAssignmentId)).size).toBe(2))
+    const original = ticket.assignments.at(-1)!.id
+    const stopped = sent.findIndex(request => request.parentAssignmentId === original && request.operation === 'stop')
+    expect(stopped).toBeGreaterThanOrEqual(0)
+    expect(sent.findIndex(request => request.parentAssignmentId !== original)).toBeGreaterThan(stopped)
     expect(sent.every(request => request.tools.length === 1 && request.tools[0] === 'read')).toBe(true)
     expect((await runtime.state()).tickets).toHaveLength(1)
     expect(native.errors).toEqual([])
