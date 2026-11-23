@@ -31,7 +31,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
   symlinkSync(fileURLToPath(new URL('../../skills/', import.meta.url)), join(modules, 'skills'), 'junction');
   mkdirSync(join(modules, 'jarvis/process-runtime'), { recursive: true });
   for (const name of ['native-host.mjs', 'native-wire.mjs', 'native-transport.mjs', 'native-journal.mjs', 'native-environment.mjs', 'worker-execution.mjs', 'ipc.mjs',
-    'manager.mjs', 'control.mjs', 'capability-applications.mjs', 'child.mjs', 'dsh-bridge.mjs', 'reply-progress.mjs', 'original-adoption.mjs']) copyFileSync(new URL(name, import.meta.url), join(modules, 'jarvis/process-runtime', name));
+    'manager.mjs', 'control.mjs', 'capability-applications.mjs', 'child.mjs', 'dsh-bridge.mjs', 'reply-progress.mjs', 'original-adoption.mjs', 'startup-progress.mjs']) copyFileSync(new URL(name, import.meta.url), join(modules, 'jarvis/process-runtime', name));
   const [cordis, scopeModule, promptModule, toolsModule, agentsModule, sessionModule, projectionModule, loopModule, llmModule, persistence, skillsModule, transportModule, hostModule, coreModule] = await Promise.all([
     load('@deepseek-ai/cordis'), load('@deepseek-ai/dsh-scope'), load('@deepseek-ai/dsh-system-prompt'), load('@deepseek-ai/dsh-tools'),
     load('@deepseek-ai/dsh-agent'), load('@deepseek-ai/dsh-session'), load('@deepseek-ai/dsh-session-projection'), load('@deepseek-ai/dsh-agent-loop'),

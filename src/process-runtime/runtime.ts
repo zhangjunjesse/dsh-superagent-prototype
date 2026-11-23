@@ -428,8 +428,12 @@ export class ProcessRuntime {
     return { ready: !this.stopping && !this.closed && this.original.delegationReady() }
   }
   private delegationResult(snapshot: DelegationSnapshot): DelegationSnapshot {
-    return { ...snapshot, artifacts: snapshot.ticketId ? this.taskFiles.links(this.config.instanceId, snapshot.ticketId)
-      .map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: snapshot.ticketId! })) : [] }
+    const downstream = snapshot.ticketId && this.delegated.result(snapshot.ticketId)
+    const paths = snapshot.ticketId ? this.delegated.artifactLineages(snapshot.ticketId).map(path =>
+      [this.inbound.resultLink(snapshot.delegationId, path[0]!.parentAssignmentId), ...path]) : []
+    return { ...snapshot, artifacts: this.artifactsForTicket(snapshot.ticketId),
+      ...(snapshot.lineage ? { lineage: [...snapshot.lineage, ...(downstream && downstream.lineage || [])] } : {}),
+      ...(paths.length ? { artifactLineages: paths } : {}) }
   }
   /** Private lifecycle-only control; it cannot submit, append, answer or resume work. */
   async lifecycleDelegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
@@ -586,3 +590,4 @@ export class ProcessRuntime {
   }
 
 }
+export { verifiedDelegationArtifacts } from './delegation-contract.ts'

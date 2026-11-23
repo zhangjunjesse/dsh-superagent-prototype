@@ -3,8 +3,9 @@ import { Engine, key, latestAssignment, liveTicket, type Assignment, type Ticket
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
-import { verifiedDelegationArtifacts, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
+import { DelegationRequestSchema, verifiedArtifactLineages, verifiedDelegationArtifacts, verifiedDelegationLineage, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
 import { DelegationTaskContextSchema } from '../sources/delegation-context.ts'
+import type { InboundDelegations } from './delegation-ingress.ts'
 
 export interface DelegationBinding {
   request: DelegationRequest; accepted?: boolean; stopped?: boolean; finished?: boolean;
@@ -22,7 +23,7 @@ export class DelegationExecutor {
   constructor(private config: Config, private store: Store, private engine: Engine,
     private send?: (request: DelegationRequest) => Promise<DelegationSnapshot>, private frozen: () => boolean = () => false,
     private ready: (instanceId: string) => boolean = () => false,
-    private toolsFor?: (ticket: Ticket) => readonly string[]) {}
+    private toolsFor?: (ticket: Ticket) => readonly string[], private incoming?: InboundDelegations) {}
 
   /** Stored selection outlives catalog readiness; retries cannot move an existing task. */
   selected(triggerId: string): string | undefined { return this.store.get(selections(triggerId)) }
@@ -33,7 +34,9 @@ export class DelegationExecutor {
     if (target && (!this.send || !this.config.delegationTargets?.some(item => item.instanceId === target))) throw new Error('Unknown or unavailable delegation target')
     if (target && !prior && !this.ready(target)) throw new Error('The selected child is not ready for new tasks')
     const trigger = this.store.triggers.get(triggerId)
-    if (target && trigger?.source === 'delegation') throw new Error('This stage permits only one delegation hop')
+    const ceiling = trigger && this.incoming?.toolsForTrigger(trigger)
+    if (target && ceiling && !this.config.delegationTargets?.find(item => item.instanceId === target)?.tools.some(tool => ceiling.includes(tool)))
+      throw new Error('The selected child has no capability within the original task grant')
     this.store.set(selections(triggerId), selection)
   }
   remote(ticket: Ticket): boolean {
@@ -52,12 +55,13 @@ export class DelegationExecutor {
     const delegationId = key('delegation', this.config.instanceId, ticket.id, assignment.id)
     const source = this.store.triggers.get(ticket.origin.triggerId)
     if (!source) throw new Error('A delegated task requires its actual original source record')
+    const inherited = this.incoming?.forward(ticket, assignment)
     const taskContext = DelegationTaskContextSchema.parse({ scope: ticket.mandate.scope, strength: ticket.mandate.strength,
-      assignment: ticket.execution?.assignment ?? '', source: { triggerId: source.id, kind: source.source, actor: source.actor,
+      assignment: ticket.execution?.assignment ?? '', source: inherited?.source ?? { triggerId: source.id, kind: source.source, actor: source.actor,
         human: source.human, at: source.at, text: source.text, ...(source.url ? { url: source.url } : {}) } })
-    const request: DelegationRequest = { targetInstanceId: capability.instanceId, delegationId, parentTicketId: ticket.id,
+    const request: DelegationRequest = DelegationRequestSchema.parse({ targetInstanceId: capability.instanceId, delegationId, parentTicketId: ticket.id,
       parentAssignmentId: assignment.id, parentDecisionId: ticket.decisionId, operation: 'submit', commandId: key(delegationId, 'submit'),
-      text: ticket.title, tools, path: [this.config.instanceId], taskContext }
+      text: ticket.title, tools, path: inherited?.path ?? [this.config.instanceId], lineage: inherited?.lineage ?? [], taskContext })
     this.store.set(name, { request, commands: {}, submitAttempted: false })
   }
   stop(ticket: Ticket, assignment: Assignment): void {
@@ -77,6 +81,11 @@ export class DelegationExecutor {
     if (snapshot.delegationId !== r.delegationId || snapshot.parentTicketId !== r.parentTicketId
       || snapshot.parentAssignmentId !== r.parentAssignmentId || snapshot.childInstanceId !== r.targetInstanceId) throw new Error('Child response does not match the fixed assignment')
     if (row.snapshot?.ticketId && snapshot.ticketId !== row.snapshot.ticketId) throw new Error('Child ticket binding changed')
+    const starts = [verifiedDelegationLineage(snapshot)[0], ...verifiedArtifactLineages(snapshot).map(path => path[0])]
+    if (starts.some(first => first && (first.parentInstanceId !== this.config.instanceId || first.parentDecisionId !== r.parentDecisionId
+      || fingerprint(first.tools) !== fingerprint(r.tools) || r.taskContext && (first.scope !== r.taskContext.scope
+        || first.strength !== r.taskContext.strength || first.assignment !== r.taskContext.assignment))))
+      throw new Error('Child lineage changed the accepted parent scope or grant')
     verifiedDelegationArtifacts(snapshot)
   }
   private controls(row: Binding, ticket: Ticket): void {
@@ -231,6 +240,23 @@ export class DelegationExecutor {
     }
   }
   list() { return this.store.keys(outgoing).map(name => this.store.get(name)!) }
+  result(ticketId: string): DelegationSnapshot | undefined {
+    const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    const row = assignment && this.store.get(this.name(ticketId, assignment.id))
+    if (!row?.snapshot) return
+    this.verify(row, row.snapshot); return row.snapshot
+  }
+  artifactLineages(ticketId: string) {
+    const paths = this.list().filter(row => row.request.parentTicketId === ticketId && row.snapshot).flatMap(row => {
+      this.verify(row, row.snapshot!)
+      const snapshot = row.snapshot!, artifacts = verifiedDelegationArtifacts(snapshot)
+      return [verifiedDelegationLineage(snapshot), ...verifiedArtifactLineages(snapshot)].filter(path => {
+        const leaf = path.at(-1)
+        return leaf && artifacts.some(item => item.instanceId === leaf.childInstanceId && item.ticketId === leaf.childTicketId)
+      })
+    })
+    return [...new Map(paths.map(path => [fingerprint(path), path])).values()]
+  }
   artifacts(ticketId: string): VerifiedArtifact[] {
     const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
     if (!ticket || !assignment) return []

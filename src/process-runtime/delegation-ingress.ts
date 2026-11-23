@@ -1,10 +1,10 @@
 /** Durable machine ingress. It never creates a human UserTurn or writes a Ticket directly. */
-import { Engine, key, latestAssignment, type DelegationAuthority, type Mandate, type Trigger, type Ticket } from '../core/index.ts'
+import { Engine, key, latestAssignment, type Assignment, type DelegationAuthority, type Mandate, type Trigger, type Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import { z } from 'zod'
 import { family, record } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
-import { DelegationRequestSchema, type DelegationEnvelope, type DelegationRequest, type DelegationSnapshot } from './delegation-contract.ts'
+import { DelegationRequestSchema, type DelegationEnvelope, type DelegationRequest, type DelegationSnapshot, type DelegationLink } from './delegation-contract.ts'
 import { WorkerToolSchema } from './worker-capabilities.ts'
 
 interface Command { request: DelegationRequest; hash: string; at: string; trigger?: Trigger }
@@ -22,6 +22,7 @@ const grantedTools = family<z.infer<typeof WorkerToolSchema>[], [string]>('proce
 const sameParent = (a: DelegationRequest, b: DelegationRequest) => a.delegationId === b.delegationId && a.parentTicketId === b.parentTicketId
   && a.parentAssignmentId === b.parentAssignmentId && a.parentDecisionId === b.parentDecisionId && a.targetInstanceId === b.targetInstanceId
   && fingerprint(a.tools) === fingerprint(b.tools) && fingerprint(a.path) === fingerprint(b.path)
+  && fingerprint(a.lineage ?? []) === fingerprint(b.lineage ?? [])
   && fingerprint(a.taskContext ?? null) === fingerprint(b.taskContext ?? null)
 type Config = { instanceId: string; allowedParents?: string[]; workerTools: string[] }
 type Preparation = { status: 'complete' | 'failed' | 'cancelled'; text: string; error?: string }
@@ -36,7 +37,7 @@ export class InboundDelegations {
 
   private related(source: string, request: DelegationRequest): boolean {
     return source !== this.config.instanceId && !!this.config.allowedParents?.includes(source)
-      && request.targetInstanceId === this.config.instanceId && request.path[0] === source
+      && request.targetInstanceId === this.config.instanceId && request.path.at(-1) === source
   }
   private permitted(source: string, request: DelegationRequest, bound?: Incoming): boolean {
     return this.related(source, request) && request.tools.length > 0 && (bound ? bound.source === source && sameParent(bound.request, request)
@@ -94,6 +95,35 @@ export class InboundDelegations {
     const row = this.store.get(incoming(basis.delegation.delegationId))
     return row && this.revalidate(ticket.mandate) ? this.allowedTools(row).filter(tool => basis.delegation.tools.includes(tool)) : []
   }
+  /** The candidate catalog uses the same verified incoming grant as the eventual Worker. */
+  toolsForTrigger(trigger: Trigger): string[] | undefined {
+    if (trigger.source !== 'delegation') return
+    const authority = this.authorize(trigger), row = authority && this.store.get(incoming(authority.delegationId))
+    return row ? this.allowedTools(row) : []
+  }
+  private link(row: Incoming, ticket: Ticket, assignment: Assignment): DelegationLink {
+    const r = row.request, context = r.taskContext
+    if (!context) throw new Error('Historical delegation has no verified original parent task context for another hop')
+    return { ...this.authority(row), tools: [...r.tools], childInstanceId: this.config.instanceId, childTicketId: ticket.id,
+      childAssignmentId: assignment.id, childDecisionId: ticket.decisionId,
+      scope: context.scope, strength: context.strength, assignment: context.assignment }
+  }
+  /** Prove a retained descendant result against the exact receiving assignment that sent it. */
+  resultLink(delegationId: string, assignmentId: string): DelegationLink {
+    const row = this.store.get(incoming(delegationId)), ticket = row && this.ticket(row)
+    const assignment = ticket?.assignments.find(item => item.id === assignmentId)
+    if (!row || !ticket || !assignment) throw new Error('Artifact path has no matching original receiving assignment')
+    return this.link(row, ticket, assignment)
+  }
+  /** Extend only this incoming ticket's durable binding; never reconstruct ancestry from model text. */
+  forward(ticket: Ticket, assignment: Assignment) {
+    if (ticket.mandate.basis.via !== 'delegation') return
+    const row = this.store.get(incoming(ticket.mandate.basis.delegation.delegationId))
+    if (!row || !this.revalidate(ticket.mandate) || this.ticket(row)?.id !== ticket.id)
+      throw new Error('Delegated task no longer has its original authorized parent binding')
+    return { path: [...row.request.path, this.config.instanceId], lineage: [...row.request.lineage ?? [], this.link(row, ticket, assignment)],
+      source: row.request.taskContext!.source }
+  }
   private ticket(row: Incoming): Ticket | undefined {
     const command = row.commands[row.request.commandId], trigger = command?.trigger
     const receipt = trigger && this.engine.commandReceipt(trigger.id)?.consumption
@@ -113,6 +143,7 @@ export class InboundDelegations {
     return { delegationId: row.request.delegationId, parentTicketId: row.request.parentTicketId,
       parentAssignmentId: row.request.parentAssignmentId, childInstanceId: this.config.instanceId, status, receipts,
       ...(ticket ? { ticketId: ticket.id, assignmentId: assignment?.id } : {}),
+      ...(ticket && assignment && row.request.taskContext ? { lineage: [this.link(row, ticket, assignment)] } : {}),
       ...(report?.summary || row.error ? { summary: report?.summary ?? row.error } : {}),
       ...(ticket?.attention && !ticket.attention.answeredBy ? { question: { id: ticket.attention.id, text: ticket.attention.question } } : {}) }
   }

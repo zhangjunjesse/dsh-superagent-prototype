@@ -732,10 +732,15 @@ export class ProcessManager {
       if (!control || source.management !== managementOwner || !managementOwner.active || managementOwner.ended) throw new Error('Management-only delegation permits bound cleanup controls only');
     } else current(source, sourceGeneration);
     const sourceId = source.config.instanceId;
-    if (request.path[0] !== sourceId) throw new Error('Delegation path must identify the authenticated source instance');
+    if (request.path.at(-1) !== sourceId) throw new Error('Delegation path must end at the authenticated source instance');
     const capability = source.config.delegationTargets.find(target => target.instanceId === request.targetInstanceId);
     const target = this.instances.get(request.targetInstanceId);
     if (!capability || !target?.config.allowedParents.includes(sourceId)) throw new Error('Delegation relationship is not mutually allowed');
+    for (const [index, id] of request.path.entries()) {
+      const childId = request.path[index + 1] ?? request.targetInstanceId, parent = this.instances.get(id), child = this.instances.get(childId);
+      if (!parent?.config.delegationTargets.some(target => target.instanceId === childId) || !child?.config.allowedParents.includes(id))
+        throw new Error('Delegation lineage no longer matches the current direct organization relationships');
+    }
     // The child verifies the immutable identity and grant of each follow-up. Its execution policy intersects that grant with current permissions.
     if (request.operation === 'submit' && request.tools.some(tool => !capability.tools.includes(tool))) throw new Error('Delegation tools exceed the parent and child intersection');
     if (request.operation === 'submit' && (!capability.tools.length || !request.tools.length)) throw new Error('Delegation submission requires shared read-only tools');

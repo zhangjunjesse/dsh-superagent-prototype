@@ -57,7 +57,7 @@ const RouteItemSchema = z.object({
   acknowledgement: z.string().nullish().describe(`accept: one brief sentence of at most ${IM_WORDS} words naming the concrete change and intended result in the source language. It is posted as a reply to the original source on acceptance, so do not quote the source; quote an earlier proposal briefly only when the trigger merely confirms it and the sentence does not already state it. No generic I will handle it.`),
   note: z.string().nullish().describe(`accept and attach: ${RoutingNoteSchema.description ?? ''}`),
   reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
-  target_instance_id: z.string().nullish().describe('accept only: a direct child instance from this candidate\'s execution_targets; omit for this instance\'s Worker. This never permits another delegation hop.'),
+  target_instance_id: z.string().nullish().describe('accept only: a direct child instance from this candidate\'s execution_targets; omit for this instance\'s Worker. Each child applies its own original task admission and inherited permission limits.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
