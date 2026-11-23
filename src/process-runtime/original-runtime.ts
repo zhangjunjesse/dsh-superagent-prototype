@@ -225,8 +225,17 @@ export class OriginalProcess {
         holdForDepartment: (ticketId, assignmentId, reviewId, requirement, summary) => this.departments.hold(ticketId, assignmentId, reviewId, requirement, summary),
         resumeDepartment: async (ticketId, assignmentId, reviewId, target, summary) => {
           const committed = runtime!.store.tickets.get(ticketId)?.assignments.find(item => item.id === assignmentId)?.resultReviews?.find(item => item.id === reviewId)?.decision
-          if (!committed) await this.prepareReview(ticketId, target, assignmentId, reviewId)
-          return this.departments.resume(ticketId, assignmentId, reviewId, target, summary)
+          if (committed) return this.departments.resume(ticketId, assignmentId, reviewId, target, summary)
+          try {
+            await this.refreshDelegationCatalog()
+            const ticket = runtime!.store.tickets.get(ticketId)
+            this.departments.validateResume(ticketId, assignmentId, reviewId, target, ticket ? this.departmentTargets(ticket) : [])
+            await this.prepareReview(ticketId, target, assignmentId, reviewId)
+            return this.departments.resume(ticketId, assignmentId, reviewId, target, summary)
+          } catch (error) {
+            this.departments.failedResume(ticketId, assignmentId, reviewId, target)
+            throw error
+          }
         },
         initialize: original => {
           if (adoption) verifyAdoption(original, config, adoption)
