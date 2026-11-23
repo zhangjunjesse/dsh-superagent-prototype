@@ -163,7 +163,8 @@ export class OriginalProcess {
             authorize: (ticket, assignment, decision) => this.delegated.authorizeReview(ticket, assignment, decision),
             request: (ticket, assignment, review) => runtime!.sessions.relay(review.id, JSON.stringify({ kind: 'result_review',
               ticket_id: ticket.id, assignment_id: assignment.id, review_id: review.id, evidence_ref: review.evidenceRef,
-              scope: ticket.mandate.scope, original_request: `trigger/${ticket.origin.triggerId}`,
+              scope: ticket.mandate.scope, original_request: ticket.mandate.basis.via === 'delegation'
+                ? `delegation/${ticket.origin.triggerId}/source` : `trigger/${ticket.origin.triggerId}`,
               ...(ticket.attention ? { human_action: ticket.attention.question, attention_id: ticket.attention.id } : {}),
               original_assignment: `ticket/${ticket.id}/assignment`, inputs: `ticket/${ticket.id}/inputs`,
               history: `ticket/${ticket.id}/assignments`, read: `ticket/${ticket.id}/review/${review.id}`,

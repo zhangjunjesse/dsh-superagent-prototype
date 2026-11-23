@@ -145,6 +145,21 @@ test('real running owners keep old waiting work on its original path and switch 
     const card = JSON.parse(text);
     trace.push({ instanceId: config.instanceId, role: policy.role, card });
     if (policy.role === 'orchestrator') {
+      if (card.kind === 'result_review') {
+        const original = await tool('orchestrator_read', { resource: card.original_request, offset: 0 });
+        assert.equal(original.text, config.instanceId === 'old' ? 'Read the bounded old department file' : 'Read a newly authorized department file');
+        const review = JSON.parse((await tool('orchestrator_read', { resource: card.read, offset: 0, limit: 8000 })).text);
+        assert.equal(review.evidenceRef, card.evidence_ref);
+        const parts = review.summary.split('\n\n'), summary = parts[0];
+        assert.equal(summary, 'Original bound work completed with its own answer.');
+        const { producer, artifacts } = JSON.parse(parts.at(-1));
+        assert.equal(producer.instanceId, 'research');
+        assert.equal(artifacts.length, 1);
+        assert.equal(artifacts[0].ticketId, producer.ticketId);
+        await tool('orchestrator_result_review', { ticket_id: card.ticket_id, assignment_id: card.assignment_id,
+          review_id: card.review_id, decision: { kind: 'accept', summary } });
+        return;
+      }
       if (card.kind !== 'candidate') return;
       let decision;
       if (card.dispatch && card.dispatch.operation !== 'new') decision = { kind: 'attach', trigger_id: card.trigger_id, ticket_id: card.dispatch.target_ticket_id };
