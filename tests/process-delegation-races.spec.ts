@@ -66,6 +66,19 @@ function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapsho
 }
 
 describe('delegation completion fences', () => {
+  it('keeps the parent ticket open for its own goal verification after a child completes', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed',
+      summary: 'Marker A was checked. Marker B has not been verified.' }), {
+      text: 'Read marker A and marker B and verify both results.',
+      scope: 'Both marker A and marker B must be verified.',
+      assignment: 'Verify both marker results before delivering the original request.',
+    })
+
+    await h.proxy.tick()
+
+    expect(h.current().ended).toBeUndefined()
+  })
+
   it('does not enqueue a local Worker when an original executor resumes a pending child-owned assignment', () => {
     const h = fixture(async request => childSnapshot(request)), board = new HealthBoard(), effects = new Effects(h.store, board)
     const denied = () => { throw new Error('A child-owned assignment must never enter a local Session') }
