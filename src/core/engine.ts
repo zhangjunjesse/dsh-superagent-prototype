@@ -284,7 +284,8 @@ export class Engine {
    * cleared (`null` or a `ready` report), and a replaced attention question whose reply has not been sent yet is withdrawn
    * from the outbox. A `blocked` or `failed` report holds back automated inputs until a human message arrives. A `dropped`
    * report ends the ticket, and a `ready` report ends it: `completed` without followed Threads, else with the `followsDone`
-   * outcome once `followsDone` holds.
+   * outcome once `followsDone` holds. With result-review integration, a reviewed continuation's results, blockers and
+   * failures return to the owning main Session; only its current acceptance can complete the original goal.
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
@@ -292,9 +293,9 @@ export class Engine {
     return this.repo.atomic(() => {
       const ticket = this.repo.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
       // Ordinary local ready reports retain their original semantics. A reviewed task's local continuation returns to its owner.
-      if (this.options.resultReview && assignment?.continuation && (report.state === 'ready' || report.state === 'dropped')) {
+      if (this.options.resultReview && assignment?.continuation && ['ready', 'dropped', 'blocked', 'failed'].includes(report.state)) {
         if (report.state === 'ready' && report.question) throw new UserError('questionWithResult')
-        this.reviews.stage(ticketId, assignment.id, key('local-result', assignment.id, report.summary), report.summary, report)
+        this.reviews.stage(ticketId, assignment.id, key('local-result', assignment.id, report.state, report.summary, report.question ?? ''), report.summary, report)
         return this.repo.tickets.get(ticketId)!
       }
       return this.assignments.report(ticketId, report)

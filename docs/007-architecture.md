@@ -308,6 +308,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/evals.ts` | `Evals`: the Evals of Threads and their Decisions |
 | `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, Subscriptions and Inputs |
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
+| `src/core/result-reviews.ts` | `ResultReviews`: durable evidence, original-goal acceptance and remaining work under the same Mandate, with input/authority CAS and idempotent decisions |
 | `src/core/replies.ts` | `Replies`: the Engine's Channel writes |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
 | `src/core/errors.ts` | `UserError` and `USER_ERRORS` |
@@ -462,6 +463,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/core-delegation.spec.ts` | Verified machine admission, immutable parent authority, fixed targets, actionable inputs, question CAS, revocation and nonhuman stop |
 | `tests/process-delegation.spec.ts` | Parent and child runtime flow, isolated child brain, tool intersection, fixed bindings, followups, questions, stops, local capacity and restart without replay |
 | `tests/process-delegation-races.spec.ts` | Late input and rejected-control completion fences, stop during missing-query, transport failure visibility and recovery |
+| `tests/process-result-review.spec.ts` | Original native main Session judges a partial repair, continues local or child validation, checks the actual file revision, retains evidence and accepts before the original Channel receives a result |
+| `tests/result-review-recovery.spec.ts` | Real SQLite/Effects resume one pending review and one immutable continuation; followed-thread close cannot bypass parent acceptance |
 | `tests/process-live-routing.spec.ts` | Live child discovery, readiness at selection and admission, and continuity of existing assignments |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
@@ -554,18 +557,23 @@ Nothing deletes old records yet, so these grow without bound: the `trigger`, `di
 
 ### Main Session tools
 
-The main Session has 14 application tools:
+The main Session has 15 application tools:
 
 | Purpose | Tools |
 | --- | --- |
 | Read and route | `orchestrator_read`, `orchestrator_route` |
 | Manage Tickets | `orchestrator_ticket_retry`, `orchestrator_ticket_request_status`, `orchestrator_ticket_note` |
+| Review executor evidence | `orchestrator_result_review` |
 | Re-evaluate | `orchestrator_trigger_requeue` |
 | Assess proactive work | `orchestrator_eval`, `orchestrator_eval_read`, `orchestrator_eval_decide` |
 | Communicate and unsubscribe | `orchestrator_reply`, `orchestrator_thread_unsubscribe` |
 | Configure | `orchestrator_settings_save`, `orchestrator_policy_sync`, `orchestrator_prompts_save` |
 
 `orchestrator_route` accepts 1–20 decisions in order. Each accept, attach, stop or ignore runs as a separate Engine command. It also permits ignoring an inferred candidate directly from its card. `orchestrator_ticket_note` sends a fact as context, not authority.
+
+An organization holds a completed child result for its original main Session, using the configured Router model, full versioned prompts, skills and native tool limits. `Sessions.relay` persists the review and wakes that Session through the original `Effects` queue. The review links the original Trigger, scope, full inputs, previous assignments, actual producer and verified artifact references. The program validates provenance and authority; the model judges whether the evidence meets the original goal and belongs to the delivered version.
+
+`orchestrator_result_review` binds `ticket_id`, `assignment_id` and `review_id` to the saved result. `accept` records the judgement and uses the normal ready/followed-thread rule; `continue` records the remaining instructions and starts a new Assignment on the same Ticket and Mandate. A continuation's `executionTarget` explicitly selects `local` or an authorized current child; older assignments retain their trigger route. Original instructions, earlier evidence and decisions remain readable. Local continuation results, dropped work, blockers and failures also return for review; ordinary local tasks retain their existing ready semantics. Input changes, newer evidence, stops, policy revocation, narrowed capabilities and frozen maintenance refuse stale decisions. Duplicate decisions replay without creating another assignment, and a followed-thread close cannot bypass a pending review.
 
 Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id. A prompt save with `preview: true` composes text without saving.
 
@@ -623,7 +631,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | `thread/<key>` | Label, Tickets, recent Decisions and a page of Triggers |
 | `trigger/<id>` | Message text, replied-to Trigger and neighboring messages, excluding CI runs |
 | `ticket/<id>` | Related ids, source-batch Triggers, Threads, and first pages of Assignments and Inputs |
-| Ticket subresources | `/assignments`, `/inputs`, `/assignment`, `/result`, `/report/<assignment id>`, `/transcript`, `/message/<n>`, `/input/<id>` |
+| Ticket subresources | `/assignments`, `/inputs`, `/assignment`, `/result`, `/report/<assignment id>`, `/review/<review id>`, `/continuation/<assignment id>`, `/transcript`, `/message/<n>`, `/input/<id>` |
 | `settings`, `settings/<block>` | Revisions and summaries, or a complete block ready to save |
 | `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
 | `models`, `models/<provider>` | Available models |

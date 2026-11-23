@@ -121,7 +121,7 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
   // The result-review relay carries the original goal and evidence. A ready-looking duplicate must not suggest delivery.
   const review = latestAssignment(ticket)?.resultReviews?.at(-1)
-  if ((report.state === 'ready' || report.state === 'dropped') && review && !review.decision) return undefined
+  if (['ready', 'dropped', 'blocked', 'failed'].includes(report.state) && review && !review.decision && review.summary === report.summary) return undefined
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     return { id: `attention:${ticket.id}:${asked.id}`,
