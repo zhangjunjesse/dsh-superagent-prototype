@@ -804,7 +804,8 @@ export class NativeHost {
     if (method === 'revokeDelivery') return this.revokeDelivery(input);
     if (method === 'readSourceImage') return this.trackExecution(() => this.sourceImage(input, signal));
     if (method === 'runPrepare') return this.trackExecution(() => this.executor.runPrepare(input.command, input.cwd, decodeEnvironment(input.environment), signal));
-    if (method === 'verifyDirectory') return this.executor.verifyDirectory(input.directory, signal);
+    if (method === 'verifyDirectory') return this.executor.verifyDirectory(input.directory, signal,
+      input.environment === undefined ? undefined : decodeEnvironment(input.environment));
     if (method === 'stopBackground') {
       if (!this.journal.session(input.sessionId) && !this.trusted.has(input.sessionId)) return;
       return this.drainBackground(input.sessionId, input.reason, input.keepInbox);

@@ -172,10 +172,10 @@ export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 
  * Verifies that a ticket directory's local or worktree git config defines no custom `credential.*` or `http.*extraheader`
  * keys, which the agent's git would read from the repository's own config and act on.
  */
-export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal, environment?: Record<string, string | undefined>): Promise<void> {
   const keys = ['git', 'config', '-z', '--show-scope', '--get-regexp', '^(credential\\..*|http\\..*extraheader)$']
   // `git config --get-regexp` exits with code 1 when no keys match.
-  const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), environment)
     .catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 1) return ''; throw error })
   const scoped = output.split('\0')
   const local = scoped.flatMap((scope, index) => index % 2 === 0 && (scope === 'local' || scope === 'worktree') ? [scoped[index + 1]!.split('\n')[0]!] : [])

@@ -145,9 +145,10 @@ it('removes every spelling of a directory from PATH and keeps the other entries'
 })
 
 /** Minimal SubprocessRuntime backed by child_process.spawn with an isolated global git config. */
-const subprocess = (config: string): SubprocessRuntime => ({
-  spawn: ({ argv, cwd }: { argv: readonly string[]; cwd: string }) => {
-    const child = spawn(argv[0]!, argv.slice(1), { cwd, env: gitEnv({ GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' }) })
+const subprocess = (config: string, ambient?: Record<string, string | undefined>): SubprocessRuntime => ({
+  spawn: ({ argv, cwd, env }: { argv: readonly string[]; cwd: string; env?: Record<string, string | undefined> }) => {
+    const environment = { ...gitEnv({ GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' }), ...ambient, ...env }
+    const child = spawn(argv[0]!, argv.slice(1), { cwd, env: ambient ? workerEnv(environment) : environment })
     const output = { stdout: '', stderr: '' }
     child.stdout.on('data', chunk => { output.stdout += String(chunk) })
     child.stderr.on('data', chunk => { output.stderr += String(chunk) })
@@ -162,6 +163,15 @@ describe('ticket directory check', () => {
   const git = (...args: string[]) => exec('git', args, { cwd: dir, env: env() })
   const check = (directory: string) => verifyDirectory(join(dir, directory), subprocess(join(dir, 'global')), signal)
   beforeEach(() => { writeFileSync(join(dir, 'global'), '[credential]\n\thelper = global-helper\n') })
+  it('checks the real directory with the Worker environment after ambient git config keys are scrubbed', async () => {
+    await git('init', '-q', 'repo')
+    await writeEnvironment(testDeployment({ stateDir: dir, github: undefined, feishu: undefined }), [])
+    const port = subprocess(join(dir, 'global'), { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.abbrev', GIT_CONFIG_VALUE_0: '12' })
+    await expect(verifyDirectory(join(dir, 'repo'), port, signal)).rejects.toThrow('missing config key GIT_CONFIG_KEY_0')
+    await expect(verifyDirectory(join(dir, 'repo'), port, signal, agentVariables(dir))).resolves.toBeUndefined()
+    await git('-C', 'repo', 'config', 'http.https://github.com/.extraheader', 'forbidden-local-header')
+    await expect(verifyDirectory(join(dir, 'repo'), port, signal, agentVariables(dir))).rejects.toThrow('sets http.https://github.com/.extraheader')
+  })
   it('passes a directory whose repository adds no credentials, and one outside any repository', async () => {
     await git('init', '-q', 'repo')
     await expect(check('repo')).resolves.toBeUndefined()

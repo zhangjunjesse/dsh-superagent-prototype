@@ -33,7 +33,7 @@ export function localExecutorNative(ctx: Context, ownsSession?: (sessionId: stri
     async removePending(id, ids) { for (const message of ids) requireAgent(id).inbox.remove(message as MessageId) },
     async events(id) { return requireAgent(id).session.snapshotEvents() },
     async runPrepare(command, cwd, environment, signal) { await runAsWorker(ctx.subprocess, prepareCommand(command), cwd, signal, environment) },
-    verifyDirectory: (directory, signal) => verifyDirectory(directory, ctx.subprocess, signal),
+    verifyDirectory: (directory, signal, environment) => verifyDirectory(directory, ctx.subprocess, signal, environment),
     stopBackground: (id, reason, keepInbox) => stopBackground(ctx, id, reason, keepInbox),
     async stopSubagents(id, keepInbox) { const value = agent(id); if (value) await stopSubagents(ctx, value, keepInbox) },
     async runningJobs(id, except) { return runningJobs(ctx, id, except) },

@@ -271,7 +271,7 @@ export class DshExecutor implements Executor {
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
     await mkdir(directory, { recursive: true })
-    await this.native.verifyDirectory(directory, this.host.lifetime)
+    await this.native.verifyDirectory(directory, this.host.lifetime, env)
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
