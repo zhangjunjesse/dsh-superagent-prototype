@@ -200,3 +200,54 @@ it('clears earlier transport uncertainty only after the exact result and native 
   expect(db.item.store.tickets.get(ticketId)!.assignments).toHaveLength(2)
   expect(h.proxy.artifacts(ticketId)).toEqual([artifact])
 })
+
+it.each(['stopping-query', 'stopped-query', 'stopped-control-error'] as const)('fences an older ordinary poll when %s hands ownership to the verified handoff', async mode => {
+  const db = database(), entered = Promise.withResolvers<void>(), held = Promise.withResolvers<void>()
+  const stopEntered = Promise.withResolvers<void>(), stopRelease = Promise.withResolvers<void>()
+  const operations: { operation: string; stopping: boolean; nativeStopped: boolean }[] = []
+  let h: ReturnType<typeof owner>, holdNext = false, intercepted = false, nativeStopped = false
+  h = owner(db.item.store, async request => {
+    operations.push({ operation: request.operation, stopping: h.proxy.list()[0]?.handoff?.stopping === true, nativeStopped })
+    const gated = mode === 'stopped-control-error' ? request.operation === 'append' : request.operation === 'query'
+    if (holdNext && gated && !intercepted) {
+      intercepted = true; entered.resolve(); await held.promise
+      if (mode === 'stopped-control-error') throw new Error('Old control acknowledgement lost after verified handoff stop')
+    }
+    if (request.operation === 'stop') { stopEntered.resolve(); await stopRelease.promise; nativeStopped = true; return result(request, { executionStopped: true }) }
+    return result(request, request.operation === 'append' ? { receipts: { [request.commandId]: 'denied' } } : {})
+  })
+  const ticketId = accept(h); await h.proxy.tick()
+  const original = db.item.store.tickets.get(ticketId)!, assignment = latestAssignment(original)!, review = assignment.resultReviews!.at(-1)!
+  const append = (id: string) => {
+    const trigger: Trigger = { id, source: 'jarvis', threads: [{ source: 'jarvis', id }], actor: { source: 'jarvis', id: 'human' },
+      human: true, addressed: 'direct', at: new Date().toISOString(), text: id, meta: {}, dispatch: { commandId: id, payloadHash: id,
+        operation: 'append', expectedInitialRecipients: [], targetTicketId: ticketId, controlPrecondition: { mandateDecisionId: original.decisionId } } }
+    h.engine.receive(trigger); h.engine.attach(ticketId, trigger.id)
+  }
+  if (mode === 'stopped-control-error') append('earlier-input-with-pending-control-ack')
+  holdNext = true
+  const poll = h.proxy.tick(); await entered.promise
+  const preparing = h.proxy.prepareReview(ticketId, assignment.id, review.id); await stopEntered.promise
+  try {
+    append('later-input-belongs-to-the-next-assignee')
+    if (mode === 'stopping-query') { held.resolve(); await poll; stopRelease.resolve(); await preparing }
+    else { stopRelease.resolve(); await preparing; held.resolve(); await poll }
+    // The later real input makes the old main turn stale, so this old assignment legitimately remains current after cleanup.
+    expect(() => h.engine.resolveResultReview(ticketId, assignment.id, review.id,
+      { kind: 'continue', summary: 'Old pre-input judgement', instructions: 'Old pre-input remaining work' })).toThrow('stale')
+    expect(operations.filter(item => item.operation === 'append' && (item.stopping || item.nativeStopped))).toEqual([])
+    const row = h.proxy.list()[0]!
+    expect(row.handoff?.stopped?.executionStopped).toBe(true)
+    expect(row.snapshot?.executionStopped).toBe(true)
+    expect(row.finished).toBe(true)
+    expect(row.error).toBeUndefined()
+    expect(h.proxy.artifacts(ticketId)).toEqual([artifact])
+    await h.proxy.tick()
+    const current = latestAssignment(db.item.store.tickets.get(ticketId)!)!.resultReviews!.at(-1)!
+    await h.proxy.prepareReview(ticketId, assignment.id, current.id)
+    h.engine.resolveResultReview(ticketId, assignment.id, current.id, { kind: 'continue', summary: 'Verified original version and later inputs still require validation.',
+      instructions: 'Validate only the retained original version and handle the later original-task inputs.' })
+    expect(db.item.store.tickets.get(ticketId)!.assignments).toHaveLength(2)
+    expect(db.item.store.tickets.get(ticketId)!.mandate).toEqual(original.mandate)
+  } finally { held.resolve(); stopRelease.resolve(); await Promise.allSettled([poll, preparing]) }
+})

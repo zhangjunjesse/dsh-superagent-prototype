@@ -415,7 +415,7 @@ export class DelegationExecutor {
     if (!this.send) return
     bindings: for (const name of this.store.keys(outgoing)) {
       let row = this.store.get(name)!
-      if (this.retryOwns(row)) continue
+      if (row.replacement && !row.stopped) continue
       if (row.handoff && this.current(row) && !row.stopped) {
         try { await this.recoverHandoff(name) } catch (error) {
           if ((this.store.get(name)?.handoff?.retryAt ?? 0) <= Date.now()) this.failedHandoff(name, error)
@@ -429,7 +429,7 @@ export class DelegationExecutor {
         if (!ticket && !row.stopped) { row.stopped = true; this.store.set(name, row) }
         let snapshot = await this.send({ ...row.request, operation: 'query', commandId: key(row.request.delegationId, 'query'), text: undefined })
         row = this.store.get(name)!
-        if (this.retryOwns(row)) continue
+        if (this.pollSuperseded(row)) continue
         this.verify(row, snapshot)
         if (!this.current(row)) { row.stopped = true; this.store.set(name, row) }
         // Query before every possible submit: a lost acknowledgement never creates another task.
@@ -442,17 +442,17 @@ export class DelegationExecutor {
           this.store.set(name, row)
           snapshot = await this.send(row.request)
           row = this.store.get(name)!
-          if (this.retryOwns(row)) continue
+          if (this.pollSuperseded(row)) continue
           this.verify(row, snapshot)
         }
         // Reload because a human stop or a new input can arrive while the IPC request is in flight.
         row = this.store.get(name)!
-        if (this.retryOwns(row)) continue
+        if (this.pollSuperseded(row)) continue
         if (row.stopped) {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
           snapshot = await this.send(request)
           row = this.store.get(name)!
-          if (this.retryOwns(row)) continue
+          if (this.pollSuperseded(row)) continue
           this.verify(row, snapshot)
           row.snapshot = snapshot
           this.stoppedSnapshot(row, snapshot)
@@ -464,24 +464,24 @@ export class DelegationExecutor {
           this.controls(row, current); this.store.set(name, row)
           if (snapshot.ticketId) for (const command of Object.values(row.commands)) {
             row = this.store.get(name)!
-            if (this.retryOwns(row)) continue bindings
+            if (this.pollSuperseded(row)) continue bindings
             if (row.commands[command.request.commandId]?.settled) continue
             if (this.frozen()) break
             if (row.stopped || !this.current(row)) break
             snapshot = await this.send(command.request)
             row = this.store.get(name)!
-            if (this.retryOwns(row)) continue bindings
+            if (this.pollSuperseded(row)) continue bindings
             this.verify(row, snapshot)
           }
           // A stop during control delivery fences late reports as well.
           row = this.store.get(name)!
-          if (this.retryOwns(row) || row.stopped) continue
+          if (this.pollSuperseded(row) || row.stopped) continue
           this.store.atomic(() => { this.apply(row, snapshot); this.store.set(name, row) })
         }
         delete row.error; delete row.retryAt; delete row.failures; this.store.set(name, row)
       } catch (error) {
         const latest = this.store.get(name)!
-        if (this.retryOwns(latest)) continue
+        if (this.pollSuperseded(latest)) continue
         const message = String(error), ticket = this.current(latest)
         if (ticket && latest.error !== message) this.engine.report(ticket.id, { state: 'blocked',
           summary: 'Child connection or command outcome is unavailable. The fixed task will be queried again; no replacement task was created.' })
@@ -491,8 +491,10 @@ export class DelegationExecutor {
       }
     }
   }
-  /** Retry owns even a retired assignment; a late ordinary poll cannot overwrite its scoped cleanup proof. */
-  private retryOwns(row: Binding): boolean { return !!row.replacement && !row.stopped }
+  /** Late replies from ordinary polling cannot deliver inputs or overwrite another operation's cleanup proof. */
+  private pollSuperseded(row: Binding): boolean {
+    return !!row.finished || (!row.stopped && (!!row.replacement || !!row.handoff))
+  }
   list() { return this.store.keys(outgoing).map(name => this.store.get(name)!) }
   result(ticketId: string): DelegationSnapshot | undefined {
     const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
