@@ -12,7 +12,7 @@ const installedRequire = createRequire(join(installed, 'package.json'));
 const load = name => import(pathToFileURL(installedRequire.resolve(name)));
 export const available = existsSync(join(installed, 'package.json'));
 
-export async function nativeFixture(t, { managementOnly = false, role = 'worker', allowedTools = ['read', 'todo_write', 'subagent', 'send_message', 'list_agents', 'interrupt_agent'], local = ['subagent'], inherited = ['read', 'write', 'todo_write', 'send_message', 'list_agents', 'interrupt_agent'], nativeTools, realCapabilities = false } = {}) {
+export async function nativeFixture(t, { managementOnly = false, role = 'worker', allowedTools = ['read', 'todo_write', 'subagent', 'send_message', 'list_agents', 'interrupt_agent'], local = ['subagent'], inherited = ['read', 'write', 'todo_write', 'send_message', 'list_agents', 'interrupt_agent'], nativeTools, realCapabilities = false, searchCapabilities = false, pwshTimeoutMs = 5000 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'original-native-host-'));
   let rootContext, cleanup;
   t.after(async () => {
@@ -127,7 +127,8 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
   if (realCapabilities) {
     const names = ['dsh-subprocess-local', 'dsh-working-directory', 'dsh-session-query-sqlite', 'dsh-subagent', 'dsh-subagent-spawn-in-process',
       'dsh-tool-subagent', 'dsh-tool-subagent-control', 'dsh-tool-todo', 'dsh-jobs-local', 'dsh-tool-jobs', 'dsh-pwsh-sandbox', 'dsh-tool-pwsh',
-      'dsh-sandbox-local', 'dsh-sandbox-policy', 'dsh-user-approval', 'dsh-permission-presets', 'dsh-fs-local', 'dsh-tool-fs', 'dsh-shell-env'];
+      'dsh-sandbox-local', 'dsh-sandbox-policy', 'dsh-user-approval', 'dsh-permission-presets', 'dsh-fs-local', 'dsh-tool-fs', 'dsh-shell-env',
+      ...(searchCapabilities ? ['dsh-tool-fs-search'] : [])];
     nativePlugins = Object.fromEntries(await Promise.all(names.map(async name => [name, await load('@deepseek-ai/' + name)])));
     // Installed DSH publishes services from sibling plugin fibers. Constructing
     // them on the root Context would accidentally permit undeclared reads in a
@@ -142,7 +143,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
     const live = value => ({ get: () => value });
     const { SandboxPwshExecutor } = nativePlugins['dsh-pwsh-sandbox'];
     await ctx.plugin({ name: 'fixture-pwsh-provider', inject: SandboxPwshExecutor.inject, apply(scope) {
-      new SandboxPwshExecutor(scope, { cwd: live(undefined), timeoutMs: live(5000), maxTimeoutMs: live(5000),
+      new SandboxPwshExecutor(scope, { cwd: live(undefined), timeoutMs: live(pwshTimeoutMs), maxTimeoutMs: live(pwshTimeoutMs),
         maxOutputBytes: live(200000), maxSpillBytes: live(1000000), graceMs: live(1000), pwshPath: live(undefined) });
     } });
     new nativePlugins['dsh-user-approval'].ApprovalService(ctx, { policy: 'never' });
@@ -175,6 +176,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
         const install = (name, config) => preset.ctx.plugin({ name: `fixture-${name}`, inject: nativePlugins[name].inject,
           apply: child => nativePlugins[name].apply(child, config) });
         await install('dsh-tool-fs', cordis.resolveConfig(nativePlugins['dsh-tool-fs'], { readImage: false }));
+        if (searchCapabilities) await install('dsh-tool-fs-search', cordis.resolveConfig(nativePlugins['dsh-tool-fs-search'], { sampleOverCapGlobResults: false }));
         await install('dsh-tool-pwsh', {});
         await install('dsh-tool-jobs', { waitTimeoutMs: 1000, maxWaitTimeoutMs: 5000 });
         await install('dsh-tool-subagent-control');

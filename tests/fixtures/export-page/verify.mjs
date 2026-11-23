@@ -20,6 +20,7 @@ try {
   const shown = await page.locator('tbody tr').evaluateAll(rows =>
     rows.map(row => ({ id: row.cells[0].textContent, name: row.cells[1].textContent })));
   assert.deepEqual(shown, expected, 'The page must show both known records.');
+  await page.screenshot({ path: join(outputDirectory, 'verification.png'), fullPage: true });
   const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: '导出记录' }).click()]);
   assert.equal(download.suggestedFilename(), 'records.json');
   const path = join(outputDirectory, 'records.json');
