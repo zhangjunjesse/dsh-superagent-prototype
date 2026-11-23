@@ -125,6 +125,27 @@ function delegationLimits(instances, config) {
     sourceInstanceId, tools: instances.get(sourceInstanceId).config.delegationTargets.find(target => target.instanceId === config.instanceId).tools,
   }));
 }
+// A never-started, stopped child cannot own an in-flight delegated execution.
+// Its initial tool selection changes the parent's future catalog, not the
+// permissions of any existing parent Worker. The business owner independently
+// refuses catalog changes for a target with any saved task/assignment binding.
+function initialChildCatalogChange(previous, next, id, configuredIds) {
+  const item = previous.get(id), config = next.get(id)?.config;
+  if (!item || !config || !sameConfiguration(item.config, { ...config, delegationTargets: item.config.delegationTargets })) return false;
+  const targets = new Map(config.delegationTargets.map(target => [target.instanceId, target]));
+  if (targets.size !== item.config.delegationTargets.length) return false;
+  let changed = false;
+  for (const target of item.config.delegationTargets) {
+    const current = targets.get(target.instanceId);
+    if (!current || !sameConfiguration(target, { ...current, tools: target.tools })) return false;
+    if (sameConfiguration(target.tools, current.tools)) continue;
+    const child = previous.get(target.instanceId);
+    if (!child || child.phase !== 'stopped' || child.generation !== 0 || child.startup || child.child || child.bridge || child.native
+      || child.operation || child.cleanupPending || configuredIds && !configuredIds.includes(target.instanceId)) return false;
+    changed = true;
+  }
+  return changed;
+}
 // An online addition can introduce new children, but cannot rewrite any existing
 // grant, change its order, or change the configuration of an existing instance.
 function onlyAddsChildren(previous, next) {
@@ -430,7 +451,7 @@ export class ProcessManager {
   /** Include parents whose derived delegation catalog changes with a child's capabilities. */
   affectedInstances(rawInstances) {
     const next = configuration(rawInstances, this.rootDir), ids = new Set([...this.instances.keys(), ...next.keys()]);
-    return [...ids].filter(id => !this.instances.has(id) || !next.has(id) || !sameConfiguration(this.instances.get(id).config, next.get(id).config)
+    return [...ids].filter(id => !this.instances.has(id) || !next.has(id) || !sameConfiguration(this.instances.get(id).config, next.get(id).config) && !initialChildCatalogChange(this.instances, next, id)
       || !sameConfiguration(delegationLimits(this.instances, this.instance(id).config), delegationLimits(next, next.get(id).config)));
   }
   async freezeIdleCapabilities(ids, operationId) {
@@ -457,7 +478,8 @@ export class ProcessManager {
       const config = next.get(id)?.config;
       if (!config) throw new Error('Missing organization during Worker configuration');
       const expected = ids.includes(id) ? { ...item.config, workerTools: config.workerTools, workerSkills: config.workerSkills,
-        delegationTargets: item.config.delegationTargets.map(target => ({ ...target, tools: config.delegationTargets.find(t => t.instanceId === target.instanceId)?.tools })) } : item.config;
+        delegationTargets: item.config.delegationTargets.map(target => ({ ...target, tools: config.delegationTargets.find(t => t.instanceId === target.instanceId)?.tools })) }
+        : initialChildCatalogChange(this.instances, next, id, ids) ? { ...item.config, delegationTargets: config.delegationTargets } : item.config;
       if (!sameConfiguration(expected, config) || !ids.includes(id) && !sameConfiguration(delegationLimits(this.instances, item.config), delegationLimits(next, config))) {
         throw new Error('Worker settings cannot change an unfrozen organization or its delegation grant');
       }
@@ -491,7 +513,7 @@ export class ProcessManager {
     }
     // All participating owners are frozen. A failed durable commit leaves them fenced for idempotent retry.
     persist();
-    for (const item of items) item.config = next.get(item.config.instanceId).config;
+    for (const [id, item] of this.instances) if (ids.includes(id) || initialChildCatalogChange(this.instances, next, id, ids)) item.config = next.get(id).config;
   }
   validateCapabilityOperation(operationId) {
     if (typeof operationId !== 'string' || !operationId.trim() || operationId.length > 200) throw new Error('Invalid capability operation identity');

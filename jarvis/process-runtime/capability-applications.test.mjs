@@ -30,6 +30,45 @@ async function fixture(t, extra = []) {
 const child = (id, tools = ['read']) => ({ id, parent: 'root', kind: 'instance', name: id, workerTools: tools });
 const peer = (control, id = 'root') => control.manager.instance(id).peer;
 
+test('a new unbound child can configure its tools while the parent keeps unrelated live work', async t => {
+  const { control } = await fixture(t, [child('sibling')]);
+  await control.action('root', 'start', control.revision);
+  await control.action('sibling', 'start', control.revision);
+  await peer(control).call('test.add', work('original-parent-work'));
+  const before = control.manager.status().instances.find(item => item.instanceId === 'root');
+  const initial = await control.get();
+  await control.save({ revision: initial.revision, nodes: [...initial.nodes, child('new-client')] });
+  const view = await save(control, control.revision, ['read', 'glob'], 'new-client');
+  assert.equal(view.application.state, 'applied', 'A stopped new child has no binding to the parent old work and must be configurable before startup');
+  assert.deepEqual(view.applied.tools, ['read', 'glob']);
+  assert.deepEqual(view.application.affected.map(item => item.instanceId), ['new-client']);
+  assert.deepEqual(control.manager.status().instances.find(item => item.instanceId === 'root'), before, 'Existing parent owner remains in its original generation');
+  const parent = await peer(control).call('test.inspect');
+  assert.deepEqual(parent.tasks.map(item => item.id), ['original-parent-work']);
+  assert.equal(parent.hold, undefined);
+  assert.deepEqual(control.manager.instance('root').config.delegationTargets.find(item => item.instanceId === 'new-client').tools, ['read', 'glob']);
+  assert.equal(control.manager.instance('new-client').phase, 'stopped');
+  const expanded = await save(control, control.revision, ['read', 'glob', 'write'], 'new-client');
+  assert.equal(expanded.application.state, 'applied');
+  assert.deepEqual(control.manager.instance('root').config.workerTools, ['read', 'glob']);
+  assert.deepEqual(control.manager.instance('root').config.delegationTargets.find(item => item.instanceId === 'new-client').tools, ['read', 'glob'], 'New child tools remain intersected with the unchanged parent ceiling');
+  assert.deepEqual(control.manager.instance('sibling').config.workerTools, ['read']);
+  assert.deepEqual(control.manager.instance('root').config.delegationTargets.find(item => item.instanceId === 'sibling').tools, ['read']);
+});
+
+test('a previously started child still requires the parent capability freeze while old parent work remains', async t => {
+  const { control } = await fixture(t, [child('existing-child')]);
+  await control.action('root', 'start', control.revision);
+  await control.action('existing-child', 'start', control.revision);
+  await control.action('existing-child', 'stop', control.revision);
+  await peer(control).call('test.add', work('old-bound-capability-work'));
+  const view = await save(control, control.revision, ['read', 'glob'], 'existing-child');
+  assert.equal(view.application.state, 'waiting');
+  assert.deepEqual(view.application.affected.map(item => item.instanceId).sort(), ['existing-child', 'root']);
+  assert.deepEqual(control.manager.instance('root').config.delegationTargets.find(item => item.instanceId === 'existing-child').tools, ['read']);
+  assert.deepEqual((await peer(control).call('test.inspect')).tasks.map(item => item.id), ['old-bound-capability-work']);
+});
+
 test('idle save applies and restores running organizations; stopped and unrelated organizations stay stopped', async t => {
   const { control } = await fixture(t, [child('research'), child('other')]);
   await control.action('root', 'start', control.revision); await control.action('research', 'start', control.revision);
