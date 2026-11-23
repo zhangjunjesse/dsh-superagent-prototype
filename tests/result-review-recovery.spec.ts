@@ -95,3 +95,51 @@ it('keeps a followed-thread close from bypassing a pending goal review', async (
     { kind: 'accept', summary: 'The exact merged revision satisfies both repair and validation.' })
   expect(store.tickets.get(ticketId)!.ended?.outcome).toBe('merged')
 })
+
+it('reopens a completed result after a lost connection with a fresh report and relay while rejecting the pre-failure review', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'result-review-reconnect-')), file = join(directory, 'core.sqlite'), item = { directory, store: new Store(file) }
+  opened.push(item)
+  const first = owner(item.store), trigger: Trigger = { id: 'original', source: 'jarvis', threads: [{ source: 'jarvis', id: 'original' }],
+    actor: { source: 'jarvis', id: 'human' }, human: true, addressed: 'direct', at: new Date().toISOString(), text: 'Verify the completed original goal.', meta: {} }
+  first.engine.receive(trigger); first.proxy.select(trigger.id, 'child')
+  const ticketId = first.engine.decide(trigger.id, { kind: 'accept', title: trigger.text, scope: trigger.text, reason: 'explicit' }).ticketId!
+  await first.proxy.tick()
+  const assignment = latestAssignment(item.store.tickets.get(ticketId)!)!, prior = assignment.resultReviews!.at(-1)!
+  first.send.mockRejectedValueOnce(new Error('Completed child disconnected before acceptance'))
+  await first.proxy.tick()
+  const afterBackoff = Date.now() + 1001, now = vi.spyOn(Date, 'now').mockReturnValue(afterBackoff)
+  try {
+    item.store.close(); item.store = new Store(file)
+    const recovered = owner(item.store)
+    await recovered.proxy.tick(); await recovered.proxy.tick()
+    const current = latestAssignment(item.store.tickets.get(ticketId)!)!.resultReviews!.at(-1)!
+    expect(current.evidenceRef).toBe(prior.evidenceRef)
+    expect(current.id).not.toBe(prior.id)
+    expect(latestAssignment(item.store.tickets.get(ticketId)!)!.report?.summary).toBe(current.summary)
+    expect(recovered.effects.pending('relay', current.id)).toBe(true)
+    expect(recovered.send.mock.calls.every(([request]) => request.operation === 'query')).toBe(true)
+    expect(() => recovered.engine.resolveResultReview(ticketId, assignment.id, prior.id, { kind: 'accept', summary: 'Old judgement' })).toThrow('stale')
+    recovered.engine.resolveResultReview(ticketId, assignment.id, current.id, { kind: 'accept', summary: 'Original goal verified from the recovered evidence.' })
+    expect(item.store.tickets.get(ticketId)!.ended?.outcome).toBe('completed')
+    expect(item.store.tickets.get(ticketId)!.assignments).toHaveLength(1)
+  } finally { now.mockRestore() }
+})
+
+it('keeps an accepted review and ready report unchanged while its followed thread remains open', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'result-review-follow-accepted-')), store = new Store(join(directory, 'core.sqlite')); opened.push({ directory, store })
+  const h = owner(store), trigger: Trigger = { id: 'accepted', source: 'jarvis', threads: [{ source: 'jarvis', id: 'accepted' }],
+    actor: { source: 'jarvis', id: 'human' }, human: true, addressed: 'direct', at: new Date().toISOString(), text: 'Verify the original result and follow the exact pull request.', meta: {} }
+  h.engine.receive(trigger); h.proxy.select(trigger.id, 'child')
+  const ticketId = h.engine.decide(trigger.id, { kind: 'accept', title: trigger.text, scope: trigger.text, reason: 'explicit' }).ticketId!, pull = { source: 'github', id: 'pull-accepted' }
+  h.engine.bindThread(ticketId, pull, true); await h.proxy.tick()
+  const assignment = latestAssignment(store.tickets.get(ticketId)!)!, review = assignment.resultReviews!.at(-1)!, summary = 'The completed evidence satisfies the original goal; waiting for the followed merge.'
+  h.engine.resolveResultReview(ticketId, assignment.id, review.id, { kind: 'accept', summary })
+  expect(store.tickets.get(ticketId)!.ended).toBeUndefined()
+  await h.proxy.tick(); await h.proxy.tick()
+  const unchanged = latestAssignment(store.tickets.get(ticketId)!)!
+  expect(unchanged.resultReviews).toHaveLength(1)
+  expect(unchanged.resultReviews![0]!.decision).toMatchObject({ kind: 'accept', summary })
+  expect(unchanged.report).toMatchObject({ state: 'ready', summary })
+  h.engine.threadClosed(pull, 'merged', new Date().toISOString())
+  expect(store.tickets.get(ticketId)!.ended?.outcome).toBe('merged')
+})

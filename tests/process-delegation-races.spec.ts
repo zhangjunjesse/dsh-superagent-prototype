@@ -422,4 +422,73 @@ describe('delegation completion fences', () => {
       expect(new Set(sent.map(request => request.parentAssignmentId)).size).toBe(1)
     } finally { now.mockRestore() }
   })
+
+  it('recovers a completed result with a fresh review after a failed query without reviving the old decision', async () => {
+    let time = Date.UTC(2026, 10, 15), disconnected = false
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => time)
+    const h = fixture(async request => {
+      if (disconnected) throw new Error('Completed child temporarily disconnected')
+      return childSnapshot(request, { status: 'completed' })
+    })
+    try {
+      await h.proxy.tick()
+      const assignment = latestAssignment(h.current())!, review = assignment.resultReviews!.at(-1)!
+      const decide = () => h.engine.resolveResultReview(h.current().id, assignment.id, review.id,
+        { kind: 'accept', summary: 'The original completed evidence satisfies the goal.' })
+      disconnected = true; await h.proxy.tick()
+      expect(latestAssignment(h.current())!.report?.summary).toContain('connection or command outcome is unavailable')
+      expect(decide).toThrow()
+      disconnected = false; time += 1001
+      await h.proxy.tick(); await h.proxy.tick()
+      const recovered = latestAssignment(h.current())!.resultReviews!.at(-1)!
+      expect(h.proxy.list()[0]!.error).toBeUndefined()
+      expect(recovered.evidenceRef).toBe(review.evidenceRef)
+      expect(latestAssignment(h.current())!.report?.summary).toBe(recovered.summary)
+      expect(recovered.id).not.toBe(review.id)
+      expect(h.reviews).toEqual([review.id, recovered.id])
+      expect(decide).toThrow('stale')
+      h.accept()
+      expect(h.current().ended?.outcome).toBe('completed')
+    } finally { now.mockRestore() }
+  })
+
+  it('does not revive an earlier review when previously reviewed evidence returns after a newer result', async () => {
+    let summary = 'Verified result A'
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary }))
+    await h.proxy.tick()
+    const assignment = latestAssignment(h.current())!, original = assignment.resultReviews!.at(-1)!
+    summary = 'Verified result B'; await h.proxy.tick()
+    const intermediate = latestAssignment(h.current())!.resultReviews!.at(-1)!
+    summary = 'Verified result A'; await h.proxy.tick(); await h.proxy.tick()
+    const current = latestAssignment(h.current())!.resultReviews!.at(-1)!
+    expect(current.evidenceRef).toBe(original.evidenceRef)
+    expect(current.summary).toBe(original.summary)
+    expect(current.id).not.toBe(original.id)
+    expect(h.reviews).toEqual([original.id, intermediate.id, current.id])
+    expect(() => h.engine.resolveResultReview(h.current().id, assignment.id, original.id,
+      { kind: 'accept', summary: 'A judgement made before the newer result' })).toThrow('stale')
+    h.accept()
+    expect(h.current().ended?.outcome).toBe('completed')
+  })
+
+  it.each(['report', 'input'] as const)('refuses acceptance when a newer %s supersedes the recovered result review', async change => {
+    let disconnected = false, time = Date.UTC(2026, 10, 15)
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => time)
+    const h = fixture(async request => {
+      if (disconnected) throw new Error('Temporary child connection loss')
+      return childSnapshot(request, { status: 'completed' })
+    })
+    try {
+      await h.proxy.tick(); disconnected = true; await h.proxy.tick()
+      disconnected = false; time += 1001; await h.proxy.tick()
+      const assignment = latestAssignment(h.current())!, review = assignment.resultReviews!.at(-1)!
+      if (change === 'report') h.engine.report(h.current().id, { state: 'blocked', summary: 'A newer executor observation requires validation.' })
+      else h.append('after-reconnect', 'Verify the additional original-scope acceptance condition.')
+      expect(() => h.engine.resolveResultReview(h.current().id, assignment.id, review.id,
+        { kind: 'accept', summary: 'The older recovered result is sufficient.' })).toThrow(change === 'report' ? 'superseded' : 'stale')
+      expect(h.current().ended).toBeUndefined()
+      expect(h.current().assignments).toHaveLength(1)
+      expect(latestAssignment(h.current())!.resultReviews!.at(-1)!.decision).toBeUndefined()
+    } finally { now.mockRestore() }
+  })
 })
