@@ -181,6 +181,20 @@ export class Tickets extends EnginePart {
     this.options.executor.start(ticket, assignment)
     return ticket
   }
+  /** Replace a reviewed executor result with remaining authorized work, keeping all original inputs and evidence. */
+  continueReviewed(ticket: Ticket, previous: Assignment, reviewId: string, instructions: string, targetInstanceId?: string): Assignment {
+    this.endAssignment(ticket, previous, 'continuedAfterReview')
+    this.requeueUntaken(ticket, previous)
+    const assignment = this.newAssignment(ticket)
+    assignment.executionTarget = targetInstanceId ?? 'local'
+    assignment.continuation = { reviewId, instructions }
+    ticket.updatedAt = this.now()
+    delete ticket.attention
+    this.repo.tickets.save(ticket)
+    this.options.executor.stop(ticket, previous, 'continuedAfterReview')
+    this.options.executor.start(ticket, assignment)
+    return assignment
+  }
   /**
    * Drops a ticket's Subscription to a Thread its worker found unrelated, and hands back, with `reason`, the person's messages there that the ticket decides.
    * @throws UserError when the ticket is unknown, or `thread` is an origin thread, a bound `follows` thread, or not subscribed.
@@ -372,6 +386,8 @@ export class Tickets extends EnginePart {
    * change asks for no work.
    */
   private unfinished(ticket: Ticket, at: string): boolean {
+    const review = latestAssignment(ticket)?.resultReviews?.at(-1)
+    if (review && !review.decision) return true
     const until = readUntil(ticket, false)
     const taken = this.triggersOf(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger' && !readBefore(input, until) ? [input.id] : []))
       .some(trigger => this.owners(trigger).includes(ticket.id) && this.takenUp(ticket, trigger))

@@ -37,6 +37,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
   { name: 'ticket/<id>/result', holds: 'its latest report', executor: true },
   { name: 'ticket/<id>/report/<id>', holds: 'the report of one of its assignments', executor: true },
+  { name: 'ticket/<id>/review/<id>', holds: 'the complete saved result evidence and its owning main-Session judgement', executor: true },
+  { name: 'ticket/<id>/continuation/<id>', holds: 'the remaining work assigned after a result review, under the original mandate', executor: true },
   { name: 'ticket/<id>/transcript', holds: 'its Executor Session\'s messages, newest first', executor: true },
   { name: 'ticket/<id>/message/<n>', holds: 'one message of that transcript', executor: true },
   { name: 'ticket/<id>/input/<id>', holds: 'one input it was delivered', executor: true },
@@ -287,6 +289,15 @@ const ROUTES: readonly Route[] = [
       const entry = event && transcriptEntry(event)
       if (!entry) throw new Error('Unknown transcript entry')
       body = JSON.stringify(entry)
+    } else if (section === 'review' && part) {
+      const assignment = ticket.assignments.find(item => item.resultReviews?.some(review => review.id === part))
+      const review = assignment?.resultReviews?.find(item => item.id === part)
+      if (!review) throw new Error('Unknown result review')
+      body = JSON.stringify({ ticket_id: ticket.id, assignment_id: assignment!.id, ...review })
+    } else if (section === 'continuation' && part) {
+      const continuation = ticket.assignments.find(item => item.id === part)?.continuation
+      if (!continuation) throw new Error('Unknown remaining work')
+      body = continuation.instructions
     } else if (section === 'report' && part) {
       const report = ticket.assignments.find(item => item.id === part)?.report
       if (!report) throw new Error('Unknown assignment report')

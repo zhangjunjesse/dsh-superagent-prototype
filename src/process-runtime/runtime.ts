@@ -404,8 +404,9 @@ export class ProcessRuntime {
     if (!ticketId) return []
     const ticket = this.store.tickets.get(ticketId)
     if (!ticket) return []
-    return this.delegated.remote(ticket) ? this.delegated.artifacts(ticketId)
-      : this.taskFiles.links(this.config.instanceId, ticketId).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId }))
+    const artifacts = [...this.taskFiles.links(this.config.instanceId, ticketId).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId })),
+      ...this.delegated.artifacts(ticketId)]
+    return [...new Map(artifacts.map(item => [item.url, item])).values()]
   }
   async delegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     await this.ready

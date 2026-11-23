@@ -32,18 +32,25 @@ const childSnapshot = (request: DelegationRequest, patch: Partial<DelegationSnap
 function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapshot>, task?: { text: string; scope: string; assignment: string }) {
   const directory = mkdtempSync(join(tmpdir(), 'process-delegation-race-')), store = new Store(join(directory, 'core.sqlite'))
   opened.push({ directory, store })
-  let clock = 0, proxy: DelegationExecutor
+  let clock = 0, proxy: DelegationExecutor, held = false
+  const localStarts: string[] = [], reviews: string[] = []
+  const config = { instanceId: 'parent', workerTools: ['read'], delegationTargets: [
+    { instanceId: 'child', organizationName: 'Child', description: 'Bounded reader', tools: ['read' as const] },
+  ] }
   const policy: Policy = { version: 'v1', paused: false, evalTimeoutMs: 60_000,
     gate: () => ({ admissible: true, strength: 'explicit', basis: { via: 'listed' } }),
     revalidate: () => true, admitsInferred: () => false }
   const engine = new Engine({ repo: store, policy: () => policy, scope: { scope: () => ({ listened: true, observed: false }) },
     assessor: { request: vi.fn(), release: vi.fn() }, outbox: { send: vi.fn(), withdraw: vi.fn(), status: () => undefined },
-    executor: { start: (ticket, assignment) => proxy.start(ticket, assignment), deliver: vi.fn(), stop: (ticket, assignment) => proxy.stop(ticket, assignment) },
+    executor: { start: (ticket, assignment) => proxy.remote(ticket, assignment) ? proxy.start(ticket, assignment) : void localStarts.push(assignment.id),
+      deliver: vi.fn(), stop: (ticket, assignment) => proxy.stop(ticket, assignment) },
+    resultReview: { request: (_ticket, _assignment, review) => { reviews.push(review.id) },
+      context: (ticket, assignment) => proxy.reviewContext(ticket, assignment),
+      authorize: (ticket, assignment, decision) => proxy.authorizeReview(ticket, assignment, decision) },
+    admission: { evaluate: () => !held, resume: () => !held, frozen: () => held },
     prepareTicket: ticket => task ? { ...ticket, execution: { name: 'bounded-task', directory, assignment: task.assignment } } : ticket,
     now: () => new Date(Date.UTC(2026, 10, 15, 0, 0, clock++)).toISOString() })
-  proxy = new DelegationExecutor({ instanceId: 'parent', workerTools: ['read'], delegationTargets: [
-    { instanceId: 'child', organizationName: 'Child', description: 'Bounded reader', tools: ['read'] },
-  ] }, store, engine, send, () => false, id => id === 'child')
+  proxy = new DelegationExecutor(config, store, engine, send, () => held, id => id === 'child')
   const message = (id: string, operation: 'new' | 'append' = 'new', target?: Ticket): Trigger => ({
     id, source: 'jarvis', threads: [{ source: 'jarvis', id }], actor: { source: 'jarvis', id: 'user' },
     human: true, addressed: 'direct', at: '2026-11-15T00:00:00.000Z', text: `read requirement ${id}`, meta: {},
@@ -62,7 +69,11 @@ function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapsho
     engine.receive(trigger); engine.attach(ticketId, trigger.id)
     return current().inputs.find(input => input.kind === 'trigger' && input.triggerId === trigger.id)!
   }
-  return { store, engine, proxy, current, append }
+  const accept = () => {
+    const assignment = latestAssignment(current())!, review = assignment.resultReviews!.at(-1)!
+    return engine.resolveResultReview(ticketId, assignment.id, review.id, { kind: 'accept', summary: 'Original goal and current evidence verified.' })
+  }
+  return { store, engine, proxy, current, append, accept, config, policy, localStarts, reviews, freeze: (value: boolean) => { held = value } }
 }
 
 describe('delegation completion fences', () => {
@@ -96,6 +107,96 @@ describe('delegation completion fences', () => {
       expect(h.current().assignments).toHaveLength(1)
       expect(h.proxy.list()).toHaveLength(1)
     } finally { executor.dispose() }
+  })
+
+  it('continues a partial result locally on the same mandate and reviews the validation before completion', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Revision abc is repaired; validation is still required.' }))
+    await h.proxy.tick()
+    const original = h.current(), first = latestAssignment(original)!, review = first.resultReviews!.at(-1)!
+    const decision = { kind: 'continue' as const, summary: 'The repair is present but the original validation condition is not evidenced.',
+      instructions: 'Validate revision abc, retaining the repair evidence and recording the tested revision and result.' }
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    expect(h.current().decisionId).toBe(original.decisionId)
+    expect(h.current().mandate).toEqual(original.mandate)
+    expect(h.current().assignments).toHaveLength(2)
+    expect(h.localStarts).toHaveLength(1)
+    expect(h.proxy.remote(h.current())).toBe(false)
+    expect(h.proxy.list()[0]?.finished).toBe(true)
+    const second = latestAssignment(h.current())!
+    expect(second).toMatchObject({ executionTarget: 'local', continuation: { reviewId: review.id, instructions: decision.instructions } })
+    expect(h.current().assignments[0]?.resultReviews?.[0]?.summary).toContain('Revision abc is repaired')
+    expect(h.current().ended).toBeUndefined()
+    h.engine.report(original.id, { state: 'ready', summary: 'Validated revision abc: all original checks passed.' })
+    expect(h.current().ended).toBeUndefined()
+    expect(latestAssignment(h.current())!.resultReviews?.at(-1)?.summary).toContain('Validated revision abc')
+    h.accept()
+    expect(h.current().ended?.outcome).toBe('completed')
+    expect(h.current().assignments[0]?.resultReviews?.[0]?.decision?.kind).toBe('continue')
+    expect(latestAssignment(h.current())!.resultReviews?.at(-1)?.decision?.kind).toBe('accept')
+    await h.proxy.tick()
+    expect(h.proxy.list()).toHaveLength(1)
+  })
+
+  it('creates a new fixed child binding for remaining work and preserves all earlier source material', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Partial repair revision abc.' }), {
+      text: 'Repair and validate this exact revision.\n  Keep original spacing  ', scope: 'Repair and validation', assignment: 'Original instructions',
+    })
+    await h.proxy.tick()
+    const original = h.current(), first = latestAssignment(original)!, review = first.resultReviews!.at(-1)!, binding = structuredClone(h.proxy.list()[0]!.request)
+    const decision = { kind: 'continue' as const, summary: 'Validation remains.', instructions: 'Validate the repaired revision abc.', targetInstanceId: 'child' }
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    const rows = h.proxy.list(), next = rows.find(row => row.request.parentAssignmentId !== first.id)!
+    expect(rows).toHaveLength(2)
+    expect(rows.find(row => row.request.parentAssignmentId === first.id)!.request).toEqual(binding)
+    expect(next.request.delegationId).not.toBe(binding.delegationId)
+    expect(next.request.taskContext!.source).toEqual(binding.taskContext!.source)
+    expect(next.request.taskContext!.assignment).toContain('Validate the repaired revision abc.')
+    expect(next.request.taskContext!.assignment).toContain('Partial repair revision abc.')
+    expect(next.request.tools).toEqual(binding.tools)
+    expect(h.current().ended).toBeUndefined()
+    await h.proxy.tick()
+    h.accept()
+    expect(h.current().ended?.outcome).toBe('completed')
+  })
+
+  it('keeps an abandoned local continuation open for the parent instead of dropping the original goal', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    h.engine.resolveResultReview(h.current().id, first.id, review.id,
+      { kind: 'continue', summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' })
+    h.engine.report(h.current().id, { state: 'dropped', summary: 'Validation was not performed.' })
+    expect(h.current().ended).toBeUndefined()
+    expect(latestAssignment(h.current())?.resultReviews?.at(-1)?.summary).toBe('Validation was not performed.')
+  })
+
+  it('deduplicates review relays and immutable acceptance decisions', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    await h.proxy.tick(); await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    expect(first.resultReviews).toHaveLength(1)
+    expect(h.reviews).toHaveLength(1)
+    h.accept()
+    h.engine.resolveResultReview(h.current().id, first.id, review.id, { kind: 'accept', summary: 'Original goal and current evidence verified.' })
+    expect(h.current().assignments).toHaveLength(1)
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, { kind: 'accept', summary: 'Different judgement' })).toThrow('different decision')
+  })
+
+  it.each(['input', 'stop', 'permissions', 'policy', 'freeze'] as const)('refuses an old review after a concurrent %s change', async change => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    if (change === 'input') h.append('during-review', 'Also verify revision abc against the new requirement.')
+    if (change === 'stop') h.engine.stopTicket(h.current().id)
+    if (change === 'permissions') h.config.workerTools = []
+    if (change === 'policy') h.policy.revalidate = () => false
+    if (change === 'freeze') h.freeze(true)
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, { kind: 'accept', summary: 'The old result suffices.' })).toThrow()
+    expect(h.current().ended?.outcome).not.toBe('completed')
+    expect(first.resultReviews![0]!.decision).toBeUndefined()
+    expect(h.current().assignments).toHaveLength(1)
   })
 
   it('retains the complete parent source, accepted scope and original assignment through append and owner recovery', async () => {
@@ -169,6 +270,8 @@ describe('delegation completion fences', () => {
     expect(h.current().undelivered).toContain(input.id)
     admit = true
     await h.proxy.tick()
+    expect(h.current().ended).toBeUndefined()
+    h.accept()
     expect(h.current().ended?.outcome).toBe('completed')
     expect(h.current().undelivered).not.toContain(input.id)
   })
@@ -198,6 +301,8 @@ describe('delegation completion fences', () => {
     expect(sent.filter(request => request.operation === 'append').map(request => request.text)).toEqual([
       'read requirement first', 'read requirement during-control',
     ])
+    expect(h.current().ended).toBeUndefined()
+    h.accept()
     expect(h.current().ended?.outcome).toBe('completed')
   })
 
