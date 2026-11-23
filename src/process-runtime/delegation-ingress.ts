@@ -172,10 +172,12 @@ export class InboundDelegations {
     if (old) { if (old.hash !== hash) throw new Error('Command identity was reused with different content'); return this.snapshot(row!) }
     if (!request.text?.trim()) throw new Error('A delegation command requires text')
     if (!row) {
-      if (request.operation !== 'submit') throw new Error('Unknown delegation; no control target exists')
+      if (request.operation !== 'submit' && request.operation !== 'stop') throw new Error('Unknown delegation; no control target exists')
       // Validate at the actual first durable admission. Replayed commands and
       // bound lifecycle controls above retain their original semantics.
-      if (this.closing || this.callbacks.acceptNew?.() === false) throw new Error('Child organization is not ready to admit new delegations')
+      if (request.operation === 'submit' && (this.closing || this.callbacks.acceptNew?.() === false)) throw new Error('Child organization is not ready to admit new delegations')
+      // An authenticated stop also fences a submit whose acknowledgement was lost or that is still in transit.
+      // Persist it through the normal stopped path below before acknowledging; it never admits task work.
       row = { source, request, phase: 'queued', commands: {} }
     } else if (request.operation === 'submit') throw new Error('Delegation already has its original submit command')
     const command: Command = { request, hash, at: new Date().toISOString() }

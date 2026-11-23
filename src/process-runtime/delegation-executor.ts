@@ -150,7 +150,7 @@ export class DelegationExecutor {
     }
     const query = await this.send({ ...initial.request, operation: 'query', commandId: key(initial.request.delegationId, operationId, 'query'), text: undefined })
     let row = reload(); this.verify(row, query)
-    if (query.status === 'missing') return { query, stopped: this.stoppedSnapshot(row, query), current: !!this.current(row) && !row.stopped }
+    if (this.missingBeforeSubmit(row, query)) return { query, stopped: this.stoppedSnapshot(row, query), current: !!this.current(row) && !row.stopped }
     // Cancellation supersedes a continuation's result checks, but still drains only this fixed producer.
     if (this.current(row) && !row.stopped) beforeStop?.(query)
     row = reload()
@@ -323,9 +323,12 @@ export class DelegationExecutor {
       { ...row, stopped: true, finished: false, retryAt: undefined })
     return pending.length > 0
   }
+  /** A missing record alone cannot prove cleanup after a submitted or historically unknown attempt. */
+  private missingBeforeSubmit(row: Binding, snapshot: DelegationSnapshot): boolean {
+    return snapshot.status === 'missing' && row.submitAttempted === false && !row.accepted && !row.snapshot?.ticketId
+  }
   private stoppedSnapshot(row: Binding, snapshot: DelegationSnapshot): DelegationSnapshot {
-    if (snapshot.status === 'missing' && row.submitAttempted === false && !row.accepted && !row.snapshot?.ticketId)
-      return { ...snapshot, executionStopped: true }
+    if (this.missingBeforeSubmit(row, snapshot)) return { ...snapshot, executionStopped: true }
     if (!['stopped', 'completed'].includes(snapshot.status) || snapshot.executionStopped !== true)
       throw new Error('Bound child stop has not acknowledged execution cleanup')
     return snapshot
@@ -350,7 +353,7 @@ export class DelegationExecutor {
         if (!this.send) throw new Error('Bound child delegation transport is unavailable')
         let snapshot = await this.send({ ...row.request, operation: 'query', commandId: key(row.request.delegationId, 'query'), text: undefined })
         this.verify(row, snapshot)
-        if (snapshot.status !== 'missing') {
+        if (!this.missingBeforeSubmit(row, snapshot)) {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
           snapshot = await this.send(request); this.verify(row, snapshot)
         }
@@ -433,10 +436,10 @@ export class DelegationExecutor {
         this.verify(row, snapshot)
         if (!this.current(row)) { row.stopped = true; this.store.set(name, row) }
         // Query before every possible submit: a lost acknowledgement never creates another task.
-        if (snapshot.status === 'missing') {
-          if (row.stopped) {
-            this.store.set(name, { ...row, finished: true, snapshot: this.stoppedSnapshot(row, snapshot) }); continue
-          }
+        if (row.stopped && this.missingBeforeSubmit(row, snapshot)) {
+          this.store.set(name, { ...row, finished: true, snapshot: this.stoppedSnapshot(row, snapshot) }); continue
+        }
+        if (snapshot.status === 'missing' && !row.stopped) {
           if (this.frozen()) continue
           row.submitAttempted = true
           this.store.set(name, row)

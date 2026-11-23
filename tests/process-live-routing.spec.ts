@@ -223,6 +223,34 @@ describe('live child catalogs on the original Router path', () => {
     expect(h.native.parent.errors).toEqual([]); expect(h.native.added.errors).toEqual([])
   })
 
+  it.each(['paused', 'held'] as const)('finishes cancellation after a selected child refuses admission while %s and fences a late submit', async state => {
+    const h = harness(); h.catalog.targets.push(capability('added')); const child = h.open('added'); await child.ready
+    h.hooks.beforeSubmit = async () => {
+      if (state === 'paused') await pause(child, true)
+      else await child.capabilitiesHold({ operationId: 'refused-cancellation', held: true })
+    }
+    const parent = h.open('parent'); await submit(parent, 'refused-cancellation', 'Read through the selected child')
+    await wait(async () => expect((await parent.state()).delegations.outgoing[0]?.error).toContain('not ready to admit new delegations'))
+    const before = await parent.state(), ticket = before.tickets[0]!, binding = before.delegations.outgoing[0]!.request
+    expect((await child.state()).delegations.incoming).toEqual([])
+    expect(await parent.management({ method: 'POST', path: `tickets/${ticket.id}/stop`, body: {} })).toMatchObject({ status: 200 })
+    await vi.waitFor(async () => expect((await parent.state()).tickets[0]?.ended?.outcome).toBe('stopped'), { timeout: 1500, interval: 20 })
+    const settled = await parent.state()
+    expect(settled.delegations.outgoing[0]).toMatchObject({ request: binding, finished: true,
+      snapshot: { status: 'stopped', executionStopped: true } })
+    expect((await child.state()).tickets).toEqual([])
+    expect(h.sent.filter(request => request.operation === 'stop')).toHaveLength(1)
+    if (state === 'paused') await pause(child, false)
+    else await child.capabilitiesHold({ operationId: 'refused-cancellation', held: false })
+    await child.close()
+    const reopened = createProcessRuntime(child.config, { run: async () => { throw new Error('A stopped binding must never prepare again') }, cancel: async () => {} },
+      { native: controlledNative().native }); owners.push(reopened); await reopened.ready
+    expect(await reopened.lifecycleDelegation({ sourceInstanceId: 'parent', request: { ...binding, operation: 'query' } })).toMatchObject({ status: 'stopped' })
+    await expect(reopened.delegation({ sourceInstanceId: 'parent', request: binding })).rejects.toThrow('original submit command')
+    expect((await reopened.state()).tickets).toEqual([])
+    expect(h.native.parent.errors).toEqual([]); expect(h.native.added.errors).toEqual([])
+  })
+
   it('adds a target before an existing catalog entry while preserving that entry and its active fixed task', async () => {
     const h = harness(), started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); releases.push(release.resolve)
     h.catalog.targets.push(capability('first'))
