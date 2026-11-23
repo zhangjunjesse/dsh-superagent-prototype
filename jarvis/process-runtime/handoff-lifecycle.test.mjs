@@ -32,7 +32,7 @@ async function fixture(t, closeMode = 'normal', closeDelay = 0, timeouts = {}) {
       if (closeMode === 'premature') return;
       await delay(closeDelay);
       for (const { child } of children) child.send('close');
-      await Promise.all(children.map(row => row.exited));
+      if (closeMode !== 'pending-exit') await Promise.all(children.map(row => row.exited));
       item.child = null; item.management = undefined; item.phase = 'stopped'; item.cleanupPending = false;
     },
   };
@@ -55,6 +55,16 @@ test('handoff and shutdown have separate deadlines and verify both real process 
   assert.equal(result.processes.length, 2);
   assert.deepEqual(result.processes.map(row => row.owner).sort(), ['business', 'management']);
   assert.ok(records.some(row => row.phase === 'shutdown-verified'));
+  assert.equal(records.some(row => row.phase === 'forced-cleanup-started'), false);
+  assertExited(children);
+});
+
+test('shutdown verification waits for real exits after close has released both owner handles', { timeout: 10000 }, async t => {
+  const { lifecycle, records, children } = await fixture(t, 'pending-exit');
+  const result = await lifecycle.run(async () => {});
+  const verified = records.find(row => row.phase === 'shutdown-verified');
+  assert.equal(verified.processes.length, 2);
+  assert.ok(result.processes.every(row => row.exit.code === 0 && row.exit.signal === null && !row.alive));
   assert.equal(records.some(row => row.phase === 'forced-cleanup-started'), false);
   assertExited(children);
 });

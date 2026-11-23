@@ -176,6 +176,7 @@ function topologyBlocked(tasks) {
 export class ProcessManager {
   // Only producer replies on our own private peer can populate this cache. Never return it to a receiver.
   #artifactVerifications = new Map();
+  #processObservers = new Set();
   constructor(ctx, config, { conversationModel, modelCatalog, preset,
     bridgeFactory = (instance, tool) => new DshBridge(ctx, instance, tool,
       { preset, ...(instance.instanceId === 'root' ? { conversationModel } : {}) }),
@@ -205,6 +206,19 @@ export class ProcessManager {
       this.record();
     } catch (error) { this.releaseLock(); throw error; }
     this.initialization = Promise.resolve().then(async () => { await this.recoverCleanup(); await this.recoverRestarts(); });
+  }
+  /** Observe native child creation before initialization can discard an owner handle. */
+  observeProcesses(observer) {
+    this.#processObservers.add(observer);
+    return () => this.#processObservers.delete(observer);
+  }
+  #notifyProcessObservers(item, child, owner) {
+    const failures = [];
+    // One failed observer must not hide this native child from another observer's cleanup.
+    for (const observer of [...this.#processObservers]) {
+      try { observer(item, child, owner); } catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw failures[0];
   }
   lifecycleState(id) {
     const item = this.instances.get(id);
@@ -741,7 +755,9 @@ export class ProcessManager {
     finally { if (stdout !== undefined) closeSync(stdout); if (stderr !== undefined) closeSync(stderr); }
     item.child = child;
     let bridge;
-    try { bridge = item.bridge = this.bridgeFactory(item.config, input => {
+    try {
+      this.#notifyProcessObservers(item, child, 'business');
+      bridge = item.bridge = this.bridgeFactory(item.config, input => {
       if (item.generation !== generation || !item.peer || !['starting', 'running'].includes(item.phase)) throw new Error('Instance generation is no longer active');
       return item.peer.call('tool', input, 30000);
     }); } catch (error) {
@@ -1007,6 +1023,7 @@ export class ProcessManager {
       'delegation.send': input => this.delegate(item, item.generation, input, { managementOwner: owner }),
       'runtime.restart': () => ({ running: false, effect: 'next-start' }) });
     try {
+      this.#notifyProcessObservers(item, child, 'management');
       owner.native = this.nativeFactory(item.config, peer, { adoption, managementOnly: true, isCurrent: () => owner.active && !owner.ended });
       this.event(item, 'management-open', { managementPid: child.pid });
       const initialized = await peer.call('initializeManagement', { ...item.config, delegationLimits: delegationLimits(this.instances, item.config) }, 240000);

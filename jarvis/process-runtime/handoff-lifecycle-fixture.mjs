@@ -74,6 +74,8 @@ export function handoffLifecycle(manager, checkpoint, {
       remember(item, item.child, 'business'); remember(item, item.management?.child, 'management');
     }
   }
+  const stopObserving = manager.observeProcesses?.(remember);
+  capture();
   manager.event = function (item, ...args) {
     capture();
     return event.call(this, item, ...args);
@@ -109,8 +111,9 @@ export function handoffLifecycle(manager, checkpoint, {
       finally {
         beforeShutdown();
         try {
-          await phase('shutdown', shutdownTimeoutMs, async () => {
+          await phase('shutdown', shutdownTimeoutMs, async signal => {
             capture(); await manager.close(); capture();
+            while (![...processes.values()].every(exited)) await delay(10, undefined, { signal });
             const rows = snapshot();
             assert.deepEqual(rows.filter(row => !row.exit || row.alive), [], 'shutdown must wait for actual OS-process exits');
             assert.ok(rows.every(row => row.exit.code === 0 && row.exit.signal === null), 'shutdown must exit its children cleanly');
@@ -125,9 +128,11 @@ export function handoffLifecycle(manager, checkpoint, {
           try { await forceCleanup(); } catch (cleanupError) { failures.push(cleanupError); }
         }
       }
+      // Failed runs keep observation and the spawn fence for operations that are still unwinding.
       if (failures.length === 1) throw failures[0];
       if (failures.length) throw new AggregateError(failures, failures.map(error => error.message).join('; '));
       manager.event = event; if (openManagement) manager.openManagement = openManagement;
+      stopObserving?.();
       return { processes: snapshot() };
     },
   };
