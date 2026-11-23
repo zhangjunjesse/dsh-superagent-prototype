@@ -68,6 +68,11 @@ export class InboundDelegations {
     }
     this.store.set(capabilityLimits, CapabilityLimitsSchema.parse(limits))
   }
+  /** Change current admission only; original requests, task grants and parent bindings remain immutable. */
+  configureTopology(limits: DelegationLimit[]): void {
+    this.validateCapabilityLimits(limits, this.config.workerTools)
+    this.store.set(capabilityLimits, CapabilityLimitsSchema.parse(limits))
+  }
   private authority(row: Incoming): DelegationAuthority {
     const r = row.request
     return { delegationId: r.delegationId, parentInstanceId: row.source, parentTicketId: r.parentTicketId,
@@ -161,6 +166,15 @@ export class InboundDelegations {
   async receiveLifecycle(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     const request = DelegationRequestSchema.parse(envelope.request)
     if (!['query', 'stop'].includes(request.operation)) throw new Error('Lifecycle delegation permits query and stop only')
+    if (!this.related(envelope.sourceInstanceId, request)) {
+      const row = this.store.get(incoming(request.delegationId))
+      if (!row || row.source !== envelope.sourceInstanceId || !sameParent(row.request, request)
+        || request.targetInstanceId !== this.config.instanceId || request.path[0] !== envelope.sourceInstanceId)
+        throw new Error('Historical delegation does not match the original parent binding')
+      const historical = this.snapshot(row)
+      if (!['completed', 'stopped'].includes(historical.status)) throw new Error('Historical lifecycle controls require an ended original task')
+      return historical
+    }
     const snapshot = await this.receive({ ...envelope, request })
     if (request.operation !== 'stop') return snapshot
     const row = this.store.get(incoming(request.delegationId))!, command = row.commands[request.commandId]
