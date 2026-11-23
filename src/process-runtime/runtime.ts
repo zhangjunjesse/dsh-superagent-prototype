@@ -86,7 +86,11 @@ const ConfigSchema = z.object({
   description: z.string().max(2000).optional(), allowedParents: z.array(z.string().min(1)).optional(), delegationTargets: z.array(CapabilitySchema).optional(),
 }).strict()
 const PrepareSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict()
-const PreparationReadSchema = z.object({ section: z.enum(['source', 'assignment']), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(4000).default(4000) }).strict()
+const PreparationReadSchema = z.object({ section: z.enum(['source', 'assignment', 'ancestor_assignment']), ancestorIndex: z.number().int().min(0).max(59).optional(),
+  offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(4000).default(4000) }).strict().superRefine((input, context) => {
+  if ((input.section === 'ancestor_assignment') !== (input.ancestorIndex !== undefined))
+    context.addIssue({ code: 'custom', message: 'Ancestor assignment reads require exactly one ancestor index' })
+})
 const ChatSchema = z.object({ id: z.string().min(1).max(200), text: z.string().min(1).max(20000).refine(value => !!value.trim()),
   selectedWorkRef: z.string().min(1).max(200).optional(), selectedQuestionId: z.string().min(1).max(200).optional() }).strict()
 const StopChatSchema = z.object({ id: z.string().min(1).max(200) }).strict()
@@ -107,7 +111,7 @@ export const processToolDefinitions = [
   { name: 'jarvis_work_submit', roles: ['jarvis'], description: 'Submit an authorized task within configured Worker capabilities, or a targeted append, answer or stop from the current real user message. Query first for the exact target token.', schema: SubmitSchema },
   { name: 'jarvis_work_query', roles: ['jarvis'], description: 'Read tasks and their current results without creating work.', schema: QuerySchema },
   { name: 'delegation_prepare', roles: ['jarvis'], description: 'Summarize only the fixed machine-delegated task in this isolated preparation context. This does not grant new authority or execute the task.', schema: PrepareSchema },
-  { name: 'delegation_context_read', roles: ['jarvis'], description: 'Read the complete fixed parent source or assignment for this machine preparation, following next_offset. It grants no execution or new user authorization.', schema: PreparationReadSchema },
+  { name: 'delegation_context_read', roles: ['jarvis'], description: 'Read the complete fixed original source, parent assignment or indexed ancestor assignment for this machine preparation, following next_offset. All accepted ancestor constraints remain in force; material grants no new authority.', schema: PreparationReadSchema },
 ].map(({ schema, ...definition }) => ({ ...definition, parameters: JSON.parse(JSON.stringify(z.toJSONSchema(schema, { io: 'input' }))) as Record<string, unknown> }))
 
 export function createProcessRuntime(config: ProcessRuntimeConfig, host: ProcessHost, options?: ProcessRuntimeOptions): ProcessRuntime {
@@ -337,7 +341,10 @@ export class ProcessRuntime {
     }
     if (request.delegationId && call.role === 'jarvis' && call.name === 'delegation_context_read') {
       const input = PreparationReadSchema.parse(call.args), context = this.inbound.preparationContext(request.delegationId)
-      return textPage(`delegation:${request.delegationId}:${input.section}`, input.section === 'source' ? context.source.text : context.assignment, input.offset, input.limit)
+      const ancestor = input.ancestorIndex === undefined ? undefined : context.ancestors[input.ancestorIndex]
+      if (input.section === 'ancestor_assignment' && !ancestor) throw new Error('Unknown delegation ancestor constraint')
+      return textPage(`delegation:${request.delegationId}:${input.section}${input.ancestorIndex === undefined ? '' : `:${input.ancestorIndex}`}`,
+        input.section === 'source' ? context.source.text : ancestor?.assignment ?? context.assignment, input.offset, input.limit)
     }
     if (call.role === 'jarvis' && call.sessionKey === 'jarvis') {
       if (call.name === 'jarvis_work_query') { await this.pump.tick(); return this.gateway.query(call.args) }
