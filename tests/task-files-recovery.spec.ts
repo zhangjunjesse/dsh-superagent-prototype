@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, expect, it, vi } from 'vitest'
 import { TaskFiles } from '../src/process-runtime/task-files.ts'
-import type { ArtifactReference } from '../src/process-runtime/artifact-contract.ts'
+import type { ArtifactReference, ArtifactVerification } from '../src/process-runtime/artifact-contract.ts'
 
 const io = vi.hoisted(() => ({
   beforeWrite: undefined as undefined | ((args: Parameters<typeof writeFileSync>, write: typeof writeFileSync) => void),
@@ -170,6 +170,82 @@ it('bounds source disk reads while transferring sixteen chunks with full version
   expect(chunks).toBe(16)
   expect(sourceBytesRead, JSON.stringify({ artifactBytes: f.bytes.length, chunks, sourceBytesRead })).toBeLessThanOrEqual(f.bytes.length * 2)
 }, 30000)
+
+it('bounds the whole transfer when every chunk reopens the stopped producer and only its host retains verification', async () => {
+  const f = producer(Buffer.alloc(4 * 1024 * 1024, 0x6b)); f.register()
+  const artifact = f.reference(), receiverState = join(f.root, 'receiver-state'), receiverWorkspace = join(f.root, 'receiver')
+  mkdirSync(receiverState); mkdirSync(receiverWorkspace)
+  const receiver = new TaskFiles(receiverState, receiverWorkspace)
+  let verification: ArtifactVerification | undefined, chunks = 0
+  io.bytesRead = 0
+  const [handoff] = await receiver.materialize('receiving', [artifact], async input => {
+    chunks++
+    const result = f.reopen().readForHost(input, verification)
+    verification = result.verification
+    return result.chunk
+  })
+  const sourceBytesRead = io.bytesRead
+  expect(readFileSync(join(receiver.directory('receiving'), handoff!.path))).toEqual(f.bytes)
+  expect(chunks).toBe(16)
+  expect(sourceBytesRead, JSON.stringify({ artifactBytes: f.bytes.length, chunks, sourceBytesRead })).toBe(f.bytes.length * 2)
+}, 30000)
+
+it('fully verifies cold old data again when the host lost its private verification on restart', () => {
+  const f = producer(); f.register()
+  const input = { artifact: f.reference(), offset: 0, limit: 1 }
+  const index = readFileSync(join(f.state, 'task-files.json'))
+  for (let restart = 0; restart < 2; restart++) {
+    io.bytesRead = 0
+    expect(Buffer.from(f.reopen().readForHost(input).chunk.data, 'base64')).toEqual(f.bytes.subarray(0, 1))
+    expect(io.bytesRead).toBe(f.bytes.length + 1)
+  }
+  expect(readFileSync(join(f.state, 'task-files.json'))).toEqual(index)
+})
+
+it.each(['producer', 'ticket', 'assignment', 'path', 'digest', 'size', 'bundle', 'file'] as const)('does not reuse host verification with a changed %s binding', kind => {
+  const f = producer(); f.register()
+  const input = { artifact: f.reference(), offset: 0, limit: 1 }
+  const { verification } = f.reopen().readForHost(input)
+  const changed = structuredClone(verification)
+  if (kind === 'producer') changed.artifact.instanceId = 'other-producer'
+  if (kind === 'ticket') changed.artifact.ticketId = 'other-ticket'
+  if (kind === 'assignment') changed.artifact.assignmentId = 'other-assignment'
+  if (kind === 'path') changed.artifact.version.path = 'other.bin'
+  if (kind === 'digest') changed.artifact.version.sha256 = 'f'.repeat(64)
+  if (kind === 'size') changed.artifact.version.size++
+  if (kind === 'bundle') changed.artifact.version.bundle = 'f'.repeat(64)
+  if (kind === 'file') changed.file = join(f.root, 'another-file')
+  io.bytesRead = 0
+  expect(Buffer.from(f.reopen().readForHost(input, changed).chunk.data, 'base64')).toEqual(f.bytes.subarray(0, 1))
+  expect(io.bytesRead).toBe(f.bytes.length + 1)
+  io.bytesRead = 0
+  f.reopen().readForHost(input, verification)
+  expect(io.bytesRead).toBe(1)
+})
+
+it.each(['edit', 'replace'] as const)('rejects a same-size %s across producer restarts even with prior host verification', kind => {
+  const f = producer(); f.register()
+  const input = { artifact: f.reference(), offset: 0, limit: 1 }, { verification } = f.reopen().readForHost(input)
+  const before = statSync(f.snapshot), changed = Buffer.alloc(f.bytes.length, 0x7f)
+  chmodSync(f.snapshot, 0o600)
+  if (kind === 'edit') writeFileSync(f.snapshot, changed)
+  else { writeFileSync(`${f.snapshot}.replacement`, changed); renameSync(`${f.snapshot}.replacement`, f.snapshot) }
+  utimesSync(f.snapshot, before.atime, before.mtime)
+  expect(() => f.reopen().readForHost(input, verification)).toThrow('digest changed')
+})
+
+it('rechecks Core authority after reopening even when the host has a matching producer verification', () => {
+  const f = producer(); f.register()
+  let allowed = true, execution = f.files.directory('ticket')
+  const options = { executionDirectory: () => execution, assignmentExists: () => allowed }
+  const input = { artifact: f.reference(), offset: 0, limit: 1 }
+  const { verification } = new TaskFiles(f.state, f.workspace, options).readForHost(input)
+  allowed = false; io.bytesRead = 0
+  expect(() => new TaskFiles(f.state, f.workspace, options).readForHost(input, verification)).toThrow('assignment binding')
+  allowed = true; execution = f.workspace
+  expect(() => new TaskFiles(f.state, f.workspace, options).readForHost(input, verification)).toThrow('workspace binding')
+  expect(io.bytesRead).toBe(0)
+})
 
 it('invalidates a verified file after a same-size edit even when its modified time is restored', () => {
   const f = producer(); f.register()

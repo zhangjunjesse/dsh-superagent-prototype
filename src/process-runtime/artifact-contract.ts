@@ -14,6 +14,15 @@ export const ArtifactReadSchema = z.object({ artifact: ArtifactReferenceSchema, 
 export type ArtifactRead = z.infer<typeof ArtifactReadSchema>
 export const ArtifactTransferSchema = ArtifactReadSchema.extend({ ticketId: z.string().min(1), assignmentId: z.string().min(1) }).strict()
 export interface ArtifactChunk { data: string; nextOffset: number | null }
+/** Producer-issued metadata, retained only by the real host and never accepted from a transfer caller. */
+export const ArtifactVerificationSchema = z.object({ artifact: ArtifactReferenceSchema, file: z.string().min(1).max(12000),
+  stamp: z.string().max(256).regex(/^-?\d+(?::-?\d+){5}$/) }).strict()
+export type ArtifactVerification = z.infer<typeof ArtifactVerificationSchema>
+/** These envelopes belong to the private host-to-producer IPC, not the receiver transfer API. */
+export const ArtifactHostReadSchema = ArtifactReadSchema.extend({ verification: ArtifactVerificationSchema.optional() }).strict()
+export const ArtifactHostChunkSchema = z.object({ chunk: z.object({ data: z.string().max(349528), nextOffset: z.number().int().nonnegative().nullable() }).strict(),
+  verification: ArtifactVerificationSchema }).strict()
+export type ArtifactHostChunk = z.infer<typeof ArtifactHostChunkSchema>
 export interface HandoffFile extends ArtifactReference { path: string }
 /** A version identity includes its original producer and assignment, not a mutable filename alone. */
 export const artifactIdentity = (item: ArtifactReference) => JSON.stringify([item.instanceId, item.ticketId, item.assignmentId, item.version])

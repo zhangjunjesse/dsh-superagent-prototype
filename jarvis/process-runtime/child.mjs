@@ -62,6 +62,7 @@ const peer = new ProcessPeer(process, {
   'lifecycle.drain': input => runtime.drainDelegations(input),
   'artifact.authorize': input => requireRuntime().authorizeArtifact(input),
   'artifact.read': input => runtime.readArtifact(input),
+  'artifact.readForHost': input => runtime.readArtifactForHost(input),
   management: input => requireRuntime().management(input),
   'capabilities.hold': input => requireRuntime().capabilitiesHold(input),
   'capabilities.activity': input => requireRuntime().capabilitiesActivity(input),

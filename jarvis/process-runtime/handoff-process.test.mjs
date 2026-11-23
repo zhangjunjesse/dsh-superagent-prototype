@@ -8,7 +8,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ProcessManager } from './manager.mjs';
 import { controlledNativeFactory } from './controlled-native-fixture.mjs';
 
-test('the receiving read-only Worker consumes the exact registered multi-file version through real host IPC', { timeout: 30000 }, async () => {
+for (const stoppedProducer of [false, true]) test(stoppedProducer
+  ? 'a running receiving Worker reads the same multi-block version through reopened stopped-producer owners'
+  : 'the receiving read-only Worker consumes the exact registered multi-file version through real host IPC', { timeout: 30000 }, async () => {
   const base = resolve('.artifacts/handoff/process'); mkdirSync(base, { recursive: true });
   const rootDir = mkdtempSync(join(base, 'run-')), seen = [], transfers = [];
   const instances = ['management', 'author', 'inspector'].map(instanceId => ({ instanceId, organizationName: instanceId,
@@ -63,8 +65,23 @@ test('the receiving read-only Worker consumes the exact registered multi-file ve
     run: async input => { await tool({ ...input, name: 'delegation_prepare', args: { summary: 'Perform only the original remaining work using the registered version.' } }); return { status: 'complete', text: 'Prepared.' }; },
     cancel: async () => {}, close: async () => {},
   }) });
-  const transfer = manager.readArtifact.bind(manager);
-  manager.readArtifact = async (source, generation, input) => { transfers.push({ source: source.config.instanceId, input }); return transfer(source, generation, input); };
+  const transfer = manager.readArtifact.bind(manager), open = manager.openManagement.bind(manager), producerOwners = [];
+  let producerStopped = false;
+  manager.openManagement = async item => { const owner = await open(item); if (item.config.instanceId === 'author') producerOwners.push(owner.child.pid); return owner; };
+  manager.readArtifact = async (source, generation, input) => {
+    transfers.push({ source: source.config.instanceId, input });
+    if (stoppedProducer && !producerStopped) {
+      producerStopped = true; await manager.stop('author');
+      assert.equal(manager.instance('author').phase, 'stopped');
+    }
+    const chunk = await transfer(source, generation, input);
+    assert.deepEqual(Object.keys(chunk).sort(), ['data', 'nextOffset']);
+    if (stoppedProducer) {
+      assert.equal(manager.instance('author').phase, 'stopped');
+      assert.equal(manager.instance('author').management, undefined);
+    }
+    return chunk;
+  };
   try {
     for (const id of ['author', 'inspector', 'management']) await manager.start(id);
     const text = 'Produce the HTML and stylesheet and inspect the exact delivered version.';
@@ -75,10 +92,11 @@ test('the receiving read-only Worker consumes the exact registered multi-file ve
     assert.equal(seen.filter(item => item.instanceId === 'inspector').length, 1);
     assert.ok(transfers.length >= 3); assert.ok(transfers.every(item => item.source === 'inspector' && item.input.artifact.instanceId === 'author'));
     assert.ok(transfers.some(item => item.input.offset === 262144));
+    if (stoppedProducer) { assert.equal(producerStopped, true); assert.ok(producerOwners.length >= 3); }
     const requester = manager.instance('inspector'), original = transfers[0].input;
     await assert.rejects(transfer(requester, requester.generation, { ...original, artifact: { ...original.artifact, ticketId: 'another-task' } }), /no authorized handoff/);
     const state = await manager.state('management'); assert.equal(state.tickets[0].assignments.length, 2); assert.equal(state.tickets[0].ended.outcome, 'completed');
     assert.equal(state.delegations.outgoing.find(row => row.request.targetInstanceId === 'author').handoff.stopped.executionStopped, true);
-    writeFileSync(join(rootDir, 'completion.json'), JSON.stringify({ complete: true, hash, state, seen, transfers }, null, 2));
+    writeFileSync(join(rootDir, 'completion.json'), JSON.stringify({ complete: true, stoppedProducer, producerOwners, hash, state, seen, transfers }, null, 2));
   } finally { await manager.close(); }
 });

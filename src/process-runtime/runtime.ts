@@ -24,8 +24,8 @@ import { originalConfigurationMigrations } from './original-config.ts'
 import { executionRoot } from '../app/execution-environment.ts'
 import { textPage } from '../app/context.ts'
 import { CapabilityHoldSchema, type CapabilityTask } from './capability-drain.ts'
-import { ArtifactReadSchema, ArtifactTransferSchema, artifactIdentity, type ArtifactChunk, type ArtifactRead } from './artifact-contract.ts'
-export { ArtifactReadSchema, ArtifactReferenceSchema, ArtifactTransferSchema } from './artifact-contract.ts'
+import { ArtifactHostReadSchema, ArtifactReadSchema, ArtifactTransferSchema, artifactIdentity, type ArtifactChunk, type ArtifactHostChunk, type ArtifactRead } from './artifact-contract.ts'
+export { ArtifactHostChunkSchema, ArtifactReadSchema, ArtifactReferenceSchema, ArtifactTransferSchema } from './artifact-contract.ts'
 export { DelegationRequestSchema } from './delegation-contract.ts'
 export { WORKER_TOOL_NAMES, WorkerSkillsSchema, effectiveWorkerTools } from './worker-capabilities.ts'
 export { EngineConfigSchema, normalizeEngineConfig, defaultEngineConfig } from './engine-config.ts'
@@ -451,6 +451,12 @@ export class ProcessRuntime {
     const input = ArtifactReadSchema.parse(raw)
     if (input.artifact.instanceId !== this.config.instanceId) throw new Error('Artifact producer identity does not match this owner')
     return this.taskFiles.read(input)
+  }
+  /** Private host IPC carries only verification that this producer previously issued to that host. */
+  readArtifactForHost(raw: unknown): ArtifactHostChunk {
+    const { verification, ...input } = ArtifactHostReadSchema.parse(raw)
+    if (input.artifact.instanceId !== this.config.instanceId) throw new Error('Artifact producer identity does not match this owner')
+    return this.taskFiles.readForHost(input, verification)
   }
   async delegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     await this.ready

@@ -10,7 +10,7 @@ import { nativeHash } from './native-journal.mjs';
 import { beginStartup, cancelStartup, finishStartup, restoreStartup, startupSnapshot, updateStartup } from './startup-progress.mjs';
 import { readOriginalAdoption } from './original-adoption.mjs';
 import { lockSync } from 'proper-lockfile';
-import { ArtifactTransferSchema, DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normalizeEngineConfig } from '../../lib/process-runtime.js';
+import { ArtifactHostChunkSchema, ArtifactTransferSchema, DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normalizeEngineConfig } from '../../lib/process-runtime.js';
 
 const childEntry = fileURLToPath(new URL('./child.mjs', import.meta.url));
 const roles = new Set(['jarvis', 'router', 'worker']);
@@ -174,6 +174,8 @@ function topologyBlocked(tasks) {
 
 /** DSH owns this manager; each configured business runtime has its own OS process and durable state. */
 export class ProcessManager {
+  // Only producer replies on our own private peer can populate this cache. Never return it to a receiver.
+  #artifactVerifications = new Map();
   constructor(ctx, config, { conversationModel, modelCatalog, preset,
     bridgeFactory = (instance, tool) => new DshBridge(ctx, instance, tool,
       { preset, ...(instance.instanceId === 'root' ? { conversationModel } : {}) }),
@@ -927,7 +929,15 @@ export class ProcessManager {
       if (target.child || target.bridge || target.native || target.cleanupPending || !['stopped', 'failed'].includes(target.phase))
         throw new Error('Artifact producer lifecycle has not settled');
       const owner = target.management ?? await this.openManagement(target);
-      try { return await owner.peer.call('artifact.read', request, 30000); }
+      const key = JSON.stringify([target.config.stateDir, input.artifact]);
+      try {
+        const result = ArtifactHostChunkSchema.parse(await owner.peer.call('artifact.readForHost',
+          { ...request, verification: this.#artifactVerifications.get(key) }, 30000));
+        if (JSON.stringify(result.verification.artifact) !== JSON.stringify(input.artifact)) throw new Error('Artifact producer verification has a different fixed version');
+        this.#artifactVerifications.delete(key); this.#artifactVerifications.set(key, result.verification);
+        if (this.#artifactVerifications.size > 128) this.#artifactVerifications.delete(this.#artifactVerifications.keys().next().value);
+        return result.chunk;
+      } catch (error) { this.#artifactVerifications.delete(key); throw error; }
       finally { await this.closeManagement(target); }
     }, { kind: 'management', queue: true });
     current();

@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, closeSync, existsSync, fchmodSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type BigIntStats } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
-import { ArtifactVersionSchema, artifactIdentity, type ArtifactChunk, type ArtifactRead, type ArtifactReference, type HandoffFile } from './artifact-contract.ts'
+import { ArtifactVersionSchema, artifactIdentity, type ArtifactChunk, type ArtifactHostChunk, type ArtifactRead, type ArtifactReference, type ArtifactVerification, type HandoffFile } from './artifact-contract.ts'
 
 export const ArtifactSchema = z.object({ path: z.string().min(1).max(1000), title: z.string().trim().min(1).max(200).optional() }).strict()
 type ArtifactInput = z.infer<typeof ArtifactSchema>
@@ -188,7 +188,7 @@ export class TaskFiles {
     if (!stat.isFile() || fileStamp(stat) !== fileStamp(statSync(file, { bigint: true }))) throw new Error('Artifact version digest changed')
     return stat
   }
-  private versionRange(ticketId: string, artifact: Pick<VersionedArtifact, 'assignmentId' | 'version'>, offset: number, limit: number): Buffer {
+  private versionRange(ticketId: string, artifact: Pick<VersionedArtifact, 'assignmentId' | 'version'>, offset: number, limit: number, verifiedStamp?: string): Buffer {
     const file = this.versionFile(ticketId, artifact)
     let descriptor: number | undefined
     try {
@@ -196,7 +196,7 @@ export class TaskFiles {
       const stat = this.versionState(file, descriptor), stamp = fileStamp(stat), size = artifact.version.size
       if (stat.size !== BigInt(size)) throw new Error('Artifact version digest changed')
       if (offset > size) throw new Error('Artifact offset is outside the registered version')
-      if (this.verifiedVersions.get(file) !== stamp) {
+      if (this.verifiedVersions.get(file) !== stamp && verifiedStamp !== stamp) {
         const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(262144)
         for (let position = 0; position < size;) {
           const count = readSync(descriptor, buffer, 0, Math.min(buffer.length, size - position), position)
@@ -220,6 +220,10 @@ export class TaskFiles {
   }
   /** Only an exact registered version belonging to an authoritative original assignment is readable. */
   read(input: ArtifactRead): ArtifactChunk {
+    return this.readForHost(input).chunk
+  }
+  /** Only the authenticated host may return a producer-issued verification across short-lived owners. */
+  readForHost(input: ArtifactRead, verification?: ArtifactVerification): ArtifactHostChunk {
     const { artifact, offset, limit } = input
     const task = this.index.tasks[artifact.ticketId]
     if (!task || !this.authorized(artifact.ticketId, existsSync(task.workspace) ? realpathSync.native(task.workspace) : resolve(task.workspace))) throw new Error('Artifact has no matching original task execution binding')
@@ -227,8 +231,11 @@ export class TaskFiles {
     const found = task.versions?.find(item => item.assignmentId === artifact.assignmentId
       && JSON.stringify(item.version) === JSON.stringify(artifact.version))
     if (!found) throw new Error('Artifact is not a registered version of the fixed task and assignment')
-    const bytes = this.versionRange(artifact.ticketId, found, offset, limit), end = offset + bytes.length
-    return { data: bytes.toString('base64'), nextOffset: end < found.version.size ? end : null }
+    const file = this.versionFile(artifact.ticketId, found)
+    const verifiedStamp = verification?.file === file && artifactIdentity(verification.artifact) === artifactIdentity(artifact) ? verification.stamp : undefined
+    const bytes = this.versionRange(artifact.ticketId, found, offset, limit, verifiedStamp), end = offset + bytes.length
+    return { chunk: { data: bytes.toString('base64'), nextOffset: end < found.version.size ? end : null },
+      verification: { artifact, file, stamp: this.verifiedVersions.get(file)! } }
   }
   /** The business owner imports authorized bytes into this ticket before its Worker starts, including read-only Workers. */
   async materialize(ticketId: string, artifacts: ArtifactReference[], read: (input: ArtifactRead) => Promise<ArtifactChunk>): Promise<HandoffFile[]> {
