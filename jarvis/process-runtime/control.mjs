@@ -42,6 +42,23 @@ function modelReference(value) {
   return { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) };
 }
 
+function assertOrganizationTree(nodes) {
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  if (!byId.has('root')) throw new SystemControlError(400, '系统必须保留根实例');
+  const visited = new Set(['root']);
+  for (const node of nodes) {
+    const path = new Set();
+    let current = node;
+    while (!visited.has(current.id)) {
+      if (path.has(current.id)) throw new SystemControlError(400, '组织层级不能包含循环');
+      path.add(current.id);
+      current = byId.get(current.parent);
+      if (!current) throw new SystemControlError(400, '上级实例不存在');
+    }
+    for (const id of path) visited.add(id);
+  }
+}
+
 // Resolve existing ancestors before mkdir so a symlink cannot create directories outside the managed root.
 function managedPath(root, value) {
   if (typeof value !== 'string' || value.includes('\0') || !isAbsolute(value)) throw new SystemControlError(400, '实例工作目录必须是绝对路径');
@@ -97,7 +114,7 @@ function lifecycle(file, instanceId) {
   }).slice(-50);
 }
 
-/** Explicitly saved local single-hop configuration; this owns one manager for the lifetime of its host. */
+/** Explicitly saved local organization configuration; this owns one manager for the lifetime of its host. */
 export class SystemControl {
   constructor(ctx, { rootDir, defaultModel, validateModel, capabilityCatalog, managerOptions } = {}) {
     if (typeof rootDir !== 'string' || !isAbsolute(rootDir)) throw new SystemControlError(400, '运行服务的数据根目录必须是绝对路径');
@@ -161,14 +178,16 @@ export class SystemControl {
       model, roleModels: { router: clone(model), worker: clone(model) }, engine: defaultEngineConfig() }];
   }
   normalizeNodes(value, useDefault = true) {
-    if (!Array.isArray(value) || value.length < 1 || value.length > 60) throw new SystemControlError(400, '系统需要一个根实例，最多支持 59 个直属下级实例');
+    if (!Array.isArray(value) || value.length < 1 || value.length > 60) throw new SystemControlError(400, '系统需要一个根实例，最多支持 59 个下级实例');
     const defaultModel = useDefault ? this.currentDefaultModel() : null, ids = new Set();
     const nodes = value.map(raw => {
       if (!object(raw) || Object.keys(raw).some(key => !nodeKeys.has(key))) throw new SystemControlError(400, '实例配置包含当前运行服务不支持的字段');
       if (typeof raw.id !== 'string' || !idPattern.test(raw.id) || reservedId.test(raw.id) || ids.has(raw.id)) throw new SystemControlError(400, '实例标识无效或重复');
       ids.add(raw.id);
       const root = raw.id === 'root';
-      if (raw.kind !== (root ? 'root' : 'instance') || raw.parent !== (root ? null : 'root')) throw new SystemControlError(400, '当前只支持一个根实例及其直属下级');
+      if (raw.kind !== (root ? 'root' : 'instance') || (root ? raw.parent !== null : typeof raw.parent !== 'string' || !idPattern.test(raw.parent))) {
+        throw new SystemControlError(400, '根实例必须无上级，其他实例必须指定有效的上级实例');
+      }
       // Accept the retired field from saved configurations and older clients without treating it as policy.
       if (raw.redelegate !== undefined && typeof raw.redelegate !== 'boolean') throw new SystemControlError(400, '旧版委派配置格式无效');
       const name = text(raw.name, '组织名称', 200), brainName = text(raw.brainName, '大脑名称', 200, '贾维斯');
@@ -188,13 +207,13 @@ export class SystemControl {
       // Resolve legacy inheritance once; later brain edits and older clients cannot change other roles implicitly.
       const independentModels = Object.fromEntries(['router', 'worker'].map(role => [role,
         modelReference(Object.hasOwn(roleModels, role) ? roleModels[role] : previous?.roleModels?.[role] ?? previous?.model ?? model)]));
-      return { id: raw.id, parent: root ? null : 'root', kind: root ? 'root' : 'instance', name, brainName,
+      return { id: raw.id, parent: raw.parent, kind: root ? 'root' : 'instance', name, brainName,
         description: text(raw.description, '职责说明', 1600), capabilities: text(raw.capabilities, '能力标签', 300), concurrency,
         workerTools: [...new Set(workerTools)], workspace: this.workspace(raw.workspace, raw.id),
         model, roleModels: independentModels, engine,
         ...(raw.workerSkills ? { workerSkills: [...new Set(skillResult.data)] } : {}) };
     });
-    if (!ids.has('root')) throw new SystemControlError(400, '系统必须保留根实例');
+    assertOrganizationTree(nodes);
     for (const node of nodes) this.stateDirectory(node.id);
     for (let first = 0; first < nodes.length; first++) for (let second = first + 1; second < nodes.length; second++) {
       if (within(nodes[first].workspace, nodes[second].workspace) || within(nodes[second].workspace, nodes[first].workspace)) throw new SystemControlError(400, '不同实例的工作目录不能相同或互相包含');
@@ -202,11 +221,10 @@ export class SystemControl {
     return nodes.sort((a, b) => a.id === 'root' ? -1 : b.id === 'root' ? 1 : a.id.localeCompare(b.id));
   }
   runtimeConfig(nodes) {
-    const children = nodes.filter(node => node.parent === 'root').map(node => node.id);
     return nodes.map(node => ({ instanceId: node.id, organizationName: node.name, brainName: node.brainName,
       description: [node.description || node.name, node.capabilities && `能力标签：${node.capabilities}`].filter(Boolean).join('\n'),
       stateDir: this.stateDirectory(node.id), workspace: node.workspace, engine: clone(node.engine), model: { ...node.model }, roleModels: clone(node.roleModels ?? {}), workerSkills: [...node.workerSkills ?? []], workerTools: [...node.workerTools], maxWorkers: node.concurrency,
-      children: node.id === 'root' ? children : [], parents: children.includes(node.id) ? ['root'] : [] }));
+      children: nodes.filter(child => child.parent === node.id).map(child => child.id), parents: node.parent === null ? [] : [node.parent] }));
   }
   assertRevision(revision) {
     if (!Number.isSafeInteger(revision) || revision !== this.revision) throw new SystemControlError(409, '系统配置已更新，请重新读取后再保存或操作实例');
@@ -427,6 +445,10 @@ export class SystemControl {
     this.saving = true;
     try {
       const nodes = this.normalizeNodes(proposed), identities = { ...this.identities }, changes = this.nodeChanges(nodes);
+      // Moving a saved organization needs its own admission decision; a full form save cannot bypass it.
+      if (changes.some(({ node, previous }) => previous && node.parent !== previous.parent)) {
+        throw new SystemControlError(409, '当前不支持通过普通保存更换已有组织的上级');
+      }
       const scoped = this.nodes?.length === nodes.length && changes.every(change => change.previous && change.keys.every(key => scopedKeys.has(key)));
       for (const node of nodes) {
         const stateDir = this.stateDirectory(node.id), hasState = existsSync(stateDir) && readdirSync(stateDir).length > 0;

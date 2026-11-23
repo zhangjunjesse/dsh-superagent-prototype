@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
 import { createJarvisHandler, apply, inject } from './index.mjs';
-import { SystemControlError } from '../process-runtime/control.mjs';
+import { SystemControl, SystemControlError } from '../process-runtime/control.mjs';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -37,6 +37,48 @@ test('system API exposes persisted snapshot and selected instance detail, retain
   assert.equal((await request()).value.revision, 3);
   assert.equal((await request('/api/system/research')).value.instanceId, 'research');
   assert.deepEqual((await request('/api/state')).value, { runtime: 'dsh', turns: [], active: null, csrf: 'test-csrf' });
+});
+
+test('system API saves and reloads a group-management-research organization hierarchy', async t => {
+  const artifacts = resolve('.artifacts/multilevel-organization/system-api');
+  mkdirSync(artifacts, { recursive: true });
+  const model = { provider: 'controlled', model: 'model-a', reasoningEffort: 'high' };
+  const options = { rootDir: mkdtempSync(join(artifacts, 'hierarchy-')), defaultModel: model };
+  let control = new SystemControl({}, options);
+  t.after(() => control.close());
+  const request = await host(t, control);
+  const initial = await request('/api/system?view=topology');
+  assert.equal(initial.status, 200);
+  const saved = await request('/api/system', { method: 'PUT', input: {
+    revision: initial.value.revision,
+    nodes: [
+      { ...initial.value.nodes[0], name: '集团' },
+      { id: 'management', parent: 'root', kind: 'instance', name: '管理', brainName: '管理大脑', model },
+      { id: 'research', parent: 'management', kind: 'instance', name: '研发', brainName: '研发大脑', model },
+    ],
+  } });
+  assert.equal(saved.status, 200, JSON.stringify(saved.value));
+  assert.equal(saved.value.revision, initial.value.revision + 1);
+  const hierarchy = value => Object.fromEntries(value.nodes.map(({ id, parent, kind, name, brainName }) =>
+    [id, { parent, kind, name, brainName }]));
+  const expected = {
+    root: { parent: null, kind: 'root', name: '集团', brainName: '贾维斯' },
+    management: { parent: 'root', kind: 'instance', name: '管理', brainName: '管理大脑' },
+    research: { parent: 'management', kind: 'instance', name: '研发', brainName: '研发大脑' },
+  };
+  const readback = await request('/api/system?view=topology');
+  assert.equal(readback.status, 200);
+  assert.equal(readback.value.revision, saved.value.revision);
+  assert.deepEqual(hierarchy(readback.value), expected);
+
+  await control.close();
+  control = new SystemControl({}, options);
+  const reopened = await host(t, control);
+  const restored = await reopened('/api/system?view=topology');
+  assert.equal(restored.status, 200);
+  assert.equal(restored.value.revision, saved.value.revision);
+  assert.deepEqual(hierarchy(restored.value), expected);
+  assert.ok(restored.value.runtime.instances.every(item => item.phase === 'stopped' && item.pid === null));
 });
 
 test('topology snapshots use the existing authenticated system read while ordinary reads retain the complete response', async t => {
