@@ -310,9 +310,9 @@ test('export acceptance uses the original group conversation and installed DSH t
     await page.locator('#field-name').fill('客户端组');
     await page.locator('#field-description').fill('负责浏览器界面验收，实际点击导出，取得下载文件并逐条核对已知数据。');
     await page.locator('#field-capabilities').fill('客户端、Chrome、导出按钮、下载、双记录核验');
-    const createdResponse = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/api/system'));
-    await page.getByRole('button', { name: '保存并添加', exact: true }).click();
-    const response = await createdResponse, created = await response.json();
+    const [response] = await Promise.all([page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/api/system')),
+      page.getByRole('button', { name: '保存并添加', exact: true }).click()]);
+    const created = await response.json();
     assert.equal(response.status(), 200, `Normal organization creation failed: ${JSON.stringify(created)}`);
     const client = created.nodes.find(node => node.name === '客户端组');
     assert.ok(client); clientId = client.id; assert.equal(client.parent, 'management');
@@ -325,9 +325,9 @@ test('export acceptance uses the original group conversation and installed DSH t
       const name = await option.locator('small').first().innerText();
       await option.locator('input[type="checkbox"]').setChecked(clientTools.includes(name));
     }
-    const permissionsResponse = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/worker-capabilities'));
-    await capabilities.getByRole('button', { name: '保存', exact: true }).click();
-    const permissions = await (await permissionsResponse).json();
+    const [permissionsResponse] = await Promise.all([page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/worker-capabilities')),
+      capabilities.getByRole('button', { name: '保存', exact: true }).click()]);
+    const permissions = await permissionsResponse.json();
     assert.deepEqual(new Set(permissions.tools), new Set(clientTools));
     assert.equal(permissions.application?.state, 'applied', 'A never-started client must configure normally while unrelated parent work remains');
     await until(async () => await capabilities.locator('.dt-savebar').count() === 0
@@ -376,8 +376,10 @@ test('export acceptance uses the original group conversation and installed DSH t
     await page.locator('#logs-list .logs-event').first().waitFor();
     await page.locator('#logs-query').fill('双记录核验通过');
     await page.locator('#logs-filters').getByRole('button', { name: '搜索', exact: true }).click();
-    await page.locator('#logs-list .logs-event').filter({ hasText: '双记录核验通过' }).first().click();
+    await page.locator('#logs-list .logs-event').filter({ hasText: '客户端组' }).filter({ hasText: 'orchestrator_report' }).first().click();
     await page.locator('#logs-detail-meta').waitFor({ state: 'visible' });
+    await page.locator('#logs-detail-raw > summary').click();
+    await page.locator('#logs-detail-data').getByText('双记录核验通过', { exact: false }).waitFor();
     writeFileSync(join(evidence, 'rendered-task-logs.txt'), await page.locator('#operation-logs-page').innerText());
     await page.screenshot({ path: join(evidence, 'original-task-logs.png'), fullPage: true, animations: 'disabled' });
     await save('complete', { repairHash, verification, taskDetail: finishedDetail, logRecords: await logs.list(new URLSearchParams({ limit: '100' })),
