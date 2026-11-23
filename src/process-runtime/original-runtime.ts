@@ -178,7 +178,10 @@ export class OriginalProcess {
               }
               this.delegated.authorizeReview(ticket, assignment, decision)
             },
-            request: (ticket, assignment, review) => runtime!.sessions.relay(review.id, JSON.stringify({ kind: 'result_review',
+            request: (ticket, assignment, review) => {
+              // A retained department wait resumes through its original ready/resume path after the new review CAS is staged.
+              if (this.departments?.held(ticket)) return
+              runtime!.sessions.relay(review.id, JSON.stringify({ kind: 'result_review',
               ticket_id: ticket.id, assignment_id: assignment.id, review_id: review.id, evidence_ref: review.evidenceRef,
               scope: ticket.mandate.scope, original_request: ticket.mandate.basis.via === 'delegation'
                 ? `delegation/${ticket.origin.triggerId}/source` : `trigger/${ticket.origin.triggerId}`,
@@ -190,7 +193,8 @@ export class OriginalProcess {
               execution_targets: (config.delegationTargets ?? []).map(target => ({ ...target,
                 tools: target.tools.filter(tool => this.workerCapabilities(ticket).tools.includes(tool)) }))
                 .filter(target => target.tools.length && this.readyTargets.has(target.instanceId)),
-              instruction: 'Read the original request, complete review, all later inputs and prior results. Judge every original goal and completion condition against actual evidence for the delivered version. A child completion is only a result to review. Use orchestrator_result_review: accept only with sufficient evidence, otherwise continue the remaining work under the same mandate. If the producer cannot execute, choose a direct department with suitable responsibility and tools and retain the reason. Continue from the registered version and remaining work; the business owner queries and confirms the old execution stopped before handoff. Connection loss or an unknown result is not evidence of no changes. If a necessary direct department is missing, use orchestrator_department_wait with the responsibility, all required tools and the remaining instructions. The original review resumes when a suitable department is ready. Ask the user through the original group conversation if the task needs a different goal or more authority. Do not report completion to the user before acceptance.' })),
+              instruction: 'Read the original request, complete review, all later inputs and prior results. Judge every original goal and completion condition against actual evidence for the delivered version. A child completion is only a result to review. Use orchestrator_result_review: accept only with sufficient evidence, otherwise continue the remaining work under the same mandate. If the producer cannot execute, choose a direct department with suitable responsibility and tools and retain the reason. Continue from the registered version and remaining work; the business owner queries and confirms the old execution stopped before handoff. Connection loss or an unknown result is not evidence of no changes. If a necessary direct department is missing, use orchestrator_department_wait with the responsibility, all required tools and the remaining instructions. The original review resumes when a suitable department is ready. Ask the user through the original group conversation if the task needs a different goal or more authority. Do not report completion to the user before acceptance.' }))
+            },
           } },
         scope: { scope: input => input.source === 'delegation'
           ? this.inbound?.listens(input.meta) ? { listened: true, observed: false } : { listened: false, reason: 'delegation_not_allowed' }
@@ -263,7 +267,7 @@ export class OriginalProcess {
       if (options.delegationLimits) this.inbound.configureTopology(options.delegationLimits)
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
         () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound,
-        ticket => this.handoffArtifacts(ticket))
+        ticket => this.handoffArtifacts(ticket), () => this.refreshDelegationCatalog())
       this.departments = new DepartmentWaits(config, runtime.store, runtime.engine, runtime.sessions)
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)

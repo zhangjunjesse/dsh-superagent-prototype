@@ -15,7 +15,8 @@ export interface DelegationBinding {
   retryAt?: number; failures?: number; submitAttempted?: boolean;
   reviewId?: string;
   /** Durable cleanup proof is separate from the result being judged; stopping execution does not rewrite its evidence. */
-  handoff?: { reviewId: string; evidenceRef: string; stopping: boolean; queried?: DelegationSnapshot; stopAttempted?: boolean; stopped?: DelegationSnapshot; error?: string };
+  handoff?: { reviewId: string; evidenceRef: string; stopping: boolean; queried?: DelegationSnapshot; stopAttempted?: boolean; stopped?: DelegationSnapshot;
+    error?: string; retryAt?: number; failures?: number; recoveryGeneration?: number };
 }
 const selections = family<string, [string]>('process-delegation:route:')
 type Binding = DelegationBinding
@@ -25,11 +26,15 @@ type Config = { instanceId: string; workerTools: string[]; delegationTargets?: C
 
 /** Keeps one parent Assignment bound to one child and reconciles its commands and evidence. */
 export class DelegationExecutor {
+  /** Durable intent survives a crash; only a live promise can hold off another attempt in this owner. */
+  private readonly preparing = new Map<string, Promise<void>>()
+  /** One fresh review CAS per owner boot; repeated poll ticks do not repeatedly wake the main Session. */
+  private readonly recovered = new Set<string>()
   constructor(private config: Config, private store: Store, private engine: Engine,
     private send?: (request: DelegationRequest) => Promise<DelegationSnapshot>, private frozen: () => boolean = () => false,
     private ready: (instanceId: string) => boolean = () => false,
     private toolsFor?: (ticket: Ticket) => readonly string[], private incoming?: InboundDelegations,
-    private handoffFor?: (ticket: Ticket) => ArtifactReference[]) {}
+    private handoffFor?: (ticket: Ticket) => ArtifactReference[], private prepareRecovery?: () => Promise<void>) {}
 
   /** Stored selection outlives catalog readiness; retries cannot move an existing task. */
   selected(triggerId: string): string | undefined { return this.store.get(selections(triggerId)) }
@@ -110,7 +115,8 @@ export class DelegationExecutor {
   reviewContext(ticket: Ticket, assignment: Assignment): unknown {
     const target = this.target(ticket, assignment), row = this.store.get(this.name(ticket.id, assignment.id))
     return { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
-      ...(row ? { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped, error: row.error } : {}) }
+      ...(row ? { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped, error: row.error,
+        ...(row.handoff?.recoveryGeneration ? { recoveryGeneration: row.handoff.recoveryGeneration } : {}) } : {}) }
   }
   /** Query and drain only an existing producer binding; the caller persists proof and decides whether its intent is still current. */
   async confirmStopped(ticketId: string, assignmentId: string, operationId: string, beforeStop?: (query: DelegationSnapshot) => void): Promise<{
@@ -134,9 +140,22 @@ export class DelegationExecutor {
     return { query, stopped: this.stoppedSnapshot(row, stopped), current: !!this.current(row) && !row.stopped }
   }
   /** Query the exact producer before stopping it. Lost acknowledgements can retry only this binding, never create another Worker. */
-  async prepareReview(ticketId: string, assignmentId: string, reviewId: string): Promise<void> {
+  prepareReview(ticketId: string, assignmentId: string, reviewId: string): Promise<void> {
+    return this.prepare(ticketId, assignmentId, reviewId, false)
+  }
+  private prepare(ticketId: string, assignmentId: string, reviewId: string, recovering: boolean): Promise<void> {
+    const name = this.name(ticketId, assignmentId), active = this.preparing.get(name)
+    if (active) return active
+    const pending = this.prepareBoundReview(ticketId, assignmentId, reviewId, recovering).finally(() => {
+      if (this.preparing.get(name) === pending) this.preparing.delete(name)
+    })
+    this.preparing.set(name, pending)
+    return pending
+  }
+  private async prepareBoundReview(ticketId: string, assignmentId: string, reviewId: string, recovering: boolean): Promise<void> {
     const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
-    const review = assignment?.resultReviews?.at(-1)
+    // Later inputs can refresh the review CAS while IPC is interrupted. The old saved result still owns this cleanup intent.
+    const review = recovering ? assignment?.resultReviews?.find(item => item.id === reviewId) : assignment?.resultReviews?.at(-1)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || review?.id !== reviewId || review.decision) throw new Error('Result review is no longer current')
     if (!this.remote(ticket, assignment)) return
     const name = this.name(ticketId, assignmentId), initial = this.store.get(name)
@@ -144,10 +163,10 @@ export class DelegationExecutor {
     const evidenceRef = this.evidence(initial.snapshot)
     if (review.evidenceRef !== evidenceRef) throw new Error('The result evidence changed; read the current review')
     if (initial.handoff?.stopped?.executionStopped && initial.handoff.reviewId === reviewId && initial.handoff.evidenceRef === evidenceRef) return
-    const prior = initial.handoff?.reviewId === reviewId && initial.handoff.evidenceRef === evidenceRef ? initial.handoff : undefined
+    const prior = initial.handoff?.evidenceRef === evidenceRef ? initial.handoff : undefined
     this.store.set(name, { ...initial, handoff: { ...prior, reviewId, evidenceRef, stopping: true, error: undefined } })
     try {
-      const { query, stopped } = await this.confirmStopped(ticketId, assignmentId, key('handoff', reviewId), query => {
+      const { query, stopped, current } = await this.confirmStopped(ticketId, assignmentId, key('handoff', reviewId), query => {
         const retryStopped = prior?.stopAttempted && query.status === 'stopped'
           && fingerprint(verifiedDelegationArtifacts(query)) === fingerprint(verifiedDelegationArtifacts(initial.snapshot!))
         if (this.evidence(query) !== evidenceRef && !retryStopped) {
@@ -164,12 +183,44 @@ export class DelegationExecutor {
       // Cleanup may change the status/summary; the registered artifact versions must stay identical.
       if (fingerprint(verifiedDelegationArtifacts(stopped)) !== fingerprint(verifiedDelegationArtifacts(query))) throw new Error('Producer artifacts changed while stopping; inspect the current versions before handoff')
       const row = this.store.get(name)!
-      this.store.set(name, { ...row, finished: true, snapshot: { ...row.snapshot!, executionStopped: true }, handoff: { reviewId, evidenceRef, stopping: false, stopped } })
+      this.store.set(name, { ...row, finished: true, error: undefined, retryAt: undefined, failures: undefined, snapshot: { ...row.snapshot!, executionStopped: true },
+        handoff: { ...row.handoff!, reviewId, evidenceRef, stopping: false, stopped, error: undefined, retryAt: undefined } })
+      if (!current) throw new Error('The original assignment was cancelled or replaced during handoff cleanup')
     } catch (error) {
       const row = this.store.get(name)!
-      if (row.handoff) this.store.set(name, { ...row, handoff: { ...row.handoff, error: String(error) } })
+      if (row.handoff && this.current(row) && !row.stopped) this.failedHandoff(name, error)
       throw error
     }
+  }
+  private failedHandoff(name: ReturnType<DelegationExecutor['name']>, error: unknown): void {
+    const row = this.store.get(name)!, handoff = row.handoff
+    if (!handoff || row.stopped || !this.current(row)) return
+    const failures = (handoff.failures ?? 0) + 1
+    this.store.set(name, { ...row, handoff: { ...handoff, error: String(error), failures,
+      retryAt: Date.now() + Math.min(30000, 500 * 2 ** Math.min(failures - 1, 6)) } })
+  }
+  private async recoverHandoff(name: ReturnType<DelegationExecutor['name']>): Promise<void> {
+    let row = this.store.get(name)!
+    if (this.preparing.has(name) || (row.handoff?.retryAt ?? 0) > Date.now()) return
+    if (row.handoff?.stopping) await this.prepare(row.request.parentTicketId, row.request.parentAssignmentId, row.handoff.reviewId, true)
+    row = this.store.get(name)!
+    if (!this.current(row) || row.stopped || !row.handoff?.stopped?.executionStopped || !row.snapshot) return
+    const announce = !this.recovered.has(name)
+    if (announce) await this.prepareRecovery?.()
+    this.store.atomic(() => {
+      row = this.store.get(name)!
+      const ticket = this.current(row), handoff = row.handoff
+      if (!ticket || row.stopped || !handoff?.stopped?.executionStopped || !row.snapshot) return
+      const assignment = latestAssignment(ticket)!, original = assignment.resultReviews?.find(review => review.evidenceRef === handoff.evidenceRef)
+      if (!original || assignment.resultReviews?.at(-1)?.decision) return
+      // A fresh CAS also creates a fresh durable main-Session relay after an earlier relay was already consumed before the crash.
+      if (announce) handoff.recoveryGeneration = (handoff.recoveryGeneration ?? 0) + 1
+      delete handoff.error; delete handoff.retryAt
+      this.store.set(name, row)
+      const review = this.engine.stageResultReview(ticket.id, assignment.id, handoff.evidenceRef, original.summary)
+      row.reviewId = review.id; handoff.reviewId = review.id; this.store.set(name, row)
+    })
+    if (announce) this.recovered.add(name)
   }
   authorizeReview(ticket: Ticket, assignment: Assignment, decision: ResultReviewDecision): void {
     const ceiling = this.toolsFor?.(ticket) ?? this.config.workerTools
@@ -319,20 +370,14 @@ export class DelegationExecutor {
     if (!this.send) return
     for (const name of this.store.keys(outgoing)) {
       let row = this.store.get(name)!
-      if (row.handoff?.stopped?.executionStopped && this.current(row) && row.snapshot) {
-        // A new user input while cleanup was in flight invalidates the old review, not the verified stop.
-        // Restage the same immutable result against current inputs without re-delivering them to the stopped producer.
-        this.store.atomic(() => {
-          const ticket = this.current(row)!, assignment = latestAssignment(ticket)!
-          const original = assignment.resultReviews?.find(review => review.evidenceRef === row.handoff!.evidenceRef)
-          if (original && !assignment.resultReviews?.at(-1)?.decision) {
-            const review = this.engine.stageResultReview(ticket.id, assignment.id, row.handoff!.evidenceRef, original.summary)
-            row.reviewId = review.id; row.handoff!.reviewId = review.id; this.store.set(name, row)
-          }
-        })
+      if (row.handoff && this.current(row) && !row.stopped) {
+        try { await this.recoverHandoff(name) } catch (error) {
+          if ((this.store.get(name)?.handoff?.retryAt ?? 0) <= Date.now()) this.failedHandoff(name, error)
+        }
         continue
       }
-      if (row.finished || row.handoff?.stopping || (row.retryAt ?? 0) > Date.now()) continue
+      // Human cancellation drains the fixed binding even if a continuation's query/stop was interrupted or is still awaiting IPC.
+      if (row.finished || (row.retryAt ?? 0) > Date.now()) continue
       try {
         const ticket = this.current(row)
         if (!ticket && !row.stopped) { row.stopped = true; this.store.set(name, row) }
@@ -358,6 +403,7 @@ export class DelegationExecutor {
           row.snapshot = snapshot
           this.stoppedSnapshot(row, snapshot)
           row.finished = true
+          if (row.handoff) row.handoff = { ...row.handoff, stopping: false, stopped: snapshot, error: undefined, retryAt: undefined }
         } else {
           const current = this.current(row)
           if (!current) continue
