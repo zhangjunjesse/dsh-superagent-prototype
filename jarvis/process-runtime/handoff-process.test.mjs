@@ -2,11 +2,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ProcessManager } from './manager.mjs';
-import { controlledNativeFactory } from './controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
 
 for (const stoppedProducer of [false, true]) test(stoppedProducer
   ? 'a running receiving Worker reads the same multi-block version through reopened stopped-producer owners'
@@ -99,4 +99,161 @@ for (const stoppedProducer of [false, true]) test(stoppedProducer
     assert.equal(state.delegations.outgoing.find(row => row.request.targetInstanceId === 'author').handoff.stopped.executionStopped, true);
     writeFileSync(join(rootDir, 'completion.json'), JSON.stringify({ complete: true, stoppedProducer, producerOwners, hash, state, seen, transfers }, null, 2));
   } finally { await manager.close(); }
+});
+
+test('a waiting management task resumes once from the newer registered B and its inspector reads the exact bytes', { timeout: 30000 }, async t => {
+  const base = resolve('.artifacts/handoff/process'); mkdirSync(base, { recursive: true });
+  const rootDir = mkdtempSync(join(base, 'updated-producer-')), workers = [], preparations = [], transfers = [], resumed = [];
+  t.diagnostic(`Waiting management task and real B transfer evidence: ${rootDir}`);
+  const goal = 'Produce the marker and independently inspect the exact delivered version by reading and searching its registered bytes.';
+  const requirement = { responsibility: 'Independently inspect the delivered marker', required_tools: ['read', 'grep'],
+    instructions: 'Read and search the exact registered marker bytes, measure their SHA-256, and report the tested version and observed marker.' };
+  const instances = ['management', 'author', 'inspector'].map(instanceId => ({ instanceId, organizationName: instanceId,
+    description: instanceId === 'inspector' ? requirement.responsibility : instanceId,
+    stateDir: join(rootDir, instanceId, 'state'), workspace: join(rootDir, instanceId, 'work'),
+    model: { provider: 'controlled', model: 'controlled' }, maxWorkers: 1,
+    workerTools: instanceId === 'management' ? ['read', 'write', 'grep'] : instanceId === 'author' ? ['read', 'write'] : ['read', 'grep'],
+    ...(instanceId === 'management' ? { children: ['author', 'inspector'] } : { parents: ['management'] }) }));
+  const bytesA = Buffer.from('marker-A: independent inspection remains\n');
+  const bytesB = Buffer.from(`marker-B: registered delivery\n${'B'.repeat(300000)}\n`);
+  const hashA = createHash('sha256').update(bytesA).digest('hex'), hashB = createHash('sha256').update(bytesB).digest('hex');
+  const releaseB = Promise.withResolvers();
+  let sourceFile, waitId, firstReview, readyReview, received, reportedB = false, delivered = false;
+  const log = row => appendFileSync(join(rootDir, 'trace.jsonl'), JSON.stringify({ at: new Date().toISOString(), ...row }) + '\n');
+  const checkpoint = (phase, extra = {}) => {
+    const record = JSON.stringify({ phase, hashA, hashB, ...extra }, null, 2);
+    writeFileSync(join(rootDir, `${phase}.json`), record); writeFileSync(join(rootDir, 'progress.json'), record);
+  };
+  async function read(tool, resource) {
+    let text = '', offset = 0;
+    for (;;) {
+      const page = await tool('orchestrator_read', { resource, offset, limit: 8000 }); text += page.text;
+      if (page.next_offset === null) return text;
+      offset = page.next_offset;
+    }
+  }
+  const native = controlledNativeFactory(async ({ config, sessionId, text, policy, tool }) => {
+    if (!text.startsWith('{')) return;
+    const card = JSON.parse(text); log({ event: 'native-turn', instanceId: config.instanceId, role: policy.role, sessionId, card });
+    if (policy.role === 'orchestrator') {
+      if (card.kind === 'candidate') {
+        const routed = await tool('orchestrator_route', { decisions: [{ kind: 'accept', trigger_id: card.trigger_id,
+          title: 'Produce and independently inspect the delivered marker', worktree_name: 'updated-marker',
+          acknowledgement: 'Accepted the original production and inspection requirements.',
+          ...(config.instanceId === 'management' ? { target_instance_id: 'author' } : {}) }] });
+        assert.equal(routed.results[0].decision, 'accept', JSON.stringify(routed)); return;
+      }
+      if (card.kind === 'result_review') {
+        assert.equal(config.instanceId, 'management');
+        if (received) {
+          await reviewDelegatedResult(tool, card, ({ original, summary }) => {
+            assert.ok(original.includes(goal)); assert.ok(summary.includes(hashB)); assert.ok(summary.includes('Inspection passed'));
+          });
+          delivered = true; return;
+        }
+        assert.equal(waitId, undefined, 'the management wait must retain updates without a second manual wait decision');
+        firstReview = JSON.parse(await read(tool, card.read));
+        assert.ok(firstReview.summary.includes(hashA)); assert.equal(card.producer_state, 'blocked');
+        const args = { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
+          ...requirement, summary: 'Production has partial evidence; the original independent inspection condition remains unaccepted.' };
+        const wait = await tool('orchestrator_department_wait', args);
+        assert.deepEqual(await tool('orchestrator_department_wait', args), wait);
+        waitId = wait.id; log({ event: 'management-waiting-on-A', wait, firstReview }); return;
+      }
+      if (card.kind === 'department_ready') {
+        assert.equal(config.instanceId, 'management'); assert.equal(card.wait_id, waitId);
+        const target = card.execution_targets.find(item => item.instanceId === 'inspector');
+        assert.equal(target?.description, requirement.responsibility);
+        assert.ok((await read(tool, card.original_request)).includes(goal));
+        readyReview = JSON.parse(await read(tool, card.read));
+        checkpoint('department-ready', { card, firstReview, readyReview });
+        assert.ok(readyReview.summary.includes(hashB), 'department_ready must review producer B rather than the originally waiting A');
+        assert.equal(readyReview.summary.includes(hashA), false, 'the superseded A report must not replace registered B evidence');
+        assert.notEqual(card.review_id, firstReview.id);
+        const args = { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
+          target_instance_id: target.instanceId, summary: 'The ready direct inspector can verify the latest registered version under the original mandate.' };
+        await tool('orchestrator_department_resume', args); await tool('orchestrator_department_resume', args);
+        resumed.push(args); return;
+      }
+      return;
+    }
+    if (!card.ticket_id) return;
+    workers.push({ instanceId: config.instanceId, ticketId: card.ticket_id, assignmentId: card.assignment_id, sessionId });
+    if (config.instanceId === 'author') {
+      sourceFile = join(policy.cwd, 'marker.txt'); writeFileSync(sourceFile, bytesA);
+      // A blocked report keeps this original Worker alive. Only the later ready report registers a deliverable version.
+      await tool('orchestrator_report', { state: 'blocked', summary: `Partial marker A SHA-256 ${hashA}; independent inspection is unavailable.` });
+      await releaseB.promise;
+      writeFileSync(sourceFile, bytesB);
+      await tool('orchestrator_report', { state: 'ready', summary: `Registered marker B SHA-256 ${hashB}; independent inspection remains unaccepted.`,
+        artifacts: [{ path: 'marker.txt', title: 'Registered marker B' }] });
+      reportedB = true; log({ event: 'same-producer-reported-registered-B', ticketId: card.ticket_id, sessionId }); return;
+    }
+    assert.equal(config.instanceId, 'inspector'); assert.equal(policy.allowedTools.includes('write'), false);
+    assert.equal(policy.allowedTools.includes('grep'), true);
+    assert.ok((await read(tool, card.trigger.delegation.assignment.read)).includes(hashB));
+    const [file] = card.execution.handoff;
+    assert.equal(card.execution.handoff.length, 1); assert.equal(file.instanceId, 'author'); assert.equal(file.version.path, 'marker.txt');
+    assert.equal(file.version.sha256, hashB); assert.equal(isAbsolute(file.path), false);
+    received = readFileSync(join(policy.cwd, file.path));
+    assert.deepEqual(received, bytesB); assert.equal(createHash('sha256').update(received).digest('hex'), hashB);
+    assert.ok(received.includes(Buffer.from('marker-B: registered delivery\n')));
+    assert.equal(readFileSync(sourceFile, 'utf8'), 'unregistered source mutation after B');
+    log({ event: 'inspector-read-registered-B', file, bytes: received.length, sha256: hashB });
+    await tool('orchestrator_report', { state: 'ready', summary: `Inspection passed for registered marker B SHA-256 ${hashB}; exact bytes were read.` });
+  });
+  const manager = new ProcessManager({}, { rootDir, instances }, { nativeFactory: native.factory, bridgeFactory: (config, tool) => ({
+    run: async input => {
+      preparations.push({ instanceId: config.instanceId, sessionKey: input.sessionKey });
+      await tool({ ...input, name: 'delegation_prepare', args: { summary: 'Perform only the original production or remaining inspection using the retained registered version.' } });
+      return { status: 'complete', text: 'Prepared.' };
+    }, cancel: async () => {}, close: async () => {},
+  }) });
+  const transfer = manager.readArtifact.bind(manager);
+  manager.readArtifact = async (source, generation, input) => {
+    transfers.push({ source: source.config.instanceId, input }); return transfer(source, generation, input);
+  };
+  async function until(readValue, predicate, label) {
+    let value;
+    for (let attempt = 0; attempt < 400; attempt++) {
+      assert.deepEqual(native.errors.map(error => error.stack), []);
+      value = await readValue(); if (predicate(value)) return value;
+      await delay(25);
+    }
+    assert.fail(`${label}: ${JSON.stringify(value)}`);
+  }
+  try {
+    await manager.start('author'); await manager.start('management');
+    await manager.gateway('management', { operation: 'submit', input: { operation: 'new', request: { quote: goal, summary: goal } },
+      origin: { conversationId: 'updated-handoff', userMessageId: 'original', text: goal, at: new Date().toISOString(), source: 'user' } });
+    const waiting = await until(() => manager.state('management'), state => state.departmentWaits.length === 1 && !!waitId, 'management did not retain the original A review');
+    const original = waiting.tickets[0], producer = (await manager.state('author')).tickets[0];
+    assert.equal(waiting.departmentWaits[0].ticketId, original.id); assert.equal(waiting.departmentWaits[0].reviewId, firstReview.id);
+    assert.equal(producer.ended, undefined); assert.equal(producer.attention, undefined); assert.equal(producer.assignments.length, 1);
+    assert.equal(manager.instance('inspector').phase, 'stopped'); assert.deepEqual(workers.map(item => item.instanceId), ['author']);
+    checkpoint('management-waiting-on-A', { waiting, producer });
+    releaseB.resolve();
+    const updated = await until(() => manager.state('management'), state => reportedB && state.delegations.outgoing.some(row =>
+      row.snapshot?.summary?.includes(hashB) && row.snapshot.artifacts?.some(file => file.version?.sha256 === hashB)), 'registered B did not return through the original delegation');
+    assert.equal(updated.tickets[0].id, original.id); assert.equal(updated.tickets[0].assignments.length, 1);
+    assert.equal((await manager.state('author')).tickets[0].id, producer.id);
+    assert.equal((await manager.state('author')).tickets[0].assignments.length, 1);
+    checkpoint('registered-B-returned-before-inspector-start', { updated, firstReview });
+    writeFileSync(sourceFile, 'unregistered source mutation after B');
+    await manager.start('inspector');
+    const completed = await until(() => manager.state('management'), state => delivered && resumed.length === 1
+      && state.tickets[0]?.ended?.outcome === 'completed', 'original management task did not accept the actual B inspection');
+    const final = completed.tickets[0];
+    assert.equal(delivered, true); assert.deepEqual(native.errors, []); assert.deepEqual(received, bytesB);
+    assert.equal(final.id, original.id); assert.equal(final.decisionId, original.decisionId); assert.deepEqual(final.mandate, original.mandate);
+    assert.equal(final.assignments.length, 2); assert.equal(final.assignments[1].executionTarget, 'inspector');
+    assert.deepEqual(workers.map(item => item.instanceId), ['author', 'inspector']);
+    assert.deepEqual(preparations.map(item => item.instanceId), ['author', 'inspector']); assert.equal(resumed.length, 1);
+    assert.equal(completed.delegations.outgoing.filter(row => row.request.targetInstanceId === 'inspector').length, 1);
+    assert.equal(completed.departmentWaits.length, 0);
+    assert.ok(transfers.length >= 2); assert.ok(transfers.some(item => item.input.offset === 262144));
+    assert.ok(transfers.every(item => item.source === 'inspector' && item.input.artifact.instanceId === 'author' && item.input.artifact.version.sha256 === hashB));
+    checkpoint('complete', { original, completed, firstReview, readyReview, workers, preparations, resumed, transfers, receivedBytes: received.length });
+  } catch (error) { checkpoint('failed', { error: error.stack, firstReview, readyReview, workers, transfers }); throw error; }
+  finally { releaseB.resolve(); await manager.close(); }
 });
