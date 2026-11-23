@@ -56,6 +56,7 @@ function organizationChain(leaf?: (turn: NativeTurn) => Promise<void>, configure
       if (!turn.text.startsWith('{')) return
       const input = JSON.parse(turn.text)
       if (turn.policy.role === 'orchestrator') {
+        if (input.kind === 'result_review') { await routeOriginal(turn); return }
         if (input.kind !== 'candidate') return
         calls.push({ instance: id, role: 'router', text: turn.text })
         if (route && await route(id, turn)) return

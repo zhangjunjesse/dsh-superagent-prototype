@@ -4,7 +4,7 @@ import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
-import type { Ticket } from '../core/index.ts'
+import { latestAssignment, liveTicket, type Ticket } from '../core/index.ts'
 import type { RuntimeNativePorts } from '../app/runtime-ports.ts'
 import type { Machine } from '../deployment.ts'
 import type { StartupObserver } from '../setup.ts'
@@ -22,7 +22,8 @@ import { DelegationExecutor } from './delegation-executor.ts'
 import { CapabilitySchema, DelegationCatalogSchema, type Capability } from './delegation-contract.ts'
 import { EngineConfigSchema, normalizeEngineConfig } from './engine-config.ts'
 import { initializeOriginalConfiguration } from './original-config.ts'
-import { TaskFiles, artifactLinks } from './task-files.ts'
+import { TaskFiles } from './task-files.ts'
+import { ArtifactReferenceSchema, artifactIdentity, type ArtifactReference } from './artifact-contract.ts'
 import { effectiveWorkerTools, WorkerSkillsSchema, WorkerToolSchema } from './worker-capabilities.ts'
 import { CapabilityDrain, type CapabilityHold } from './capability-drain.ts'
 import type { ProcessHost, ProcessRunResult, ProcessRuntimeConfig } from './runtime.ts'
@@ -56,8 +57,9 @@ export interface ProcessRuntimeOptions {
   startup?: StartupObserver;
 }
 type Preparation = { prepare(id: string, text: string): Promise<ProcessRunResult>; cancel(sessionKey: string): Promise<unknown> }
-const WorkerCapabilityBindingSchema = z.object({ version: z.literal(1), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
+const WorkerCapabilityBindingSchema = z.object({ version: z.union([z.literal(1), z.literal(2)]), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
 const workerCapabilities = family<z.infer<typeof WorkerCapabilityBindingSchema>, [string]>('process-runtime:worker-capabilities:')
+const localHandoffs = family<{ reviewId: string; evidenceRef: string }, [string]>('process-runtime:local-handoff:')
 
 /** Validate adopted identities against the actual locked Store rather than trusting transport observations. */
 function verifyAdoption(runtime: Runtime, config: ProcessRuntimeConfig, adoption: OriginalAdoption): void {
@@ -128,10 +130,14 @@ export class OriginalProcess {
         workerTools: ticket => effectiveWorkerTools(this.workerCapabilities(ticket).tools).names,
         workerSkills: ticket => this.workerCapabilities(ticket).skills,
         prepareTicket: ticket => {
-          runtime!.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 1, ...this.workerCapabilities(ticket) }))
+          runtime!.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 2, ...this.workerCapabilities(ticket) }))
           return ticket
         },
         localTicket: ticket => !this.delegated.remote(ticket),
+        prepareHandoff: async (ticket, assignment) => this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket), async input => {
+          if (!host.readArtifact) throw new Error('The authenticated artifact transfer is unavailable')
+          return host.readArtifact({ ...input, ticketId: ticket.id, assignmentId: assignment.id })
+        }),
         executionHeld: () => this.draining || (this.capabilityDrain?.frozen ?? false),
         authorizeCapabilityStop: operationId => this.capabilityDrain.authorizeStop(operationId),
         engine: { resumeCompletedCommands: true,
@@ -140,17 +146,24 @@ export class OriginalProcess {
           delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false },
           resultReview: {
             context: (ticket, assignment) => ({ delegation: this.delegated.reviewContext(ticket, assignment), capabilities: this.workerCapabilities(ticket) }),
-            authorize: (ticket, assignment, decision) => this.delegated.authorizeReview(ticket, assignment, decision),
+            authorize: (ticket, assignment, decision) => {
+              if (decision.kind === 'continue' && !this.delegated.remote(ticket, assignment)) {
+                const review = assignment.resultReviews?.at(-1), proof = runtime!.store.get(localHandoffs(assignment.id))
+                if (!review || proof?.reviewId !== review.id || proof.evidenceRef !== review.evidenceRef) throw new Error('The original Worker execution has not been verified stopped for this result')
+              }
+              this.delegated.authorizeReview(ticket, assignment, decision)
+            },
             request: (ticket, assignment, review) => runtime!.sessions.relay(review.id, JSON.stringify({ kind: 'result_review',
               ticket_id: ticket.id, assignment_id: assignment.id, review_id: review.id, evidence_ref: review.evidenceRef,
               scope: ticket.mandate.scope, original_request: `trigger/${ticket.origin.triggerId}`,
               original_assignment: `ticket/${ticket.id}/assignment`, inputs: `ticket/${ticket.id}/inputs`,
               history: `ticket/${ticket.id}/assignments`, read: `ticket/${ticket.id}/review/${review.id}`,
               summary: review.summary.slice(0, 600), chars: review.summary.length,
+              producer_state: this.delegated.result(ticket.id)?.status ?? assignment.report?.state,
               execution_targets: (config.delegationTargets ?? []).map(target => ({ ...target,
                 tools: target.tools.filter(tool => this.workerCapabilities(ticket).tools.includes(tool)) }))
                 .filter(target => target.tools.length && this.readyTargets.has(target.instanceId)),
-              instruction: 'Read the original request, complete review, all later inputs and prior results. Judge every original goal and completion condition against actual evidence for the delivered version. A child completion is only a result to review. Use orchestrator_result_review: accept only with sufficient evidence, otherwise continue the remaining work under the same mandate. Do not report completion to the user before acceptance.' })),
+              instruction: 'Read the original request, complete review, all later inputs and prior results. Judge every original goal and completion condition against actual evidence for the delivered version. A child completion is only a result to review. Use orchestrator_result_review: accept only with sufficient evidence, otherwise continue the remaining work under the same mandate. If the producer cannot execute, choose a direct department with suitable responsibility and tools and retain the reason. Continue from the registered version and remaining work; the business owner queries and confirms the old execution stopped before handoff. Connection loss or an unknown result is not evidence of no changes. If no current department can execute, or the goal or authority must change, ask through the original parent/group conversation instead of widening the mandate. Do not report completion to the user before acceptance.' })),
           } },
         scope: { scope: input => input.source === 'delegation'
           ? this.inbound?.listens(input.meta) ? { listened: true, observed: false } : { listened: false, reason: 'delegation_not_allowed' }
@@ -164,7 +177,7 @@ export class OriginalProcess {
           },
           prepare: async (id, target) => { if (target && !this.delegated.selected(id)) await this.refreshDelegationCatalog() },
           select: (id, target) => this.delegated.select(id, target),
-          prepareReview: async (_id, target) => { if (target) await this.refreshDelegationCatalog() },
+          prepareReview: (id, target, assignmentId, reviewId) => this.prepareReview(id, target, assignmentId, reviewId),
         },
         executor: local => ({
           requestCancellation: ticket => this.delegated.requestCancellation(ticket.id),
@@ -177,7 +190,10 @@ export class OriginalProcess {
             else if (!options.managementOnly) local.stop(ticket, assignment, reason)
           },
         }),
-        reportArtifacts: (ticketId, artifacts) => artifactLinks(config.instanceId, ticketId, this.taskFiles.register(ticketId, artifacts)),
+        reportArtifacts: (ticketId, artifacts) => {
+          this.taskFiles.register(ticketId, artifacts)
+          return this.taskFiles.links(config.instanceId, ticketId).map(item => `- ${item.title.replace(/[\[\]\\\r\n]/g, ' ')}：[打开](${item.url}) · [下载](${item.downloadUrl})${item.version ? ` · SHA-256 ${item.version.sha256}` : ''}`).join('\n')
+        },
         initialize: original => {
           if (adoption) verifyAdoption(original, config, adoption)
           const before = original.store.settings().sources.jarvis?.config
@@ -192,13 +208,16 @@ export class OriginalProcess {
                 maxWorkers: config.maxWorkers, directory: workspace } }) })
         },
       })
-      this.taskFiles = new TaskFiles(directory, workspace, { executionDirectory: id => runtime!.store.tickets.get(id)?.execution?.directory })
+      this.taskFiles = new TaskFiles(directory, workspace, { executionDirectory: id => runtime!.store.tickets.get(id)?.execution?.directory,
+        assignmentId: id => runtime!.store.tickets.get(id)?.assignments.at(-1)?.id,
+        assignmentExists: (id, assignmentId) => runtime!.store.tickets.get(id)?.assignments.some(item => item.id === assignmentId) ?? false })
       const kind = jarvisKind(ledger, identity)
       this.unregister = runtime.sources.register(kind)
       this.inbound = new InboundDelegations(config, runtime.store, runtime.engine,
         { ...preparation, admitted: id => this.capabilityDrain.prepare(id), acceptNew: () => this.delegationReady() })
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
-        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound)
+        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound,
+        ticket => this.handoffArtifacts(ticket))
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
       const backend = new SourceBackend(runtime.context(kind), identity)
@@ -216,13 +235,39 @@ export class OriginalProcess {
   /** Existing task grants can only narrow; changing instance settings never grants an old task new tools or skills. */
   private workerCapabilities(ticket: Ticket) {
     const stored = this.runtime.store.get(workerCapabilities(ticket.id)), saved = stored && WorkerCapabilityBindingSchema.parse(stored)
-    const selected = ticket.assignments.at(-1)?.executionTarget ?? this.delegated?.selected(ticket.origin.triggerId)
-    const childTools = selected && selected !== 'local' ? this.config.delegationTargets?.find(target => target.instanceId === selected)?.tools ?? [] : undefined
     return {
       tools: (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
-        .filter(tool => (!childTools || childTools.some(name => name === tool)) && (!saved || saved.tools.some(name => name === tool))),
+        .filter(tool => this.config.workerTools.includes(tool) && (!saved || saved.tools.some(name => name === tool))),
       skills: (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill)),
     }
+  }
+  /** Keep task authority separate from each target's capabilities; old v1 grants remain conservatively narrow. */
+  handoffArtifacts(ticket: Ticket): ArtifactReference[] {
+    const own = this.taskFiles.links(this.config.instanceId, ticket.id).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: ticket.id }))
+    const input = [...this.inbound.handoff(ticket), ...[...own, ...this.delegated.artifacts(ticket.id)].map(item => {
+      if (!item.version || !item.assignmentId) throw new Error('Historical result has no verified version for handoff')
+      return { instanceId: item.instanceId, ticketId: item.ticketId, assignmentId: item.assignmentId, version: item.version }
+    })]
+    const references = input.map(item => ArtifactReferenceSchema.parse(item))
+    return [...new Map(references.map(item => [artifactIdentity(item), item])).values()]
+  }
+  /** Shared by normal reviews and missing-department resumes; no second execution starts before the old one is known quiet. */
+  async prepareReview(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void> {
+    if (target) await this.refreshDelegationCatalog()
+    if (target && (!this.config.delegationTargets?.some(item => item.instanceId === target) || !this.readyTargets.has(target))) throw new Error('The selected child is not ready for remaining work')
+    const ticket = this.runtime.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    const review = assignment?.resultReviews?.at(-1)
+    if (!ticket || !liveTicket(ticket) || !assignment || assignmentId && assignment.id !== assignmentId || !review || reviewId && review.id !== reviewId) throw new Error('Result review is no longer current')
+    if (this.delegated.remote(ticket, assignment)) return this.delegated.prepareReview(ticketId, assignment.id, review.id)
+    const native = this.options.native.executor, sessionId = `worker-${ticketId}`
+    if (native.current(sessionId)) await native.cancel(sessionId, false)
+    await native.stopBackground(sessionId, 'The owning organization is arranging remaining work', false)
+    if (native.current(sessionId)) {
+      await native.whenIdle(sessionId)
+      if (!await native.untilQuiet(sessionId, AbortSignal.timeout(1000)) || (await native.runningJobs(sessionId)).length || native.current(sessionId)?.status !== 'idle') throw new Error('The original Worker execution cleanup has not completed')
+    }
+    await this.options.native.sessions.flush()
+    this.runtime.store.set(localHandoffs(assignment.id), { reviewId: review.id, evidenceRef: review.evidenceRef })
   }
   /** Catch up a catalog addition already committed by the host before validating the unchanged relationships. */
   async prepareCapabilityConfiguration(targets: readonly Capability[]): Promise<void> {
@@ -248,10 +293,11 @@ export class OriginalProcess {
       for (const ticket of this.runtime.store.tickets.list()) {
         const current = this.workerCapabilities(ticket)
         const basis = ticket.mandate.basis, parentTools = basis.via === 'delegation' ? limits.get(basis.delegation.parentInstanceId) ?? [] : undefined
-        this.runtime.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 1,
+        this.runtime.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 2,
           tools: current.tools.filter(tool => input.workerTools.includes(tool) && (!parentTools || parentTools.includes(tool))),
           skills: current.skills.filter(skill => input.workerSkills.includes(skill)) }))
       }
+      this.delegated.narrowCapabilities(input.workerTools, input.delegationTargets)
       this.inbound.configureCapabilityLimits(input.delegationLimits, input.workerTools)
     })
     this.config.workerTools = [...input.workerTools]

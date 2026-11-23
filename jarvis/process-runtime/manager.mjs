@@ -10,7 +10,7 @@ import { nativeHash } from './native-journal.mjs';
 import { beginStartup, cancelStartup, finishStartup, restoreStartup, startupSnapshot, updateStartup } from './startup-progress.mjs';
 import { readOriginalAdoption } from './original-adoption.mjs';
 import { lockSync } from 'proper-lockfile';
-import { DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normalizeEngineConfig } from '../../lib/process-runtime.js';
+import { ArtifactTransferSchema, DelegationRequestSchema, WORKER_TOOL_NAMES, WorkerSkillsSchema, normalizeEngineConfig } from '../../lib/process-runtime.js';
 
 const childEntry = fileURLToPath(new URL('./child.mjs', import.meta.url));
 const roles = new Set(['jarvis', 'router', 'worker']);
@@ -629,6 +629,7 @@ export class ProcessManager {
       'session.cancel': input => bridge.cancel(input),
       'delegation.catalog': () => this.delegationCatalog(item, generation),
       'delegation.send': input => this.delegate(item, generation, input),
+      'artifact.transfer': input => this.readArtifact(item, generation, input),
       'runtime.restart': () => this.requestRestart(item, generation),
       'runtime.startup': update => {
         if (item.generation !== generation || item.child !== child || item.phase !== 'starting') throw new Error('Startup generation is no longer active');
@@ -762,6 +763,30 @@ export class ProcessManager {
     if (managementOwner) {
       if (source.management !== managementOwner || managementOwner.ended) throw new Error('Delegation cleanup owner changed');
     } else current(source, sourceGeneration, sourcePeer);
+    return result;
+  }
+  /** An authenticated receiver must prove a current task grant; the producer resolves only its own registered version. */
+  async readArtifact(source, generation, raw) {
+    const input = ArtifactTransferSchema.parse(raw), sourcePeer = source.peer;
+    const current = () => {
+      if (source.generation !== generation || source.peer !== sourcePeer || source.phase !== 'running' || this.closing) throw new Error('Artifact receiver generation is no longer active');
+    };
+    current();
+    if ((await sourcePeer.call('artifact.authorize', input, 15000))?.authorized !== true) throw new Error('Artifact has no current task grant');
+    current();
+    const target = this.instance(input.artifact.instanceId), request = { artifact: input.artifact, offset: input.offset, limit: input.limit };
+    let result;
+    if (target.phase === 'running' && target.peer) {
+      const peer = target.peer, producerGeneration = target.generation;
+      result = await peer.call('artifact.read', request, 30000);
+      if (target.peer !== peer || target.generation !== producerGeneration) throw new Error('Artifact producer generation changed during the read');
+    } else result = await this.exclusive(target, async () => {
+      if (target.phase !== 'stopped' || target.child || target.bridge || target.native || target.cleanupPending) await this.stopInstance(target);
+      const owner = target.management ?? await this.openManagement(target);
+      try { return await owner.peer.call('artifact.read', request, 30000); }
+      finally { await this.closeManagement(target); }
+    }, { kind: 'management', queue: true });
+    current();
     return result;
   }
   async conversationCall(id, method, input, { generation } = {}) {

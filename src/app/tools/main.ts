@@ -35,7 +35,7 @@ export interface MainToolsHost {
   selectTarget?(triggerId: string, target?: string): void
   /** Refreshes child availability before the original atomic routing decision. */
   prepareTarget?(triggerId: string, target?: string): Promise<void>
-  prepareReview?(ticketId: string, target?: string): Promise<void>
+  prepareReview?(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void>
 }
 /** Schedules an Engine pass to execute the recorded routing decision and formats the tool response. */
 function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: string; ticketId?: string | undefined }) {
@@ -186,7 +186,7 @@ export function mainTools(host: MainToolsHost, agent: Pick<Agent, 'id'>): Tool[]
       execute: async (args, signal) => {
         const committed = host.store.tickets.get(args.ticket_id)?.assignments.find(item => item.id === args.assignment_id)
           ?.resultReviews?.find(item => item.id === args.review_id)?.decision
-        if (args.decision.kind === 'continue' && !committed) await host.prepareReview?.(args.ticket_id, args.decision.target_instance_id)
+        if (args.decision.kind === 'continue' && !committed) await host.prepareReview?.(args.ticket_id, args.decision.target_instance_id, args.assignment_id, args.review_id)
         signal.throwIfAborted()
         const decision = args.decision.kind === 'accept' ? args.decision : { kind: 'continue' as const,
           summary: args.decision.summary, instructions: args.decision.instructions,

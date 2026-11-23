@@ -110,11 +110,13 @@ describe('delegation completion fences', () => {
   })
 
   it('continues a partial result locally on the same mandate and reviews the validation before completion', async () => {
-    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Revision abc is repaired; validation is still required.' }))
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Revision abc is repaired; validation is still required.',
+      ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
     await h.proxy.tick()
     const original = h.current(), first = latestAssignment(original)!, review = first.resultReviews!.at(-1)!
     const decision = { kind: 'continue' as const, summary: 'The repair is present but the original validation condition is not evidenced.',
       instructions: 'Validate revision abc, retaining the repair evidence and recording the tested revision and result.' }
+    await h.proxy.prepareReview(original.id, first.id, review.id)
     h.engine.resolveResultReview(original.id, first.id, review.id, decision)
     h.engine.resolveResultReview(original.id, first.id, review.id, decision)
     expect(h.current().decisionId).toBe(original.decisionId)
@@ -139,12 +141,14 @@ describe('delegation completion fences', () => {
   })
 
   it('creates a new fixed child binding for remaining work and preserves all earlier source material', async () => {
-    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Partial repair revision abc.' }), {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Partial repair revision abc.',
+      ...(request.operation === 'stop' ? { executionStopped: true } : {}) }), {
       text: 'Repair and validate this exact revision.\n  Keep original spacing  ', scope: 'Repair and validation', assignment: 'Original instructions',
     })
     await h.proxy.tick()
     const original = h.current(), first = latestAssignment(original)!, review = first.resultReviews!.at(-1)!, binding = structuredClone(h.proxy.list()[0]!.request)
     const decision = { kind: 'continue' as const, summary: 'Validation remains.', instructions: 'Validate the repaired revision abc.', targetInstanceId: 'child' }
+    await h.proxy.prepareReview(original.id, first.id, review.id)
     h.engine.resolveResultReview(original.id, first.id, review.id, decision)
     h.engine.resolveResultReview(original.id, first.id, review.id, decision)
     const rows = h.proxy.list(), next = rows.find(row => row.request.parentAssignmentId !== first.id)!
@@ -162,9 +166,10 @@ describe('delegation completion fences', () => {
   })
 
   it('keeps an abandoned local continuation open for the parent instead of dropping the original goal', async () => {
-    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
     await h.proxy.tick()
     const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    await h.proxy.prepareReview(h.current().id, first.id, review.id)
     h.engine.resolveResultReview(h.current().id, first.id, review.id,
       { kind: 'continue', summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' })
     h.engine.report(h.current().id, { state: 'dropped', summary: 'Validation was not performed.' })

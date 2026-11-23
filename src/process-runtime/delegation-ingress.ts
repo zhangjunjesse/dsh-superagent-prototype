@@ -122,7 +122,14 @@ export class InboundDelegations {
     if (!row || !this.revalidate(ticket.mandate) || this.ticket(row)?.id !== ticket.id)
       throw new Error('Delegated task no longer has its original authorized parent binding')
     return { path: [...row.request.path, this.config.instanceId], lineage: [...row.request.lineage ?? [], this.link(row, ticket, assignment)],
-      source: row.request.taskContext!.source }
+      source: row.request.taskContext!.source, handoff: row.request.taskContext?.handoff ?? [] }
+  }
+  /** Version grants are inherited only from this ticket's verified original machine binding. */
+  handoff(ticket: Ticket) {
+    if (ticket.mandate.basis.via !== 'delegation') return []
+    const row = this.store.get(incoming(ticket.mandate.basis.delegation.delegationId))
+    if (!row || !this.revalidate(ticket.mandate) || this.ticket(row)?.id !== ticket.id) throw new Error('Handoff has no original authorized parent binding')
+    return row.request.taskContext?.handoff ?? []
   }
   private ticket(row: Incoming): Ticket | undefined {
     const command = row.commands[row.request.commandId], trigger = command?.trigger
