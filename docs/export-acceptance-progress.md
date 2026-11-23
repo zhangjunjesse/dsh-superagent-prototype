@@ -26,7 +26,7 @@
 
 主要文件为 `complete.json`、`trace.jsonl`、`sessions/`、`records.json`、`verification.json`、`verification.png`、`observed-repaired-page.html`、`rendered-original-task-card.txt`、`rendered-task-logs.txt` 及三张原对话／任务卡／日志截图。任务卡元素截图受原页面滚动容器裁切，完整三条委派的真实 DOM 文本和浏览器可见性断言一并保存。
 
-本结果为真实 DSH 和真实工具／浏览器下的受控模型机制验收；没有声称外部模型生成质量、全仓 `pnpm check`、生产部署或用户 4318 更新通过。另观察到已完成卡片仍有固定的“结果待验收”回报标签，主整合会话负责修正并在最终整合版重新验收；这里没有把该标签声称为已修复。
+模型决策来自受控适配器，DSH、工具调用和浏览器执行均使用真实实现。随后在集成分支复跑同一场景，集团工单 `JW-809f30569424` 的任务卡显示「结果已验收」和原交办方保存的验收意见。Chrome 同时核对了这两个字段、导出文件、部门链和客户端 Worker 日志。隔离证据在工作区 `.runtime/spec4/ticket-13-native-2SzMkO/`，命令结果在 `final-4-chrome-with-acceptance.log`。本场景的范围为隔离环境中的业务机制验收。
 
 ## 已完成的第一段
 

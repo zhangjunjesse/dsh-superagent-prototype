@@ -370,6 +370,8 @@ test('export acceptance uses the original group conversation and installed DSH t
     await originalCard.getByText(`worker-${completedClient.tickets[0].id}`, { exact: true }).waitFor();
     const renderedCard = await originalCard.innerText();
     assert.ok(renderedCard.includes('双记录核验通过') && renderedCard.includes('实际浏览器导出双记录'));
+    assert.match(await originalCard.locator('.chat-task-result-source').innerText(), /结果已验收/);
+    assert.ok(renderedCard.includes(finishedDetail.item.acceptance.summary));
     writeFileSync(join(evidence, 'rendered-original-task-card.txt'), renderedCard);
     await originalCard.screenshot({ path: join(evidence, 'original-task-card-details.png'), animations: 'disabled' });
     await originalCard.getByRole('link', { name: '查看任务日志', exact: true }).click();
