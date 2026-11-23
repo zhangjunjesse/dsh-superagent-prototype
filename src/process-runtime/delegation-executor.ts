@@ -112,6 +112,27 @@ export class DelegationExecutor {
     return { target, tools: [...this.toolsFor?.(ticket) ?? this.config.workerTools],
       ...(row ? { result: row.snapshot && this.evidence(row.snapshot), stopped: row.stopped, error: row.error } : {}) }
   }
+  /** Query and drain only an existing producer binding; the caller persists proof and decides whether its intent is still current. */
+  async confirmStopped(ticketId: string, assignmentId: string, operationId: string, beforeStop?: (query: DelegationSnapshot) => void): Promise<{
+    query: DelegationSnapshot; stopped: DelegationSnapshot; current: boolean
+  }> {
+    const name = this.name(ticketId, assignmentId), initial = this.store.get(name)
+    if (!initial || !this.send) throw new Error('The original child binding or transport is unavailable')
+    const reload = () => {
+      const row = this.store.get(name)
+      if (!row || fingerprint(row.request) !== fingerprint(initial.request)) throw new Error('The original child binding changed during cleanup')
+      return row
+    }
+    const query = await this.send({ ...initial.request, operation: 'query', commandId: key(initial.request.delegationId, operationId, 'query'), text: undefined })
+    let row = reload(); this.verify(row, query)
+    // Cancellation supersedes a continuation's result checks, but still drains only this fixed producer.
+    if (this.current(row) && !row.stopped) beforeStop?.(query)
+    row = reload()
+    const stopped = await this.send({ ...row.request, operation: 'stop', commandId: key(initial.request.delegationId, operationId, 'stop'),
+      text: 'The owning organization is stopping this exact delegated assignment. Confirm that all of its native execution has drained.' })
+    row = reload(); this.verify(row, stopped)
+    return { query, stopped: this.stoppedSnapshot(row, stopped), current: !!this.current(row) && !row.stopped }
+  }
   /** Query the exact producer before stopping it. Lost acknowledgements can retry only this binding, never create another Worker. */
   async prepareReview(ticketId: string, assignmentId: string, reviewId: string): Promise<void> {
     const ticket = this.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
@@ -126,23 +147,20 @@ export class DelegationExecutor {
     const prior = initial.handoff?.reviewId === reviewId && initial.handoff.evidenceRef === evidenceRef ? initial.handoff : undefined
     this.store.set(name, { ...initial, handoff: { ...prior, reviewId, evidenceRef, stopping: true, error: undefined } })
     try {
-      const query = await this.send({ ...initial.request, operation: 'query', commandId: key(initial.request.delegationId, 'handoff-query', reviewId), text: undefined })
-      this.verify(initial, query)
-      const retryStopped = prior?.stopAttempted && query.status === 'stopped'
-        && fingerprint(verifiedDelegationArtifacts(query)) === fingerprint(verifiedDelegationArtifacts(initial.snapshot))
-      if (this.evidence(query) !== evidenceRef && !retryStopped) {
-        this.store.atomic(() => { const row = this.store.get(name)!; delete row.handoff; this.apply(row, query); this.store.set(name, row) })
-        throw new Error('The producer result changed during verification; read the current review before reassigning')
-      }
-      for (const artifact of verifiedDelegationArtifacts(query)) {
-        if (!artifact.version || !artifact.assignmentId) throw new Error('Historical result has no verified immutable version for handoff')
-        ArtifactReferenceSchema.parse({ instanceId: artifact.instanceId, ticketId: artifact.ticketId, assignmentId: artifact.assignmentId, version: artifact.version })
-      }
-      const beforeStop = this.store.get(name)!
-      this.store.set(name, { ...beforeStop, handoff: { ...beforeStop.handoff!, queried: query, stopAttempted: true } })
-      const stopped = await this.send({ ...initial.request, operation: 'stop', commandId: key(initial.request.delegationId, 'handoff-stop', reviewId),
-        text: 'The owning organization is arranging remaining work. Stop this exact assignment and confirm all native execution has drained.' })
-      this.verify(initial, stopped); this.stoppedSnapshot(initial, stopped)
+      const { query, stopped } = await this.confirmStopped(ticketId, assignmentId, key('handoff', reviewId), query => {
+        const retryStopped = prior?.stopAttempted && query.status === 'stopped'
+          && fingerprint(verifiedDelegationArtifacts(query)) === fingerprint(verifiedDelegationArtifacts(initial.snapshot!))
+        if (this.evidence(query) !== evidenceRef && !retryStopped) {
+          this.store.atomic(() => { const row = this.store.get(name)!; delete row.handoff; this.apply(row, query); this.store.set(name, row) })
+          throw new Error('The producer result changed during verification; read the current review before reassigning')
+        }
+        for (const artifact of verifiedDelegationArtifacts(query)) {
+          if (!artifact.version || !artifact.assignmentId) throw new Error('Historical result has no verified immutable version for handoff')
+          ArtifactReferenceSchema.parse({ instanceId: artifact.instanceId, ticketId: artifact.ticketId, assignmentId: artifact.assignmentId, version: artifact.version })
+        }
+        const beforeStop = this.store.get(name)!
+        this.store.set(name, { ...beforeStop, handoff: { ...beforeStop.handoff!, queried: query, stopAttempted: true } })
+      })
       // Cleanup may change the status/summary; the registered artifact versions must stay identical.
       if (fingerprint(verifiedDelegationArtifacts(stopped)) !== fingerprint(verifiedDelegationArtifacts(query))) throw new Error('Producer artifacts changed while stopping; inspect the current versions before handoff')
       const row = this.store.get(name)!
