@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>研发验收记录</title>
+<h1>研发验收记录</h1>
+<table>
+  <thead><tr><th>编号</th><th>名称</th></tr></thead>
+  <tbody>
+    <tr><td>A-017</td><td>蓝色样品</td></tr>
+    <tr><td>B-042</td><td>绿色样品</td></tr>
+  </tbody>
+</table>
+<button type="button">导出记录</button>
+<script>
+  document.querySelector('button').addEventListener('click', () => {
+    const rows = [...document.querySelectorAll('tbody tr')];
+    const records = rows.slice(0, 1).map(row => ({ id: row.cells[0].textContent, name: row.cells[1].textContent }));
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([JSON.stringify(records)], { type: 'application/json' }));
+    link.download = 'records.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  });
+</script>
+</html>

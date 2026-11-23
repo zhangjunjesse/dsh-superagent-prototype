@@ -349,7 +349,7 @@ export class OriginalProcess {
     this.config.workerSkills = [...input.workerSkills]
     this.config.delegationTargets = structuredClone(input.delegationTargets)
   }
-  /** Only additive catalog changes can enter a running owner; bound descriptors remain immutable. */
+  /** Additions and unused-target initialization preserve every existing task's bound descriptor. */
   private refreshDelegationCatalog(): Promise<void> {
     return this.catalogRefresh ??= this.readDelegationCatalog().catch(error => {
       this.readyTargets = new Set(); throw error
@@ -362,7 +362,12 @@ export class OriginalProcess {
     const identity = (target: Capability) => JSON.stringify(CapabilitySchema.parse(target))
     for (const target of this.config.delegationTargets ?? []) {
       const current = byId.get(target.instanceId)
-      if (!current || identity(current) !== identity(target)) throw new Error('A running delegation catalog may only add targets')
+      if (!current) throw new Error('A running delegation catalog may only add targets')
+      if (identity(current) === identity(target)) continue
+      const bound = this.delegated.list().some(row => row.request.targetInstanceId === target.instanceId)
+        || this.runtime.store.tickets.list().some(ticket => ticket.assignments.some(assignment => assignment.executionTarget === target.instanceId)
+          || this.delegated.selected(ticket.origin.triggerId) === target.instanceId)
+      if (bound || identity({ ...current, tools: target.tools }) !== identity(target)) throw new Error('A running delegation catalog may only add targets or initialize an unbound target capability')
     }
     for (const target of catalog.targets) {
       if (target.instanceId === this.config.instanceId || target.tools.some(tool => !this.config.workerTools.includes(tool)))

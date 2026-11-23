@@ -20,9 +20,11 @@ function configuration(id: string): ProcessRuntimeConfig {
       : { allowedParents: ['parent'] }) }
 }
 type Context = { runtime: ProcessRuntime; call(name: string, args: unknown): Promise<any> }
-function pair(options: { worker?: (request: ProcessRun, context: Context) => Promise<void>; holdPreparation?: boolean; holdWorker?: boolean; holdQuery?: boolean; dropAck?: boolean } = {}) {
+function pair(options: { worker?: (request: ProcessRun, context: Context) => Promise<void>; parentTools?: ProcessRuntimeConfig['workerTools']; holdPreparation?: boolean; holdWorker?: boolean; holdQuery?: boolean; dropAck?: boolean } = {}) {
   const configs = { parent: configuration('parent'), child: configuration('child') }
+  if (options.parentTools) configs.parent.workerTools = options.parentTools
   const calls: { instance: string; request: ProcessRun }[] = [], transport: DelegationRequest[] = [], stops: string[] = []
+  const catalogReads: { instance: string; targets: ProcessRuntimeConfig['delegationTargets'] }[] = []
   const nodes = {} as Record<'parent' | 'child', ProcessRuntime>
   const nativePorts = {} as Record<'parent' | 'child', ReturnType<typeof controlledNative>['native']>
   const waits = new Map<string, () => void>(); let dropped = false, heldQuery = false
@@ -45,6 +47,7 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
       },
       async cancel({ sessionKey }) { stops.push(sessionKey); waits.get(sessionKey)?.() },
       async delegationCatalog() {
+        catalogReads.push({ instance: id, targets: structuredClone(configs[id].delegationTargets ?? []) })
         return { targets: configs[id].delegationTargets ?? [],
           readyInstanceIds: id === 'parent' && (await nodes.child.delegationReadiness()).ready ? ['child'] : [] }
       },
@@ -94,10 +97,41 @@ function pair(options: { worker?: (request: ProcessRun, context: Context) => Pro
     expect(result.status).toBe('complete')
     return result
   }
-  return { nodes, calls, transport, stops, waits, configs, open, until, control, nativePorts }
+  return { nodes, calls, transport, stops, waits, configs, open, until, control, nativePorts, catalogReads }
 }
 
 describe('single-hop SuperJarvis delegation', () => {
+  it('initializes an unused child catalog within the existing parent ceiling without changing local work', async () => {
+    const h = pair({ parentTools: ['read', 'grep'] })
+    h.configs.parent.delegationTargets![0]!.tools = ['read', 'grep']
+    await h.nodes.parent.chat({ id: 'unbound-init', text: 'local-only: Read the authorized local marker.' })
+    const state = await h.until(value => value.tickets[0]?.ended?.outcome === 'completed')
+    expect(h.nodes.parent.config.delegationTargets![0]!.tools).toEqual(['read', 'grep'])
+    expect(h.nodes.parent.config.workerTools).toEqual(['read', 'grep'])
+    expect(state.delegations.outgoing).toEqual([])
+  })
+  it('rejects a catalog tool change after that child has any actual saved assignment binding', async () => {
+    const h = pair({ parentTools: ['read', 'grep'] })
+    await h.nodes.parent.chat({ id: 'bound-original', text: 'Read the original bound child marker.' })
+    const completed = await h.until(value => value.tickets[0]?.ended?.outcome === 'completed')
+    const original = structuredClone(completed.tickets[0])
+    h.configs.parent.delegationTargets![0]!.tools = ['read', 'grep']
+    await h.nodes.parent.chat({ id: 'bound-change', text: 'local-only: Read a later local marker.' })
+    await vi.waitFor(() => expect(h.catalogReads.some(read => read.instance === 'parent' && read.targets?.[0]?.tools.includes('grep'))).toBe(true))
+    const after = await h.nodes.parent.state()
+    expect(h.nodes.parent.config.delegationTargets![0]!.tools).toEqual(['read'])
+    expect(after.tickets).toEqual([original])
+    expect(after.delegations.outgoing[0]!.request.tools).toEqual(['read'])
+  })
+  it('rejects unauthorized tools while initializing an unused child catalog', async () => {
+    const h = pair()
+    h.configs.parent.delegationTargets![0]!.tools = ['read', 'write']
+    await h.nodes.parent.chat({ id: 'unbound-excess', text: 'local-only: Read the authorized local marker.' })
+    await vi.waitFor(() => expect(h.catalogReads.some(read => read.instance === 'parent' && read.targets?.[0]?.tools.includes('write'))).toBe(true))
+    expect(h.nodes.parent.config.workerTools).toEqual(['read'])
+    expect(h.nodes.parent.config.delegationTargets![0]!.tools).toEqual(['read'])
+    expect((await h.nodes.parent.state()).tickets).toEqual([])
+  })
   it('retains business completion while refusing parent shutdown until that completed child execution is clean', async () => {
     const h = pair()
     await h.nodes.parent.chat({ id: 'completed', text: 'Read the bound child marker and finish.' })
