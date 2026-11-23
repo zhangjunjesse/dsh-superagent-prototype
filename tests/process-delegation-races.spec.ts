@@ -172,6 +172,23 @@ describe('delegation completion fences', () => {
     expect(latestAssignment(h.current())?.resultReviews?.at(-1)?.summary).toBe('Validation was not performed.')
   })
 
+  it('returns a failed validation to the parent for remaining work without an invented human retry', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    h.engine.resolveResultReview(h.current().id, first.id, review.id,
+      { kind: 'continue', summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' })
+    h.engine.report(h.current().id, { state: 'failed', summary: 'The repaired revision failed its original acceptance check.' })
+    const second = latestAssignment(h.current())!, failure = second.resultReviews!.at(-1)!
+    expect(second.report?.state).toBe('failed')
+    expect(failure.summary).toContain('failed its original acceptance check')
+    h.engine.resolveResultReview(h.current().id, second.id, failure.id,
+      { kind: 'continue', summary: 'The existing repair needs correction to meet the original check.', instructions: 'Correct the failure and repeat the same acceptance check.' })
+    expect(h.current().ended).toBeUndefined()
+    expect(h.current().assignments).toHaveLength(3)
+    expect(h.current().mandate.basis).toEqual({ via: 'listed' })
+  })
+
   it('deduplicates review relays and immutable acceptance decisions', async () => {
     const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
     await h.proxy.tick(); await h.proxy.tick()

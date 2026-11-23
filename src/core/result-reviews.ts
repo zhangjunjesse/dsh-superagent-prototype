@@ -36,8 +36,10 @@ export class ResultReviews extends EnginePart {
     if (existing) return existing
     if (assignment.state === 'pending') this.assignments.started(ticketId, assignmentId)
     // Blocked delivery remains visible; the owner can arrange remaining work with the undelivered input intact.
-    const blocked = !!ticket.delivery || !!ticket.attention || assignment.report?.state === 'blocked' || assignment.report?.state === 'failed'
-    this.assignments.report(ticketId, { ...report, state: blocked ? 'blocked' : 'waiting', summary, question: report?.question ?? ticket.attention?.question ?? null })
+    const blocked = !!ticket.delivery || !!ticket.attention || report?.state === 'blocked' || report?.state === 'failed'
+      || assignment.report?.state === 'blocked' || assignment.report?.state === 'failed'
+    this.assignments.report(ticketId, { ...report, state: report?.state === 'failed' ? 'failed' : blocked ? 'blocked' : 'waiting', summary,
+      question: report?.question ?? ticket.attention?.question ?? null })
     ;({ ticket, assignment } = this.current(ticketId, assignmentId))
     const review: ResultReview = { id, evidenceRef, contextRef, summary, at: this.now() }
     assignment.resultReviews = [...assignment.resultReviews ?? [], review]
