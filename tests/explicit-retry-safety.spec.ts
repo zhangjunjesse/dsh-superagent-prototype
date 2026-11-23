@@ -225,9 +225,12 @@ it.each(['never-submitted', 'lost-submit-ack'] as const)('treats a missing produ
     expect(proof.current).toBe(true)
     expect(calls).toEqual(['query'])
   } else {
-    await expect(proxy.confirmStopped(id, assignment.id, 'explicit-retry')).rejects.toThrow('cleanup')
+    // An older receiver may reject the new stop fence; that rejection still cannot confirm an unknown submission.
+    await expect(proxy.confirmStopped(id, assignment.id, 'explicit-retry')).rejects.toThrow('no command row to stop')
     expect(proxy.list()[0]!.snapshot?.executionStopped).not.toBe(true)
-    expect(calls).toEqual(['query', 'submit', 'query'])
+    expect(store.tickets.get(id)!.assignments).toHaveLength(1)
+    expect(latestAssignment(store.tickets.get(id)!)!.id).toBe(assignment.id)
+    expect(calls).toEqual(['query', 'submit', 'query', 'stop'])
   }
 })
 
