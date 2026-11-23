@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { key, latestAssignment, ticketStage } from '../../lib/jarvis-gateway.js';
+import { verifiedDelegationArtifacts } from '../../lib/process-runtime.js';
 import { UserError } from '../config.mjs';
 import { redactText } from '../operation-logs/redact.mjs';
 
@@ -132,20 +133,28 @@ class TaskRead {
     } catch { this.failures.add(source.id); return null; }
   }
   incomingParent(source, authority, childTicketId) {
-    if (!authority || typeof authority.parentInstanceId !== 'string' || source.parent !== authority.parentInstanceId) return null;
+    if (!authority || !orgId.test(authority.parentInstanceId ?? '')) return null;
     const parent = this.source(authority.parentInstanceId), ticket = this.ticket(parent, authority.parentTicketId);
     const binding = this.kv(parent, `process-delegation:out:${key(authority.parentTicketId, authority.parentAssignmentId)}`), request = binding?.request;
-    if (!ticket || ticket.decisionId !== authority.parentDecisionId || request?.delegationId !== authority.delegationId
+    if (!ticket || !ticket.assignments.some(a => a.id === authority.parentAssignmentId)
+      || ticket.decisionId !== authority.parentDecisionId || !request || request.delegationId !== authority.delegationId
       || request.parentTicketId !== ticket.id || request.parentAssignmentId !== authority.parentAssignmentId
       || request.parentDecisionId !== ticket.decisionId || request.targetInstanceId !== source.id
       || binding.snapshot?.ticketId && childTicketId && binding.snapshot.ticketId !== childTicketId) return null;
-    return { source: parent, ticket, binding, info: this.workForTicket(parent, ticket) };
+    return { source: parent, ticket, binding };
   }
   origin(source, ticket) {
-    const direct = this.workForTicket(source, ticket);
-    if (direct) return direct;
-    const basis = ticket.mandate?.basis;
-    return basis?.via === 'delegation' ? this.incomingParent(source, basis.delegation, ticket.id)?.info ?? null : null;
+    const seen = new Set();
+    while (source && !seen.has(source.id)) {
+      seen.add(source.id);
+      const direct = this.workForTicket(source, ticket);
+      if (direct) return direct;
+      const basis = ticket.mandate?.basis;
+      const parent = basis?.via === 'delegation' && this.incomingParent(source, basis.delegation, ticket.id);
+      if (!parent) break;
+      ({ source, ticket } = parent);
+    }
+    return null;
   }
   logs(source, ticketId, info) {
     const traceId = info ? `work:${info.source.id}:${info.work.workRef}` : `ticket:${source.id}:${ticketId}`;
@@ -163,47 +172,82 @@ class TaskRead {
     if (ticket.attention && !ticket.attention.answeredBy) return { summary: text(ticket.attention.question), at: null, source: 'question', organizationId: source.id };
     return null;
   }
-  projectTicket(source, ticket, info = this.origin(source, ticket)) {
-    const assignment = latestAssignment(ticket), target = this.kv(source, `process-delegation:route:${ticket.origin.triggerId}`);
-    const delegated = typeof target === 'string' && target !== 'local';
-    const child = delegated ? this.source(target) : null;
+  assignmentEdge(source, ticket, assignment, ancestors, fallbackTarget) {
+    const binding = this.kv(source, `process-delegation:out:${key(ticket.id, assignment.id)}`);
+    const request = binding?.request, snapshot = binding?.snapshot;
+    const target = request?.targetInstanceId ?? fallbackTarget;
+    if (!target || target === 'local' || !orgId.test(target)) return null;
+    const child = this.source(target);
+    const bound = request && request.parentTicketId === ticket.id && request.parentAssignmentId === assignment.id
+      && request.parentDecisionId === ticket.decisionId && request.targetInstanceId === target;
+    const valid = bound && snapshot && snapshot.delegationId === request.delegationId && snapshot.parentTicketId === ticket.id
+      && snapshot.parentAssignmentId === assignment.id && snapshot.childInstanceId === target;
+    const candidate = valid && !ancestors.has(target) ? this.ticket(child, snapshot.ticketId) : null;
+    const authority = candidate?.mandate?.basis?.via === 'delegation' && candidate.mandate.basis.delegation;
+    const verified = authority && authority.delegationId === request.delegationId && authority.parentInstanceId === source.id
+      && authority.parentTicketId === ticket.id && authority.parentAssignmentId === assignment.id && authority.parentDecisionId === ticket.decisionId;
+    const status = !snapshot ? 'routing' : !valid || candidate && !verified ? 'unknown' : snapshot.status;
+    const state = verified ? this.fresh(child, recordedState(candidate), Boolean(candidate.ended)) : null;
+    const report = verified ? this.report(candidate, child, Boolean(this.bindingForLatest(child, candidate)))
+      : valid && !candidate && snapshot.summary ? { summary: text(snapshot.summary), source: 'delegation-snapshot', organizationId: target, at: null } : null;
+    let artifacts = [];
+    if (this.detail && verified) {
+      try { artifacts = verifiedDelegationArtifacts(snapshot); }
+      catch { this.failures.add(target); }
+    }
+    const hop = { from: this.org(source), to: child ? this.org(child) : { instanceId: target, name: target },
+      ticketId: ticket.id, assignmentId: assignment.id, delegationId: bound ? request.delegationId : null,
+      childTicketId: verified ? candidate.id : null, childAssignmentId: verified ? latestAssignment(candidate)?.id ?? null : null,
+      status: state?.status ?? status, statusLabel: state?.statusLabel ?? labels[status] ?? labels.unknown, report, artifacts };
+    return { child, candidate: verified ? candidate : null, hop, status };
+  }
+  bindingForLatest(source, ticket) {
+    const assignment = latestAssignment(ticket);
+    return assignment && this.kv(source, `process-delegation:out:${key(ticket.id, assignment.id)}`);
+  }
+  executionView(source, ticket, ancestors = new Set()) {
+    const path = new Set(ancestors).add(source.id), current = latestAssignment(ticket);
+    const route = this.kv(source, `process-delegation:route:${ticket.origin.triggerId}`);
     let state = this.fresh(source, recordedState(ticket), Boolean(ticket.ended));
-    let progress = this.report(ticket, source, delegated), executionTicket = delegated ? null : ticket;
-    if (delegated) {
-      const binding = assignment && this.kv(source, `process-delegation:out:${key(ticket.id, assignment.id)}`), request = binding?.request, snapshot = binding?.snapshot;
-      const valid = request?.targetInstanceId === target && request.parentTicketId === ticket.id && request.parentAssignmentId === assignment?.id
-        && request.parentDecisionId === ticket.decisionId && snapshot?.delegationId === request.delegationId
-        && snapshot.parentTicketId === ticket.id && snapshot.parentAssignmentId === assignment?.id && snapshot.childInstanceId === target;
-      const candidate = valid && snapshot.ticketId ? this.ticket(child, snapshot.ticketId) : null;
-      const authority = candidate?.mandate?.basis?.via === 'delegation' ? candidate.mandate.basis.delegation : null;
-      if (candidate && authority?.delegationId === request.delegationId && authority.parentInstanceId === source.id
-        && authority.parentTicketId === ticket.id && authority.parentAssignmentId === assignment.id && authority.parentDecisionId === ticket.decisionId) {
-        executionTicket = candidate; progress = this.report(candidate, child) ?? progress;
-        if (!ticket.ended) state = candidate.ended
-          ? this.fresh(source, { status: 'waiting', statusLabel: '执行方已结束，等待任务汇总', stage: state.stage })
-          : this.fresh(child, recordedState(candidate), Boolean(candidate.ended));
-      } else if (!ticket.ended && valid) {
-        const settled = ['completed', 'stopped'].includes(snapshot.status);
-        const status = settled ? 'waiting' : snapshot.status === 'pending' ? 'routing' : snapshot.status === 'missing' ? 'unknown' : snapshot.status;
-        state = this.fresh({ ...child, core: null }, { status: labels[status] ? status : 'unknown',
-          statusLabel: settled ? '执行方已结束，等待任务汇总' : labels[status] ?? labels.unknown, stage: state.stage });
-        if (snapshot.summary) progress = { summary: text(snapshot.summary), at: null, source: 'delegation-snapshot', organizationId: target };
-      } else if (!ticket.ended) {
-        const status = snapshot ? 'unknown' : 'routing';
-        state = this.fresh(source, { status, statusLabel: labels[status], stage: state.stage });
+    let progress = this.report(ticket, source, Boolean(this.bindingForLatest(source, ticket)));
+    let updatedAt = time(ticket.updatedAt);
+    let execution = { kind: ticket.execution ? 'local' : 'unassigned', instanceId: ticket.execution ? source.id : null,
+      name: ticket.execution ? source.name : null, ticketId: ticket.id, workerId: current?.startedAt ? `worker-${ticket.id}` : null,
+      assignmentId: current?.id ?? null, assignment: assignmentView(current) };
+    const delegations = [];
+    for (const assignment of this.detail ? ticket.assignments : current ? [current] : []) {
+      const latest = assignment.id === current?.id;
+      const edge = this.assignmentEdge(source, ticket, assignment, path, assignment.executionTarget ?? (latest ? route : null));
+      if (!edge) continue;
+      const { child, candidate, hop, status } = edge;
+      const next = candidate && this.executionView(child, candidate, path);
+      if (this.detail) delegations.push(hop, ...(next?.delegations ?? []));
+      if (!latest) continue;
+      execution = next ? { ...next.execution, kind: 'delegated' } : { kind: 'delegated', instanceId: hop.to.instanceId, name: hop.to.name,
+        ticketId: null, workerId: null, assignmentId: null, assignment: null };
+      progress = next?.progress ?? hop.report ?? progress;
+      if (next?.updatedAt && (!updatedAt || next.updatedAt > updatedAt)) updatedAt = next.updatedAt;
+      if (ticket.ended) continue;
+      if (candidate?.ended || !candidate && ['stopped', 'completed'].includes(status)) {
+        state = this.fresh(source, { status: 'waiting', statusLabel: '执行方已结束，等待任务汇总', stage: state.stage });
+      } else if (next) {
+        state = next.state;
+      } else {
+        const fallback = status === 'pending' ? 'routing' : labels[status] ? status : 'unknown';
+        state = this.fresh(status === 'routing' ? source : { ...child, core: null }, { status: fallback, statusLabel: labels[fallback], stage: state.stage });
       }
     }
-    const executingAssignment = executionTicket && latestAssignment(executionTicket);
-    const execution = { kind: delegated ? 'delegated' : ticket.execution ? 'local' : 'unassigned', instanceId: delegated ? target : ticket.execution ? source.id : null,
-      name: delegated ? child?.name ?? target : ticket.execution ? source.name : null, ticketId: executionTicket?.id ?? null,
-      workerId: executingAssignment?.startedAt ? `worker-${executionTicket.id}` : null, assignmentId: executingAssignment?.id ?? null,
-      assignment: assignmentView(executingAssignment) };
+    return { state, progress, updatedAt, execution, delegations };
+  }
+  projectTicket(source, ticket, info = this.origin(source, ticket)) {
+    const assignment = latestAssignment(ticket);
+    const { state, progress, updatedAt, execution, delegations } = this.executionView(source, ticket);
     return { id: `${source.id}:${ticket.id}`, workRef: info?.work.workRef ?? null, title: text(info?.command?.summary ?? info?.work.title ?? ticket.title, 500),
       ticketTitle: text(ticket.title, 500), originalRequest: this.detail ? text(info?.command?.quote, 20000) : null, ticketId: ticket.id,
       conversationId: info?.work.conversationId ?? null, userMessageId: info?.command?.origin?.userMessageId ?? null,
       owner: this.org(info?.source ?? source), organization: this.org(source), ...state, execution, assignment: assignmentView(assignment),
       progress, receivedAt: time(info?.command?.receivedAt ?? ticket.createdAt),
-      updatedAt: [time(ticket.updatedAt), time(executionTicket?.updatedAt)].filter(Boolean).sort().at(-1) ?? null,
+      updatedAt, ...(this.detail ? { delegations } : {}),
       logs: this.logs(source, ticket.id, info) };
   }
   projectWork(info) {
@@ -264,7 +308,8 @@ class TaskRead {
       nextCursor: unique.length > input.limit ? input.cursor + input.limit : null };
   }
   preparation(source, row) {
-    const request = row.request, parent = this.incomingParent(source, { parentInstanceId: row.source, ...request }, null), info = parent?.info;
+    const request = row.request, parent = this.incomingParent(source, { ...request, parentInstanceId: row.source }, null);
+    const info = parent && this.origin(parent.source, parent.ticket);
     const status = row.phase === 'queued' ? 'queued' : row.phase === 'stopped' ? 'stopped' : row.phase === 'failed' ? 'failed' : 'routing';
     const sourceAt = row.commands?.[request.commandId]?.at;
     return { id: `${source.id}:delegation:${request.delegationId}`, workRef: info?.work.workRef ?? null,

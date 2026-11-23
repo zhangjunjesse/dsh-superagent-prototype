@@ -565,3 +565,4 @@ export class ProcessRuntime {
   }
 
 }
+export { verifiedDelegationArtifacts } from './delegation-contract.ts'

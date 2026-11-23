@@ -105,6 +105,7 @@ export class Sources {
       decisionId:table==='decision'?value.id:value.decisionId,commandId:value.dispatch?.commandId??value.consumption?.commandId,
       assignmentId:value.assignmentId??value.assignments?.at(-1)?.id,evalId:value.evalId};
     if(table==='ticket'&&source==='core:main')this.bind('worker-'+value.id,org,'worker',{ticketId:value.id});
+    if(table==='ticket')this.links.delegationIn(org.organizationId,value);
     const link=this.links.find(org.organizationId,refs);this.links.remember(org.organizationId,refs,link.traceId);
     this.snapshot('core',table,`${source}:${row.id??row.kind+':'+row.key}`,record,org,table==='decision'?'router':table==='effect'?'system':'worker',refs,
       value.updatedAt??value.at??value.createdAt??row.since,link.traceId);
@@ -112,14 +113,12 @@ export class Sources {
   processRow(row,org) {
     const record=parsed(row.value),key=String(row.key);
     if(key.startsWith('process-runtime:turn:')&&record.id)this.links.userRequest(org.organizationId,{id:record.id,requestId:'user:'+identity(record.id).slice(0,32),conversationId:'process:'+org.organizationId});
-    const refs={...sessionRefs(record.sessionKey),...(record.request?.parentTicketId?{ticketId:record.request.parentTicketId}:{}),assignmentId:record.request?.parentAssignmentId,delegationId:record.request?.delegationId??sessionRefs(record.sessionKey).delegationId,
+    const outbound=key.startsWith('process-delegation:out:');
+    const refs={...sessionRefs(record.sessionKey),...(outbound?{ticketId:record.request?.parentTicketId,assignmentId:record.request?.parentAssignmentId}:{}),delegationId:record.request?.delegationId??sessionRefs(record.sessionKey).delegationId,
       requestId:record.requestId,sessionKey:record.sessionKey,userMessageId:key.startsWith('process-runtime:turn:')?record.id:undefined};
     let link=this.links.find(org.organizationId,refs);
-    if(key.startsWith('process-delegation:out:')) {
-      if(record.request?.targetInstanceId&&record.snapshot?.ticketId) {
-        const childRefs={ticketId:record.snapshot.ticketId,delegationId:record.request.delegationId};
-        this.links.remember(record.request.targetInstanceId,childRefs,link.traceId);
-      }
+    if(outbound) {
+      this.links.delegationOut(org.organizationId,record.request,record.snapshot);
       this.links.remember(org.organizationId,refs,link.traceId);
     }
     if(key.startsWith('process-delegation:in:')) {
