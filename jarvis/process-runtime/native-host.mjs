@@ -786,6 +786,22 @@ export class NativeHost {
       const binding = this.bindings.get(input.sessionId);
       return binding ? binding.agent.session.snapshotEvents() : (await this.ctx.sessionController.inspect(input.sessionId)).events;
     }
+    if (this.managementOnly && method === 'stopBackground' && input.keepInbox === false && input.sessionId?.startsWith('worker-')) {
+      const id = input.sessionId, owned = this.journal?.session(id) ?? this.trusted.get(id);
+      const active = this.ctx.agents.get(id);
+      if (!owned) {
+        if (active || this.ctx.get('jobs')?.list(id).some(job => job.owner === id && ['running','stopping'].includes(job.status))) throw new Error('Cannot verify ownership of active Worker during cleanup');
+        return;
+      }
+      if (owned.role !== 'worker' || owned.parent || !this.journal) throw new Error('Persisted Worker cleanup ownership is unavailable');
+      if (active && active.status !== 'idle') await this.executor.cancel(id, false);
+      await this.drainBackground(id, input.reason, false);
+      if (active) {
+        await active.whenIdle();
+        if (active.status !== 'idle') throw new Error('Bound Worker has not confirmed stop');
+      }
+      return;
+    }
     if (this.managementOnly) throw new Error('Management-only instance cannot start native Sessions or execute work');
     if (method === 'delegate') {
       const handler = this.wire.peer.handlers['delegation.send'];
@@ -804,7 +820,8 @@ export class NativeHost {
     if (method === 'revokeDelivery') return this.revokeDelivery(input);
     if (method === 'readSourceImage') return this.trackExecution(() => this.sourceImage(input, signal));
     if (method === 'runPrepare') return this.trackExecution(() => this.executor.runPrepare(input.command, input.cwd, decodeEnvironment(input.environment), signal));
-    if (method === 'verifyDirectory') return this.executor.verifyDirectory(input.directory, signal);
+    if (method === 'verifyDirectory') return this.executor.verifyDirectory(input.directory, signal,
+      input.environment === undefined ? undefined : decodeEnvironment(input.environment));
     if (method === 'stopBackground') {
       if (!this.journal.session(input.sessionId) && !this.trusted.has(input.sessionId)) return;
       return this.drainBackground(input.sessionId, input.reason, input.keepInbox);

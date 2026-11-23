@@ -153,7 +153,7 @@ export type AdmissionCell = 'listedUnaddressed' | 'unlistedAddressed' | 'unliste
 export type AcceptMode = 'off' | 'observe' | 'auto'
 /** Native execution capabilities supported by the host's delegation adapter. Selection does not grant task authority. */
 export const DELEGATION_TOOLS = ['read', 'glob', 'grep', 'read_image', 'write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch'] as const
-/** Host-verified, single-hop authority inherited from one accepted parent task; never supplied by a model. */
+/** Host-verified authority inherited from one accepted direct parent's task; never supplied by a model. */
 export interface DelegationAuthority {
   delegationId: string
   parentInstanceId: string
@@ -294,7 +294,25 @@ export interface Assignment {
    * into a step before, the worker read.
    */
   idleAt?: string
+  /** A continuation chooses its own executor; absent only for the original trigger-bound route. */
+  executionTarget?: string
+  /** Remaining work under the original mandate, without replacing the original executor instructions. */
+  continuation?: { reviewId: string; instructions: string }
+  /** Evidence and main-Session judgements remain attached to the assignment that produced them. */
+  resultReviews?: ResultReview[]
 }
+/** A result held for the owning main Session, bound to immutable evidence and the complete current task context. */
+export interface ResultReview {
+  id: string
+  evidenceRef: string
+  contextRef: string
+  summary: string
+  at: string
+  decision?: ResultReviewDecision & { at: string; assignmentId?: string }
+}
+export type ResultReviewDecision =
+  | { kind: 'accept'; summary: string }
+  | { kind: 'continue'; summary: string; instructions: string; targetInstanceId?: string }
 /** Stable identity derived from the actual saved report, shared by snapshots and Outbox context. */
 export function reportReference(assignment: Pick<Assignment, 'id' | 'report'>): string | undefined {
   const report = assignment.report
@@ -360,6 +378,8 @@ export interface Ticket {
   channels: ChannelRef[]
   /** When, by whom, and how the ticket ended, with a person's or the host's reason beyond the outcome; an open ticket has none. */
   ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
+  /** Withdrawal fences new work immediately. A managed parent ends only after its fixed executions drain. */
+  cancellation?: { at: string; by: TicketEndBy; reason?: string }
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]
@@ -392,9 +412,9 @@ export interface Follow { thread: string; own: boolean; closed?: { at: string; o
 export interface Execution { name: string; directory: string; assignment: string }
 
 /** Whether a ticket is open: it has not ended. */
-export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended
+export const liveTicket = (ticket: Pick<Ticket, 'ended' | 'cancellation'>): boolean => !ticket.ended && !ticket.cancellation
 /** A stop withdraws the mandate regardless of whether a person or a verified parent requested it. */
-export const withdrawn = (ticket: Pick<Ticket, 'ended'>): boolean => ticket.ended?.by === 'human' || ticket.ended?.outcome === 'stopped'
+export const withdrawn = (ticket: Pick<Ticket, 'ended' | 'cancellation'>): boolean => !!ticket.cancellation || ticket.ended?.by === 'human' || ticket.ended?.outcome === 'stopped'
 /** How a ticket ended. */
 export const ticketOutcome = (ticket: Pick<Ticket, 'ended'>): TicketOutcome | undefined => ticket.ended?.outcome
 export const runningAssignment = (ticket: Ticket): Assignment | undefined => ticket.assignments.find(assignment => assignment.state === 'running')

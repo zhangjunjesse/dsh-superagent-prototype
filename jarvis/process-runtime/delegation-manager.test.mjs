@@ -87,7 +87,7 @@ test('unknown references, self references and cycles fail before an instance can
   return manager.close();
 });
 
-test('two actual child processes authenticate the source and enforce one hop, mutual relation and tools', async () => {
+test('two actual child processes authenticate the source and enforce immutable lineage, mutual relation and tools', async () => {
   const manager = new ProcessManager({}, config(), { bridgeFactory: idleBridge, nativeFactory: () => null, entry });
   try {
     await manager.start('alpha');
@@ -97,7 +97,7 @@ test('two actual child processes authenticate the source and enforce one hop, mu
     assert.notEqual(manager.status().instances[0].pid, manager.status().instances[1].pid);
     await assert.rejects(manager.chat('alpha', request({ sourceInstanceId: 'gamma' })), /Unrecognized key/);
     await assert.rejects(manager.chat('alpha', request({ path: ['gamma'] })), /authenticated source/);
-    await assert.rejects(manager.chat('alpha', request({ path: ['alpha', 'beta'] })), /Too big/);
+    await assert.rejects(manager.chat('alpha', request({ path: ['alpha', 'beta'] })), /immutable task lineage/);
     await assert.rejects(manager.chat('alpha', request({ targetInstanceId: 'gamma' })), /not mutually allowed/);
     await assert.rejects(manager.chat('gamma', request({ path: ['gamma'] })), /not mutually allowed/);
     await assert.rejects(manager.chat('alpha', request({ tools: ['glob'] })), /intersection/);

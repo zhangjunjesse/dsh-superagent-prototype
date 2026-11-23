@@ -271,7 +271,7 @@ export class DshExecutor implements Executor {
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
     await mkdir(directory, { recursive: true })
-    await this.native.verifyDirectory(directory, this.host.lifetime)
+    await this.native.verifyDirectory(directory, this.host.lifetime, env)
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
@@ -491,10 +491,13 @@ export class DshExecutor implements Executor {
     const batch = told ? [] : batchOf(this.host, ticket).map(batchLine)
     const execution = this.host.workspaceContext?.(ticket)
     const context = execution ? { execution } : {}
-    const text = told ? JSON.stringify({ ticket_id: ticket.id, assignment: ticket.assignments.length, ...context, ...retried })
+    const continuation = assignment.continuation ? { remaining_work: capped(assignment.continuation.instructions, ASSIGNMENT_CHARS,
+      `ticket/${ticket.id}/continuation/${assignment.id}`), review_id: assignment.continuation.reviewId,
+      evidence: `ticket/${ticket.id}/assignments` } : {}
+    const text = told ? JSON.stringify({ ticket_id: ticket.id, assignment: ticket.assignments.length, ...context, ...retried, ...continuation })
       : JSON.stringify({ ticket_id: ticket.id, title: ticket.title, ...(brief ? { assignment: brief } : {}),
         ...(read ? { assignment_chars: chars, assignment_read: read } : {}), ...(card ? { trigger: card } : {}),
-        ...(batch.length ? { batch } : {}), ...context, ...retried })
+        ...(batch.length ? { batch } : {}), ...context, ...retried, ...continuation })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
     await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
       () => { if (!current()) throw new Error('Launch authorization changed before worker delivery') },

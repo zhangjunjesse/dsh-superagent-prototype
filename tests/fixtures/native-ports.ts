@@ -18,12 +18,29 @@ export function processRunOf(input: DeliveryInput, policy: NativeSessionPolicy):
 }
 export async function routeOriginal(turn: NativeTurn, title = 'Read bounded files', targetInstanceId?: string) {
   const card = JSON.parse(turn.text)
+  if (card.kind === 'result_review') return acceptOriginalReview(turn)
   if (card.kind !== 'candidate') return
   const dispatch = card.dispatch
   return turn.tool('orchestrator_route', { decisions: [dispatch && dispatch.operation !== 'new'
     ? { kind: dispatch.operation === 'stop' ? 'stop' : 'attach', trigger_id: card.trigger_id, ticket_id: dispatch.target_ticket_id }
     : { kind: 'accept', trigger_id: card.trigger_id, title, worktree_name: 'bounded-task', acknowledgement: 'Accepted bounded request.',
       ...(targetInstanceId ? { target_instance_id: targetInstanceId } : {}) }] })
+}
+/** Reads a complete original resource through its real paged main-Session tool. */
+export async function originalText(turn: NativeTurn, resource: string): Promise<string> {
+  let text = '', offset = 0
+  for (;;) {
+    const page = await turn.tool('orchestrator_read', { resource, offset, limit: 8000 }) as { text: string; next_offset: number | null }
+    text += page.text
+    if (page.next_offset === null) return text
+    offset = page.next_offset
+  }
+}
+/** Controlled positive scenarios explicitly accept their known fixture evidence, through the actual review tool. */
+export async function acceptOriginalReview(turn: NativeTurn, summary?: string) {
+  const card = JSON.parse(turn.text), review = JSON.parse(await originalText(turn, card.read))
+  return turn.tool('orchestrator_result_review', { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
+    decision: { kind: 'accept', summary: summary ?? review.summary.split('\n\n')[0] } })
 }
 export function controlledNative(run: (turn: NativeTurn) => Promise<void> = async () => {}, options: {
   beforeDelivery?(input: DeliveryInput, policy: NativeSessionPolicy): Promise<void>;

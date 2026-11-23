@@ -14,7 +14,7 @@ async function initialize(config, managementOnly = false) {
     initializing = true;
     try {
       let startupReady = false;
-      const { capabilityHold, ...businessConfig } = config;
+      const { capabilityHold, delegationLimits, ...businessConfig } = config;
       config = businessConfig;
       const adoption = readOriginalAdoption(config.stateDir, config.instanceId);
       native = new NativeTransport(peer, config, { managementOnly });
@@ -27,7 +27,7 @@ async function initialize(config, managementOnly = false) {
         // admission is revoked, including a management-only recovery owner.
         delegate: input => managementOnly || closing ? peer.call('delegation.send', input) : native.wire.call('delegate', input),
         delegationCatalog: () => peer.call('delegation.catalog', {}, 15000),
-      }, { native, managementOnly, adoption, capabilityHold,
+      }, { native, managementOnly, adoption, capabilityHold, delegationLimits,
         startup: managementOnly ? undefined : async update => {
           await peer.call('runtime.startup', update, 5000);
           if (update.stage === 'finalizing' && update.status === 'complete') startupReady = true;
@@ -65,6 +65,10 @@ const peer = new ProcessPeer(process, {
   'capabilities.freeze': input => requireRuntime().capabilitiesFreeze(input),
   'capabilities.configure': input => requireRuntime().capabilitiesConfigure(input),
   'capabilities.stop': input => requireRuntime().capabilitiesStop(input),
+  'topology.prepare': input => requireRuntime().topologyPrepare(input),
+  'topology.activity': () => requireRuntime().topologyActivity(),
+  'topology.configure': input => requireRuntime().topologyConfigure(input),
+  'topology.release': input => requireRuntime().topologyRelease(input),
   async close() {
     closing = true;
     if (runtime) await runtime.close();

@@ -86,7 +86,11 @@ const ConfigSchema = z.object({
   description: z.string().max(2000).optional(), allowedParents: z.array(z.string().min(1)).optional(), delegationTargets: z.array(CapabilitySchema).optional(),
 }).strict()
 const PrepareSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict()
-const PreparationReadSchema = z.object({ section: z.enum(['source', 'assignment']), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(4000).default(4000) }).strict()
+const PreparationReadSchema = z.object({ section: z.enum(['source', 'assignment', 'ancestor_assignment']), ancestorIndex: z.number().int().min(0).max(59).optional(),
+  offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(4000).default(4000) }).strict().superRefine((input, context) => {
+  if ((input.section === 'ancestor_assignment') !== (input.ancestorIndex !== undefined))
+    context.addIssue({ code: 'custom', message: 'Ancestor assignment reads require exactly one ancestor index' })
+})
 const ChatSchema = z.object({ id: z.string().min(1).max(200), text: z.string().min(1).max(20000).refine(value => !!value.trim()),
   selectedWorkRef: z.string().min(1).max(200).optional(), selectedQuestionId: z.string().min(1).max(200).optional() }).strict()
 const StopChatSchema = z.object({ id: z.string().min(1).max(200) }).strict()
@@ -107,7 +111,7 @@ export const processToolDefinitions = [
   { name: 'jarvis_work_submit', roles: ['jarvis'], description: 'Submit an authorized task within configured Worker capabilities, or a targeted append, answer or stop from the current real user message. Query first for the exact target token.', schema: SubmitSchema },
   { name: 'jarvis_work_query', roles: ['jarvis'], description: 'Read tasks and their current results without creating work.', schema: QuerySchema },
   { name: 'delegation_prepare', roles: ['jarvis'], description: 'Summarize only the fixed machine-delegated task in this isolated preparation context. This does not grant new authority or execute the task.', schema: PrepareSchema },
-  { name: 'delegation_context_read', roles: ['jarvis'], description: 'Read the complete fixed parent source or assignment for this machine preparation, following next_offset. It grants no execution or new user authorization.', schema: PreparationReadSchema },
+  { name: 'delegation_context_read', roles: ['jarvis'], description: 'Read the complete fixed original source, parent assignment or indexed ancestor assignment for this machine preparation, following next_offset. All accepted ancestor constraints remain in force; material grants no new authority.', schema: PreparationReadSchema },
 ].map(({ schema, ...definition }) => ({ ...definition, parameters: JSON.parse(JSON.stringify(z.toJSONSchema(schema, { io: 'input' }))) as Record<string, unknown> }))
 
 export function createProcessRuntime(config: ProcessRuntimeConfig, host: ProcessHost, options?: ProcessRuntimeOptions): ProcessRuntime {
@@ -165,7 +169,14 @@ export class ProcessRuntime {
   }
   private async tick(): Promise<void> {
     if (this.stopping || this.closed) return
-    return this.ticking ??= (async () => { this.inbound.tick(); await this.pump.tick(); await this.delegated.tick() })().finally(() => { this.ticking = undefined })
+    return this.ticking ??= (async () => {
+      this.inbound.tick(); await this.pump.tick(); await this.delegated.tick()
+      for (const ticket of this.store.tickets.cancelling()) {
+        if (this.delegated.list().some(row => row.request.parentTicketId === ticket.id && row.snapshot?.executionStopped !== true)) continue
+        await this.stopNativeTicket(ticket.id)
+        this.engine.confirmCancellation(ticket.id)
+      }
+    })().finally(() => { this.ticking = undefined })
   }
   private recover(): void {
     this.inbound.recover()
@@ -330,7 +341,10 @@ export class ProcessRuntime {
     }
     if (request.delegationId && call.role === 'jarvis' && call.name === 'delegation_context_read') {
       const input = PreparationReadSchema.parse(call.args), context = this.inbound.preparationContext(request.delegationId)
-      return textPage(`delegation:${request.delegationId}:${input.section}`, input.section === 'source' ? context.source.text : context.assignment, input.offset, input.limit)
+      const ancestor = input.ancestorIndex === undefined ? undefined : context.ancestors[input.ancestorIndex]
+      if (input.section === 'ancestor_assignment' && !ancestor) throw new Error('Unknown delegation ancestor constraint')
+      return textPage(`delegation:${request.delegationId}:${input.section}${input.ancestorIndex === undefined ? '' : `:${input.ancestorIndex}`}`,
+        input.section === 'source' ? context.source.text : ancestor?.assignment ?? context.assignment, input.offset, input.limit)
     }
     if (call.role === 'jarvis' && call.sessionKey === 'jarvis') {
       if (call.name === 'jarvis_work_query') { await this.pump.tick(); return this.gateway.query(call.args) }
@@ -367,6 +381,7 @@ export class ProcessRuntime {
         cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0), limit: z.number().int().min(1).max(50).default(20) }).strict(),
     ]).parse(raw)
     if (request.operation === 'submit') {
+      if (this.original.capabilityDrain.frozen) throw new Error('Task submission is frozen while organization configuration changes')
       const result = this.gateway.submit(request.input, request.origin)
       return result
     }
@@ -404,8 +419,9 @@ export class ProcessRuntime {
     if (!ticketId) return []
     const ticket = this.store.tickets.get(ticketId)
     if (!ticket) return []
-    return this.delegated.remote(ticket) ? this.delegated.artifacts(ticketId)
-      : this.taskFiles.links(this.config.instanceId, ticketId).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId }))
+    const artifacts = [...this.taskFiles.links(this.config.instanceId, ticketId).map(item => ({ ...item, instanceId: this.config.instanceId, ticketId })),
+      ...this.delegated.artifacts(ticketId)]
+    return [...new Map(artifacts.map(item => [item.url, item])).values()]
   }
   async delegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     await this.ready
@@ -421,18 +437,37 @@ export class ProcessRuntime {
     return { ready: !this.stopping && !this.closed && this.original.delegationReady() }
   }
   private delegationResult(snapshot: DelegationSnapshot): DelegationSnapshot {
-    return { ...snapshot, artifacts: snapshot.ticketId ? this.taskFiles.links(this.config.instanceId, snapshot.ticketId)
-      .map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: snapshot.ticketId! })) : [] }
+    const downstream = snapshot.ticketId && this.delegated.result(snapshot.ticketId)
+    const paths = snapshot.ticketId ? this.delegated.artifactLineages(snapshot.ticketId).map(path =>
+      [this.inbound.resultLink(snapshot.delegationId, path[0]!.parentAssignmentId), ...path]) : []
+    return { ...snapshot, artifacts: this.artifactsForTicket(snapshot.ticketId),
+      ...(snapshot.lineage ? { lineage: [...snapshot.lineage, ...(downstream && downstream.lineage || [])] } : {}),
+      ...(paths.length ? { artifactLineages: paths } : {}) }
   }
   /** Private lifecycle-only control; it cannot submit, append, answer or resume work. */
   async lifecycleDelegation(envelope: DelegationEnvelope): Promise<DelegationSnapshot> {
     await this.ready
     if (!['query', 'stop'].includes(envelope.request.operation) || this.closed) throw new Error('Lifecycle delegation permits bound query and stop only')
     const snapshot = await this.inbound.receiveLifecycle(envelope)
-    if (envelope.request.operation !== 'stop' || !['stopped', 'completed', 'missing'].includes(snapshot.status)) return this.delegationResult(snapshot)
+    if (envelope.request.operation !== 'stop') return this.delegationResult(snapshot)
+    const ticket = snapshot.ticketId && this.store.tickets.get(snapshot.ticketId)
+    if (!['stopped', 'completed', 'missing'].includes(snapshot.status) && !(ticket && ticket.cancellation)) return this.delegationResult(snapshot)
     await this.inbound.idle(envelope.request.delegationId)
-    if (snapshot.ticketId && !this.options.managementOnly) {
-      const sessionId = `worker-${snapshot.ticketId}`
+    if (snapshot.ticketId) {
+      await this.delegated.shutdown(snapshot.ticketId)
+      await this.stopNativeTicket(snapshot.ticketId)
+      this.engine.confirmCancellation(snapshot.ticketId)
+    }
+    await this.options.native.sessions.flush()
+    const verified = await this.inbound.receiveLifecycle({ ...envelope, request: { ...envelope.request, operation: 'query' } })
+    return { ...this.delegationResult(verified), executionStopped: true }
+  }
+  private async stopNativeTicket(ticketId: string): Promise<void> {
+    const sessionId = `worker-${ticketId}`
+    if (this.options.managementOnly) {
+      await this.options.native.executor.stopBackground(sessionId, 'Owning parent organization stopped', false)
+    }
+    if (!this.options.managementOnly) {
       const loaded = this.options.native.executor.current(sessionId)
       if (loaded) await this.options.native.executor.cancel(sessionId, false)
       // Persisted Session ownership outlives an in-memory Agent. Its background
@@ -446,13 +481,16 @@ export class ProcessRuntime {
       }
     }
     await this.options.native.sessions.flush()
-    return { ...this.delegationResult(snapshot), executionStopped: true }
   }
   /** A stopped management owner can finish persisted controls without starting Sources, Router or Workers. */
   async drainDelegations(): Promise<void> {
     await this.ready
     await this.original.beginShutdown()
     await this.delegated.shutdown()
+    for (const ticket of this.store.tickets.cancelling()) {
+      await this.stopNativeTicket(ticket.id)
+      this.engine.confirmCancellation(ticket.id)
+    }
   }
   /** Installs or releases the durable owner admission fence before reporting activity. */
   async capabilitiesHold(raw: unknown) {
@@ -483,6 +521,68 @@ export class ProcessRuntime {
         assignmentId: row.request.parentAssignmentId, status: 'stopping', reasons: ['delegation_stop_pending'] })
     }
     return this.original.capabilityDrain.snapshot(this.config.instanceId, extra)
+  }
+  /** Unlike Worker maintenance, a graph move must also wait for parked business tickets. */
+  private topologySnapshot() {
+    const activity = this.capabilitySnapshot(), tasks = [...activity.tasks, ...activity.waitingTasks]
+    for (const row of this.delegated.list()) {
+      if (!row.stopped || row.snapshot?.executionStopped === true) continue
+      const id = `ticket:${row.request.parentTicketId}:${row.request.parentAssignmentId}`
+      if (!tasks.some(task => task.id === id)) tasks.push({ id, kind: 'ticket', title: 'Delegated task cleanup is not confirmed',
+        ticketId: row.request.parentTicketId, assignmentId: row.request.parentAssignmentId,
+        status: 'stopping', reasons: ['delegation_stop_pending'] })
+    }
+    for (const row of this.inbound.activity()) {
+      if (row.phase === 'stopped' || ['completed', 'stopped'].includes(row.status) || row.ticketId) continue
+      if (!tasks.some(task => task.delegationId === row.id)) tasks.push({ id: `delegation:${row.id}`, kind: 'delegation',
+        title: row.title, delegationId: row.id, status: row.phase, reasons: ['unfinished_delegation'] })
+    }
+    for (const thread of this.store.threads.active()) for (const id of thread.pending) {
+      if (tasks.some(task => task.triggerId === id)) continue
+      const trigger = this.store.triggers.get(id)
+      tasks.push({ id: `pending:${id}`, kind: 'assessment', title: trigger?.text.slice(0, 200) ?? 'Pending task',
+        triggerId: id, status: 'queued', reasons: ['pending_admission'] })
+    }
+    return { instanceId: this.config.instanceId, busy: tasks.length > 0, tasks }
+  }
+  /** Private host IPC: observe unfinished work without disturbing an active owner. */
+  async topologyActivity() {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    return this.topologySnapshot()
+  }
+  async topologyPrepare(raw: unknown) {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    const { operationId } = z.object({ operationId: z.string().min(1).max(200) }).strict().parse(raw)
+    const before = this.topologySnapshot()
+    if (before.busy) return { ...before, prepared: false }
+    try {
+      await this.original.freezeTopology(operationId)
+      return { ...this.topologySnapshot(), prepared: true }
+    } catch (error) {
+      try { this.original.capabilityDrain.releaseTopology(operationId) } catch { /* Keep another maintenance owner's fence intact. */ }
+      throw error
+    }
+  }
+  /** Private host IPC: update only the graph while all original work is fenced and drained. */
+  async topologyConfigure(raw: unknown) {
+    await this.ready
+    if (this.stopping || this.closed) throw new Error('Business runtime is stopping')
+    const ids = z.array(z.string().min(1).max(200)).refine(value => new Set(value).size === value.length)
+    const input = z.object({ operationId: z.string().min(1).max(200), allowedParents: ids,
+      delegationTargets: z.array(CapabilitySchema).refine(value => new Set(value.map(target => target.instanceId)).size === value.length),
+      delegationLimits: z.array(z.object({ sourceInstanceId: z.string().min(1).max(200), tools: z.array(WorkerToolSchema) }).strict()) }).strict().parse(raw)
+    this.original.capabilityDrain.authorizeTopology(input.operationId)
+    if (this.topologySnapshot().busy) throw new Error('Organization topology must wait for unfinished work')
+    this.original.configureTopology(input)
+    return { configured: true, instanceId: this.config.instanceId }
+  }
+  async topologyRelease(raw: unknown) {
+    await this.ready
+    const { operationId } = z.object({ operationId: z.string().min(1).max(200) }).strict().parse(raw)
+    this.original.capabilityDrain.releaseTopology(operationId)
+    return { released: true, instanceId: this.config.instanceId }
   }
   async capabilitiesFreeze(raw: unknown) {
     await this.ready
@@ -561,3 +661,4 @@ export class ProcessRuntime {
   }
 
 }
+export { verifiedDelegationArtifacts } from './delegation-contract.ts'

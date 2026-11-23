@@ -27,6 +27,7 @@ const StoredHoldSchema = CapabilityHoldSchema.extend({ version: z.literal(1), ti
 /** Captures admitted work once and restores that same set before original business effects start. */
 export class CapabilityDrain {
   private hold?: HoldRecord
+  private topologyOperation?: string
   constructor(private readonly runtime: Runtime, private readonly incoming: InboundDelegations,
     private readonly masterRunning: () => boolean, private readonly processing: boolean, initial?: CapabilityHold) {
     const persisted = runtime.store.get(held)
@@ -34,12 +35,26 @@ export class CapabilityDrain {
     if (initial) this.set({ ...CapabilityHoldSchema.parse(initial), held: true })
   }
   get operationId(): string | undefined { return this.hold?.operationId }
-  get frozen(): boolean { return this.hold?.frozen === true }
+  get frozen(): boolean { return !!this.topologyOperation || this.hold?.frozen === true }
+  /** Topology fencing is transient: a restarted owner reads the host's committed graph. */
+  freezeTopology(operationId: string): void {
+    if (this.hold || this.topologyOperation && this.topologyOperation !== operationId) throw new Error('Another maintenance operation owns the topology freeze')
+    this.topologyOperation = operationId
+  }
+  authorizeTopology(operationId: string): void {
+    if (this.topologyOperation !== operationId) throw new Error('The operation does not own the topology freeze')
+  }
+  releaseTopology(operationId: string): void {
+    if (!this.topologyOperation) return
+    this.authorizeTopology(operationId); this.topologyOperation = undefined
+    if (this.processing) this.runtime.passes.request()
+  }
   private matching(operationId: string): HoldRecord {
     if (!this.hold || this.hold.operationId !== operationId) throw new Error('Worker capability operation does not own the admission hold')
     return this.hold
   }
   set(input: CapabilityHold & { held: boolean }): void {
+    if (this.topologyOperation) throw new Error('An organization move owns the topology freeze')
     if (this.hold && this.hold.operationId !== input.operationId) throw new Error('Another Worker capability operation owns the admission hold')
     if (!input.held) {
       if (this.hold) { this.runtime.store.delete(held); this.hold = undefined }
@@ -60,6 +75,7 @@ export class CapabilityDrain {
     if (input.frozen === false && this.processing) this.runtime.passes.request()
   }
   evaluate(trigger: Trigger): boolean {
+    if (this.topologyOperation) return false
     if (!this.hold) return true
     if (this.frozen) return false
     if (this.admittedOrigin(trigger)) return true
@@ -71,6 +87,7 @@ export class CapabilityDrain {
       && typeof trigger.meta.delegationId === 'string' && this.hold.delegationIds.includes(trigger.meta.delegationId))
   }
   resume(ticket: Ticket): boolean {
+    if (this.topologyOperation) return false
     if (!this.hold) return true
     if (this.frozen || !liveTicket(ticket)) return false
     return this.hold.ticketIds.includes(ticket.id) || ticket.origin.triggerIds.some(id => {

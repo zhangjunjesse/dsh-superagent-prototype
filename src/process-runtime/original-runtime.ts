@@ -1,6 +1,6 @@
 /** Composition of the original complete application in an independent organization owner. */
 import { Context } from '@deepseek-ai/cordis'
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
@@ -26,6 +26,7 @@ import { TaskFiles, artifactLinks } from './task-files.ts'
 import { effectiveWorkerTools, WorkerSkillsSchema, WorkerToolSchema } from './worker-capabilities.ts'
 import { CapabilityDrain, type CapabilityHold } from './capability-drain.ts'
 import type { ProcessHost, ProcessRunResult, ProcessRuntimeConfig } from './runtime.ts'
+import { executionRoot } from '../app/execution-environment.ts'
 
 const absolute = z.string().refine(isAbsolute)
 const machineDefaults = z.object({
@@ -51,6 +52,8 @@ export interface ProcessRuntimeOptions {
   restart?(): void;
   /** Installed from durable host coordination before original Sources or effects can admit work. */
   capabilityHold?: CapabilityHold;
+  /** Rebuild current admission from the host's committed graph after any interrupted move. */
+  delegationLimits?: DelegationLimit[];
   /** Stage-only observation of the original setup and native Session initialization. */
   startup?: StartupObserver;
 }
@@ -96,6 +99,24 @@ export class OriginalProcess {
   private readyTargets = new Set<string>()
   private catalogRefresh?: Promise<void>
 
+  /** Settle a catalog read admitted before the host fenced the graph. */
+  async freezeTopology(operationId: string): Promise<void> {
+    this.capabilityDrain.freezeTopology(operationId)
+    await this.catalogRefresh
+  }
+  /** A private host operation changes relationships without replacing task or Session owners. */
+  configureTopology(input: { operationId: string; allowedParents: string[]; delegationTargets: Capability[]; delegationLimits: DelegationLimit[] }): void {
+    this.capabilityDrain.authorizeTopology(input.operationId)
+    if (input.delegationTargets.some(target => target.instanceId === this.config.instanceId || target.tools.some(tool => !this.config.workerTools.includes(tool)))
+      || input.allowedParents.includes(this.config.instanceId)) throw new Error('Organization topology exceeds the current capability or identity')
+    const previous = this.config.allowedParents
+    this.config.allowedParents = [...input.allowedParents]
+    try { this.inbound.configureTopology(input.delegationLimits) }
+    catch (error) { this.config.allowedParents = previous; throw error }
+    this.config.delegationTargets = structuredClone(input.delegationTargets)
+    this.readyTargets = new Set()
+  }
+
   constructor(readonly config: ProcessRuntimeConfig, private readonly host: ProcessHost, readonly options: ProcessRuntimeOptions, preparation: Preparation) {
     if (!options?.native) throw new Error('The original complete task runtime requires its shared DSH native ports')
     const directory = realpathSync.native(config.stateDir), workspace = realpathSync.native(config.workspace)
@@ -136,24 +157,42 @@ export class OriginalProcess {
         engine: { resumeCompletedCommands: true,
           admission: { evaluate: trigger => !this.draining && this.capabilityDrain.evaluate(trigger), resume: ticket => !this.draining && this.capabilityDrain.resume(ticket),
             frozen: () => this.draining || this.capabilityDrain.frozen },
-          delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false } },
+          delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false },
+          resultReview: {
+            context: (ticket, assignment) => ({ delegation: this.delegated.reviewContext(ticket, assignment), capabilities: this.workerCapabilities(ticket) }),
+            authorize: (ticket, assignment, decision) => this.delegated.authorizeReview(ticket, assignment, decision),
+            request: (ticket, assignment, review) => runtime!.sessions.relay(review.id, JSON.stringify({ kind: 'result_review',
+              ticket_id: ticket.id, assignment_id: assignment.id, review_id: review.id, evidence_ref: review.evidenceRef,
+              scope: ticket.mandate.scope, original_request: `trigger/${ticket.origin.triggerId}`,
+              ...(ticket.attention ? { human_action: ticket.attention.question, attention_id: ticket.attention.id } : {}),
+              original_assignment: `ticket/${ticket.id}/assignment`, inputs: `ticket/${ticket.id}/inputs`,
+              history: `ticket/${ticket.id}/assignments`, read: `ticket/${ticket.id}/review/${review.id}`,
+              summary: review.summary.slice(0, 600), chars: review.summary.length,
+              execution_targets: (config.delegationTargets ?? []).map(target => ({ ...target,
+                tools: target.tools.filter(tool => this.workerCapabilities(ticket).tools.includes(tool)) }))
+                .filter(target => target.tools.length && this.readyTargets.has(target.instanceId)),
+              instruction: 'Read the original request, complete review, all later inputs and prior results. Judge every original goal and completion condition against actual evidence for the delivered version. A child completion is only a result to review. Use orchestrator_result_review: accept only with sufficient evidence, otherwise continue the remaining work under the same mandate. Do not report completion to the user before acceptance.' })),
+          } },
         scope: { scope: input => input.source === 'delegation'
           ? this.inbound?.listens(input.meta) ? { listened: true, observed: false } : { listened: false, reason: 'delegation_not_allowed' }
           : this.runtime.sources.scope(input) },
         routing: {
           targets: async trigger => {
-            if (trigger.source === 'delegation') return []
             await this.refreshDelegationCatalog()
-            return (config.delegationTargets ?? []).filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
+            const ceiling = this.inbound.toolsForTrigger(trigger)
+            return (config.delegationTargets ?? []).map(target => ({ ...target, tools: target.tools.filter(tool => !ceiling || ceiling.includes(tool)) }))
+              .filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
           },
           prepare: async (id, target) => { if (target && !this.delegated.selected(id)) await this.refreshDelegationCatalog() },
           select: (id, target) => this.delegated.select(id, target),
+          prepareReview: async (_id, target) => { if (target) await this.refreshDelegationCatalog() },
         },
         executor: local => ({
-          start: (ticket, assignment) => this.delegated.remote(ticket) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
+          requestCancellation: ticket => this.delegated.requestCancellation(ticket.id),
+          start: (ticket, assignment) => this.delegated.remote(ticket, assignment) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
           stop: (ticket, assignment, reason) => {
-            if (this.delegated.remote(ticket)) this.delegated.stop(ticket, assignment)
+            if (this.delegated.remote(ticket, assignment)) this.delegated.stop(ticket, assignment)
             // A locked management owner has no loaded native execution. Its
             // guarded domain stop is durable; only the live business owner can cancel Sessions.
             else if (!options.managementOnly) local.stop(ticket, assignment, reason)
@@ -179,8 +218,9 @@ export class OriginalProcess {
       this.unregister = runtime.sources.register(kind)
       this.inbound = new InboundDelegations(config, runtime.store, runtime.engine,
         { ...preparation, admitted: id => this.capabilityDrain.prepare(id), acceptNew: () => this.delegationReady() })
+      if (options.delegationLimits) this.inbound.configureTopology(options.delegationLimits)
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
-        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools)
+        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound)
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
       const backend = new SourceBackend(runtime.context(kind), identity)
@@ -198,7 +238,7 @@ export class OriginalProcess {
   /** Existing task grants can only narrow; changing instance settings never grants an old task new tools or skills. */
   private workerCapabilities(ticket: Ticket) {
     const stored = this.runtime.store.get(workerCapabilities(ticket.id)), saved = stored && WorkerCapabilityBindingSchema.parse(stored)
-    const selected = this.delegated?.selected(ticket.origin.triggerId)
+    const selected = ticket.assignments.at(-1)?.executionTarget ?? this.delegated?.selected(ticket.origin.triggerId)
     const childTools = selected && selected !== 'local' ? this.config.delegationTargets?.find(target => target.instanceId === selected)?.tools ?? [] : undefined
     return {
       tools: (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
@@ -264,8 +304,12 @@ export class OriginalProcess {
   }
   /** The original admission owner is available without consuming or disturbing current work. */
   delegationReady(): boolean {
-    return !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
-      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId
+    const available = !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
+      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId && !this.capabilityDrain.frozen
+    if (!available) return false
+    try { return [this.config.stateDir, this.config.workspace, executionRoot(this.runtime.store.settings(), this.runtime.machine.stateDir)]
+      .every(directory => statSync(directory).isDirectory()) }
+    catch { return false }
   }
   close(): Promise<void> { return this.closing ??= this.shutdown() }
   /** Fence original admission and drain the original pass/source owners without closing their Store. */

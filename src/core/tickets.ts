@@ -181,6 +181,20 @@ export class Tickets extends EnginePart {
     this.options.executor.start(ticket, assignment)
     return ticket
   }
+  /** Replace a reviewed executor result with remaining authorized work, keeping all original inputs and evidence. */
+  continueReviewed(ticket: Ticket, previous: Assignment, reviewId: string, instructions: string, targetInstanceId?: string): Assignment {
+    this.endAssignment(ticket, previous, 'continuedAfterReview')
+    this.requeueUntaken(ticket, previous)
+    const assignment = this.newAssignment(ticket)
+    assignment.executionTarget = targetInstanceId ?? 'local'
+    assignment.continuation = { reviewId, instructions }
+    ticket.updatedAt = this.now()
+    delete ticket.attention
+    this.repo.tickets.save(ticket)
+    this.options.executor.stop(ticket, previous, 'continuedAfterReview')
+    this.options.executor.start(ticket, assignment)
+    return assignment
+  }
   /**
    * Drops a ticket's Subscription to a Thread its worker found unrelated, and hands back, with `reason`, the person's messages there that the ticket decides.
    * @throws UserError when the ticket is unknown, or `thread` is an origin thread, a bound `follows` thread, or not subscribed.
@@ -356,14 +370,25 @@ export class Tickets extends EnginePart {
     const left = this.untaken(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger'
       && (!readBefore(input, until) || ticket.undelivered.includes(input.id)) ? [input.id] : []))
     // An end dated earlier, such as a PR's merge, does not move the ticket's last change back.
-    ticket.ended = { at, by, outcome, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
+    if (outcome === 'stopped' && this.options.executor.requestCancellation?.(ticket)) ticket.cancellation = { at, by, ...why }
+    else ticket.ended = { at, by, outcome, ...why }
+    ticket.undelivered = []; ticket.updatedAt = this.now()
     delete ticket.attention; delete ticket.delivery
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
     this.letGo(ticketId, waiting, left)
-    this.emit('ticket.ended', { ticketId, by, outcome, ...why })
+    if (ticket.ended) this.emit('ticket.ended', { ticketId, by, outcome, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
+  }
+  confirmCancellation(ticketId: string): void {
+    const ticket = this.require(ticketId), pending = ticket.cancellation
+    if (!pending || ticket.ended) return
+    const at = this.now()
+    ticket.ended = { at, by: pending.by, outcome: 'stopped', reason: pending.reason }
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    this.emit('ticket.ended', { ticketId, by: pending.by, outcome: 'stopped', reason: pending.reason })
   }
   /**
    * Whether a ticket's work has not finished at a close at `at`: its worker took up a person's message the ticket decides and
@@ -372,6 +397,8 @@ export class Tickets extends EnginePart {
    * change asks for no work.
    */
   private unfinished(ticket: Ticket, at: string): boolean {
+    const review = latestAssignment(ticket)?.resultReviews?.at(-1)
+    if (review && !review.decision) return true
     const until = readUntil(ticket, false)
     const taken = this.triggersOf(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger' && !readBefore(input, until) ? [input.id] : []))
       .some(trigger => this.owners(trigger).includes(ticket.id) && this.takenUp(ticket, trigger))

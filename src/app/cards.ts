@@ -17,10 +17,11 @@ export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) 
 }
 /** The states a ticket card shows: an open ticket's stage (docs/003), and an ended ticket's outcome. */
 export const TICKET_STATES = ['person/delivery', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'working', 'working/queued', 'idle',
-  'completed', 'merged', 'closed', 'dropped', 'stopped'] as const
+  'completed', 'merged', 'closed', 'dropped', 'stopped', 'cancelling'] as const
 export type TicketCardState = typeof TICKET_STATES[number]
 function cardState(ticket: Ticket): TicketCardState {
   if (ticket.ended) return ticket.ended.outcome
+  if (ticket.cancellation) return 'cancelling'
   const stage = ticketStage(ticket)
   if (stage.stage === 'person') return `person/${stage.action}`
   return stage.stage === 'idle' ? 'idle' : stage.stage === 'working' && stage.action ? 'working/queued' : 'working'
@@ -49,6 +50,10 @@ export function inputLine(ticket: Ticket, input: TicketInput, worker = false) {
 }
 export function assignmentLine(ticket: Ticket, item: Ticket['assignments'][number]) {
   return { id: item.id, state: item.state, at: item.createdAt, ...(item.endedReason ? { ended_reason: reasonText({ code: item.endedReason }) } : {}),
+    ...(item.executionTarget ? { execution_target: item.executionTarget } : {}),
+    ...(item.continuation ? { continuation: { review_id: item.continuation.reviewId, read: `ticket/${ticket.id}/continuation/${item.id}` } } : {}),
+    ...(item.resultReviews?.length ? { result_reviews: item.resultReviews.map(review => ({ id: review.id, at: review.at,
+      evidence_ref: review.evidenceRef, ...(review.decision ? { decision: review.decision.kind } : {}), read: `ticket/${ticket.id}/review/${review.id}` })) } : {}),
     ...(item.report ? { report: { state: item.report.state, at: item.report.at, preview: preview(item.report.summary).slice(0, 100),
       chars: item.report.summary.length, read: `ticket/${ticket.id}/report/${item.id}` } } : {}) }
 }

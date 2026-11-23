@@ -19,7 +19,7 @@ const RoutingNoteSchema = z.string().trim()
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'resolveResultReview'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
@@ -35,6 +35,7 @@ export interface MainToolsHost {
   selectTarget?(triggerId: string, target?: string): void
   /** Refreshes child availability before the original atomic routing decision. */
   prepareTarget?(triggerId: string, target?: string): Promise<void>
+  prepareReview?(ticketId: string, target?: string): Promise<void>
 }
 /** Schedules an Engine pass to execute the recorded routing decision and formats the tool response. */
 function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: string; ticketId?: string | undefined }) {
@@ -57,7 +58,7 @@ const RouteItemSchema = z.object({
   acknowledgement: z.string().nullish().describe(`accept: one brief sentence of at most ${IM_WORDS} words naming the concrete change and intended result in the source language. It is posted as a reply to the original source on acceptance, so do not quote the source; quote an earlier proposal briefly only when the trigger merely confirms it and the sentence does not already state it. No generic I will handle it.`),
   note: z.string().nullish().describe(`accept and attach: ${RoutingNoteSchema.description ?? ''}`),
   reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
-  target_instance_id: z.string().nullish().describe('accept only: a direct child instance from this candidate\'s execution_targets; omit for this instance\'s Worker. This never permits another delegation hop.'),
+  target_instance_id: z.string().nullish().describe('accept only: a direct child instance from this candidate\'s execution_targets; omit for this instance\'s Worker. Each child applies its own original task admission and inherited permission limits.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
@@ -173,6 +174,27 @@ export function mainTools(host: MainToolsHost, agent: Pick<Agent, 'id'>): Tool[]
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),
+    tool({
+      name: 'orchestrator_result_review',
+      description: 'Judge a saved result against the original request, accepted scope, all later inputs and actual evidence. Read the review and linked sources first. Accept only when every completion condition is evidenced for the delivered version; a child saying completed is insufficient. Otherwise continue the remaining authorized work on the same ticket. Omit target_instance_id for this organization\'s Worker, or select a current execution_targets child. This cannot widen the original mandate or tools. Only the latest bound review can change task state.',
+      schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
+        decision: z.discriminatedUnion('kind', [
+          z.object({ kind: z.literal('accept'), summary: z.string().trim().min(1).max(20000) }).strict(),
+          z.object({ kind: z.literal('continue'), summary: z.string().trim().min(1).max(20000),
+            instructions: z.string().trim().min(1).max(100000), target_instance_id: z.string().min(1).max(80).optional() }).strict(),
+        ]) }).strict(),
+      execute: async (args, signal) => {
+        const committed = host.store.tickets.get(args.ticket_id)?.assignments.find(item => item.id === args.assignment_id)
+          ?.resultReviews?.find(item => item.id === args.review_id)?.decision
+        if (args.decision.kind === 'continue' && !committed) await host.prepareReview?.(args.ticket_id, args.decision.target_instance_id)
+        signal.throwIfAborted()
+        const decision = args.decision.kind === 'accept' ? args.decision : { kind: 'continue' as const,
+          summary: args.decision.summary, instructions: args.decision.instructions,
+          ...(args.decision.target_instance_id ? { targetInstanceId: args.decision.target_instance_id } : {}) }
+        const updated = host.engine.resolveResultReview(args.ticket_id, args.assignment_id, args.review_id, decision)
+        return routed(host, { reason: args.decision.kind === 'accept' ? 'Result accepted against the original goal' : 'Remaining work assigned under the original mandate', ticketId: updated.id })
+      },
+    }),
     tool({
       name: 'orchestrator_ticket_retry',
       description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',

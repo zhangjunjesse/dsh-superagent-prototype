@@ -16,8 +16,8 @@ const idPattern = /^[a-z][a-z0-9-]{0,47}$/;
 const reservedId = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 const clone = value => structuredClone(value);
 const metadataKeys = ['name', 'brainName', 'description', 'capabilities'];
-const updateKeys = new Set([...metadataKeys, 'model']);
-const scopedKeys = new Set([...updateKeys, 'roleModels']);
+const updateKeys = new Set([...metadataKeys, 'model', 'parent']);
+const scopedKeys = new Set([...metadataKeys, 'model', 'roleModels']);
 
 /** Expected management error whose status may be returned by the host's authenticated HTTP route. */
 export class SystemControlError extends Error {
@@ -122,7 +122,7 @@ export class SystemControl {
     this.rootDir = realpathSync(rootDir); this.file = join(this.rootDir, 'system-config.json');
     this.defaultModel = defaultModel; this.validateModel = validateModel;
     this.capabilityCatalog = capabilityCatalog; this.catalogCache = new Map(); this.catalogRequests = new Map();
-    this.revision = 0; this.nodes = null; this.identities = {}; this.saving = false; this.actions = new Map(); this.closing = false;
+    this.revision = 0; this.nodes = null; this.identities = {}; this.retiredParents = {}; this.saving = false; this.actions = new Map(); this.closing = false;
     let capabilityApplications = [];
     if (existsSync(this.file)) {
       try {
@@ -135,6 +135,13 @@ export class SystemControl {
           return [id, this.workspace(workspace)];
         }));
         for (const node of this.nodes) if (!Object.hasOwn(this.identities, node.id) || !samePath(this.identities[node.id], node.workspace)) throw new Error('Instance identity mismatch');
+        const retired = saved.retiredParents ?? {};
+        if (!object(retired)) throw new Error('Invalid retired organization relationships');
+        for (const [id, parent] of Object.entries(retired)) {
+          if (!Object.hasOwn(this.identities, id) || this.nodes.some(node => node.id === id) || id === 'root'
+            || typeof parent !== 'string' || !idPattern.test(parent)) throw new Error('Invalid retired organization relationship');
+          this.retiredParents[id] = parent;
+        }
       } catch (cause) { throw new SystemControlError(500, '已保存的系统配置无效，原文件已保留，请检查服务日志', { cause }); }
     }
     try { this.capabilities = new CapabilityApplications(this, capabilityApplications); }
@@ -144,8 +151,12 @@ export class SystemControl {
     this.initialization = this.capabilities.recover().catch(error => { this.initializationError = error; });
   }
   commitConfiguration({ revision, nodes, identities, capabilityApplications = this.capabilities.records }) {
-    atomicConfig(this.file, { version: 1, revision, nodes, identities, capabilityApplications });
-    this.nodes = nodes; this.identities = identities; this.revision = revision;
+    const retiredParents = { ...this.retiredParents }, present = new Set(nodes.map(node => node.id));
+    for (const node of this.nodes ?? []) if (!present.has(node.id)) retiredParents[node.id] = node.parent;
+    for (const id of present) delete retiredParents[id];
+    atomicConfig(this.file, { version: 1, revision, nodes, identities, capabilityApplications,
+      ...(Object.keys(retiredParents).length ? { retiredParents } : {}) });
+    this.nodes = nodes; this.identities = identities; this.revision = revision; this.retiredParents = retiredParents;
   }
   async capabilityOperation(work) {
     try { return await work(); }
@@ -445,12 +456,18 @@ export class SystemControl {
     this.saving = true;
     try {
       const nodes = this.normalizeNodes(proposed), identities = { ...this.identities }, changes = this.nodeChanges(nodes);
-      // Moving a saved organization needs its own admission decision; a full form save cannot bypass it.
-      if (changes.some(({ node, previous }) => previous && node.parent !== previous.parent)) {
-        throw new SystemControlError(409, '当前不支持通过普通保存更换已有组织的上级');
+      const moving = changes.filter(({ node, previous }) => previous && node.parent !== previous.parent);
+      // Only the explicit current-organization update can enter the move admission boundary.
+      if (moving.length && (!input.update || moving.length !== 1 || moving[0].node.id !== input.update.id)) {
+        throw new SystemControlError(409, '更换已有组织的上级请在该组织的信息中保存，等待旧工单结束后再移动');
+      }
+      if (moving.length && changes.some(change => change.keys.some(key => ![...metadataKeys, 'parent'].includes(key)))) {
+        throw new SystemControlError(400, '移动组织时请单独保存上级与组织信息，模型及执行配置另行保存');
       }
       const scoped = this.nodes?.length === nodes.length && changes.every(change => change.previous && change.keys.every(key => scopedKeys.has(key)));
       for (const node of nodes) {
+        if (Object.hasOwn(identities, node.id) && !this.nodes?.some(current => current.id === node.id)
+          && this.retiredParents[node.id] !== node.parent) throw new SystemControlError(409, '已移除的组织必须先恢复到原上级，再等待旧工单结束后移动；不能借删除重加更换归属');
         const stateDir = this.stateDirectory(node.id), hasState = existsSync(stateDir) && readdirSync(stateDir).length > 0;
         if (!Object.hasOwn(identities, node.id) && hasState) throw new SystemControlError(409, '该实例的状态目录已有未登记数据，请检查原配置，不能自动接管');
         if (Object.hasOwn(identities, node.id) && !samePath(identities[node.id], node.workspace) && hasState) {
@@ -459,21 +476,28 @@ export class SystemControl {
         identities[node.id] = node.workspace;
       }
       // Select validation from the normalized difference, never a caller's claimed scope or read-only execution projection.
-      if (scoped) await this.checkChangedModels(changes);
+      if (scoped || moving.length) await this.checkChangedModels(changes);
       else for (const change of changes) if (change.keys.length) await this.checkExecution(change.node);
       this.assertRevision(input.revision);
       const runtime = this.runtimeConfig(nodes);
       this.capabilities.assertUnrelated(this.manager.affectedInstances(runtime));
       const revision = this.revision + 1;
       const persist = () => this.commitConfiguration({ revision, nodes, identities });
-      if (scoped) this.manager.reconfigureScoped(runtime, { persist });
+      if (moving.length) {
+        const inspect = new Set(moving.map(change => change.node.id));
+        for (let count = -1; count !== inspect.size;) {
+          count = inspect.size;
+          for (const node of this.nodes) if (inspect.has(node.parent)) inspect.add(node.id);
+        }
+        await this.manager.reconfigureTopology(runtime, { persist, inspectIds: [...inspect] });
+      } else if (scoped) this.manager.reconfigureScoped(runtime, { persist });
       else await this.manager.reconfigureManaged(runtime, { persist });
       this.nodes = nodes; this.identities = identities; this.revision = revision;
       if (Object.hasOwn(input, 'update')) {
         // This response acknowledges the atomic commit; it must not wait for unrelated management or capability reads.
         return { ...await this.get({ view: 'topology' }), view: 'configuration',
           saved: { instanceId: input.update.id, fields: changes.find(change => change.node.id === input.update.id).keys,
-            effect: 'next-start' } };
+            effect: moving.length ? 'immediate' : 'next-start' } };
       }
       return this.get();
     } catch (error) {
