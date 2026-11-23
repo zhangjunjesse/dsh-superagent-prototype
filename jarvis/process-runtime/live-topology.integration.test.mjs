@@ -4,7 +4,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } f
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SystemControl } from './control.mjs';
-import { controlledNativeFactory } from './controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
 
 const model = { provider: 'controlled-test-only', model: 'live-topology-test' };
 const existingGoal = 'Keep the existing local task executing until its original completion signal.';
@@ -43,15 +43,11 @@ function fixture({ delegationSource = 'root' } = {}) {
     if (policy.role === 'orchestrator') {
       if (input.kind === 'result_review') {
         assert.equal(config.instanceId, delegationSource);
-        const original = await tool('orchestrator_read', { resource: input.original_request, offset: 0 });
-        assert.equal(original.text, delegatedGoal);
-        const review = JSON.parse((await tool('orchestrator_read', { resource: input.read, offset: 0, limit: 8000 })).text);
-        assert.equal(review.evidenceRef, input.evidence_ref);
-        const [marker, evidence] = review.summary.split('\n\n');
-        assert.equal(marker, 'NEW_RESEARCH_MARKER');
-        assert.equal(JSON.parse(evidence).producer.instanceId, 'research');
-        await tool('orchestrator_result_review', { ticket_id: input.ticket_id, assignment_id: input.assignment_id,
-          review_id: input.review_id, decision: { kind: 'accept', summary: marker } });
+        await reviewDelegatedResult(tool, input, ({ original, summary, producer }) => {
+          assert.equal(original, delegatedGoal);
+          assert.equal(summary, 'NEW_RESEARCH_MARKER');
+          assert.equal(producer.instanceId, 'research');
+        });
         return;
       }
       if (input.kind !== 'candidate') return;

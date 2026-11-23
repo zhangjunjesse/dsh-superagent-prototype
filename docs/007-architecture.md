@@ -464,6 +464,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/process-delegation.spec.ts` | Parent and child runtime flow, isolated child brain, tool intersection, fixed bindings, followups, questions, stops, local capacity and restart without replay |
 | `tests/process-delegation-races.spec.ts` | Late input and rejected-control completion fences, stop during missing-query, transport failure visibility and recovery |
 | `tests/process-result-review.spec.ts` | Original native main Session judges a partial repair, continues local or child validation, checks the actual file revision, retains evidence and accepts before the original Channel receives a result |
+| `tests/process-multilevel-delegation.spec.ts` | Two-hop admission with ancestor authority, leaf execution, management review and restart without duplicate delivery |
+| `tests/process-topology.spec.ts` | Idle and busy organization moves, frozen admission and restart with the committed parent |
 | `tests/result-review-recovery.spec.ts` | Real SQLite/Effects resume one pending review and one immutable continuation; followed-thread close cannot bypass parent acceptance |
 | `tests/process-live-routing.spec.ts` | Live child discovery, readiness at selection and admission, and continuity of existing assignments |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
