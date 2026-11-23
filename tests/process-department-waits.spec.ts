@@ -60,10 +60,17 @@ it('holds the original newly accepted task once without launching a local Worker
   expect(native.errors).toEqual([])
 }, 10000)
 
-it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatically resumes only after matching real responsibility, recovering %s without user input', async mode => {
+for (const mode of ['cleanup-failure', 'offline', 'interrupted-ready'] as const) {
+  // The interrupted case reopens two complete owners, before and during the matching turn.
+  it(`reopens a wait and automatically resumes only after matching real responsibility, recovering ${mode} without user input`,
+    () => recoverDepartment(mode), mode === 'interrupted-ready' ? 30000 : 16000)
+}
+async function recoverDepartment(mode: 'cleanup-failure' | 'offline' | 'interrupted-ready') {
   const config = configuration('root'), nodes = new Map<string, ProcessRuntime>(), catalogs: NonNullable<ProcessRuntimeConfig['delegationTargets']> = []
   const nativeErrors: unknown[][] = [], submitted: string[] = [], workerCalls: string[] = [], readyCards: NativeTurn[] = []
   let failCleanup = false, failedResume = false, completedResumes = 0, observedOffline = false
+  const interruptedTurn = Promise.withResolvers<void>()
+  let deferredAttempt = ''
   let root: ProcessRuntime
   function open(input: ProcessRuntimeConfig) {
     const host: ProcessHost = { run: async request => {
@@ -98,7 +105,15 @@ it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatical
           await expect(turn.tool('orchestrator_department_resume', { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
             target_instance_id: 'read-only', summary: 'Read-only is missing a necessary permission.' })).rejects.toThrow('required')
           const target = card.execution_targets.find((item: { description: string }) => item.description === requirement.responsibility)
-          if (!target) { if (failedResume) observedOffline = true; return } // Same display name does not satisfy the responsibility.
+          if (!target) {
+            if (mode === 'interrupted-ready') {
+              await turn.tool('orchestrator_department_defer', { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
+                ready_attempt_id: card.ready_attempt_id, summary: 'The ready department archives personnel records and cannot certify this repair.' })
+              deferredAttempt = card.ready_attempt_id
+            }
+            if (failedResume) observedOffline = true
+            return
+          }
           const args = { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id, target_instance_id: target.instanceId,
             summary: 'The actual ready direct department is responsible for independent measurement and certification.' }
           if (!failedResume) {
@@ -106,12 +121,18 @@ it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatical
             if (mode === 'cleanup-failure') {
               failCleanup = true
               await expect(turn.tool('orchestrator_department_resume', args)).rejects.toThrow('transient native cleanup failure')
+            } else if (mode === 'interrupted-ready') {
+              await interruptedTurn.promise // The owner closes after the ready card is consumed but before a decision or cleanup.
             } else {
               const child = nodes.get('certifier')!; await child.close(); owners.splice(owners.indexOf(child), 1); nodes.delete('certifier')
               await expect(turn.tool('orchestrator_department_resume', args)).rejects.toThrow('required')
             }
             return // There is no user message or manual tool retry; the durable owner must drive the next attempt.
           }
+          if (mode === 'interrupted-ready') await expect(turn.tool('orchestrator_department_defer', {
+            ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
+            ready_attempt_id: deferredAttempt, summary: 'Late decision about the previous candidate.'
+          })).rejects.toThrow('current')
           await turn.tool('orchestrator_department_resume', args)
           await turn.tool('orchestrator_department_resume', args)
           completedResumes++
@@ -124,7 +145,7 @@ it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatical
       expect(input.instanceId).toBe('certifier')
       writeFileSync(join(turn.policy.cwd, 'certificate.txt'), 'tested_version=marker-v1\npassed=true\n')
       await turn.tool('orchestrator_report', { state: 'ready', summary: 'Validation passed for marker-v1.', artifacts: [{ path: 'certificate.txt', title: 'Versioned certificate' }] })
-    })
+    }, { cancel: () => { if (failedResume) interruptedTurn.resolve() } })
     native.native.executor.stopBackground = async () => { if (failCleanup) { failCleanup = false; throw new Error('transient native cleanup failure') } }
     nativeErrors.push(native.errors)
     const owner = createProcessRuntime(input, host, { native: native.native }); owners.push(owner); nodes.set(input.instanceId, owner)
@@ -134,8 +155,11 @@ it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatical
   await root.chat({ id: 'original', text: 'Repair and independently certify the exact delivered marker version.' })
   await vi.waitFor(async () => expect((await root.feedback()).items.filter(event => event.kind === 'message')).toHaveLength(1), { timeout: 4000 })
   const original = (await root.state()).tickets[0]!, oldConversation = (await root.conversation()).turns
-  await root.close(); owners.splice(owners.indexOf(root), 1); nodes.delete('root')
-  root = open(structuredClone(config)); await root.ready
+  async function reopenRoot() {
+    await root.close(); owners.splice(owners.indexOf(root), 1); nodes.delete('root')
+    root = open(structuredClone(config)); await root.ready
+  }
+  if (mode !== 'interrupted-ready') await reopenRoot()
   expect((await root.state()).tickets[0]!.id).toBe(original.id)
   expect((await root.feedback()).items.filter(event => event.kind === 'message')).toHaveLength(1)
   function configureChild(id: string, tools: string[], description: string, start: boolean) {
@@ -151,9 +175,18 @@ it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatical
   expect(submitted).toEqual([]); expect(workerCalls).toEqual([])
   expect((await root.state()).tickets[0]!.assignments).toHaveLength(1)
   const unmatchedTurns = readyCards.length
+  if (mode === 'interrupted-ready') {
+    await vi.waitFor(() => expect(deferredAttempt).not.toBe(''))
+    await reopenRoot()
+  }
   for (let attempt = 0; attempt < 3; attempt++) await root.gatewayRequest({ operation: 'query', input: { operation: 'search' } })
   expect(readyCards).toHaveLength(unmatchedTurns)
   open(certifier)
+  if (mode === 'interrupted-ready') {
+    await vi.waitFor(() => expect(failedResume).toBe(true), { timeout: 3000 })
+    expect(submitted).toEqual([])
+    await reopenRoot()
+  }
   if (mode === 'offline') {
     await vi.waitFor(() => expect(observedOffline).toBe(true), { timeout: 3000 })
     expect(submitted).toEqual([])
@@ -171,7 +204,7 @@ it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatical
   expect((await root.feedback()).items.filter(event => event.kind === 'message')).toHaveLength(1)
   expect((await root.conversation()).turns).toEqual(oldConversation)
   expect(nativeErrors.flat()).toEqual([])
-}, 16000)
+}
 
 it('forwards a partial-result department wait up the immutable delegation path and recovers it without a user resend', async () => {
   const configs = { group: configuration('group'), division: configuration('division'), lab: configuration('lab') }

@@ -250,6 +250,7 @@ export class OriginalProcess {
         waitForDepartment: (ticketId, requirement, summary) => this.departments.stage(ticketId, requirement, summary),
         reportMissingDepartment: (ticketId, requirement, summary) => this.departments.stage(ticketId, requirement, summary),
         holdForDepartment: (ticketId, assignmentId, reviewId, requirement, summary) => this.departments.hold(ticketId, assignmentId, reviewId, requirement, summary),
+        deferDepartment: (ticketId, assignmentId, reviewId, attemptId, reason) => this.departments.defer(ticketId, assignmentId, reviewId, attemptId, reason),
         resumeDepartment: async (ticketId, assignmentId, reviewId, target, summary) => {
           const committed = runtime!.store.tickets.get(ticketId)?.assignments.find(item => item.id === assignmentId)?.resultReviews?.find(item => item.id === reviewId)?.decision
           if (committed) return this.departments.resume(ticketId, assignmentId, reviewId, target, summary)
@@ -289,7 +290,8 @@ export class OriginalProcess {
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
         () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound,
         ticket => this.handoffArtifacts(ticket), () => this.refreshDelegationCatalog())
-      this.departments = new DepartmentWaits(config, runtime.store, runtime.engine, runtime.sessions)
+      this.departments = new DepartmentWaits(config, runtime.store, runtime.engine, runtime.sessions,
+        id => !runtime!.effects.pending('relay', id) && options.native.sessions.current(runtime!.masterId)?.status !== 'running')
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
       this.retries = new ExplicitRetries({ store: runtime.store, effects: runtime.effects, engine: runtime.engine,

@@ -91,6 +91,7 @@ export interface RuntimeOptions {
   prepareHandoff?(ticket: Ticket, assignment: Assignment): Promise<unknown[]>
   waitForDepartment?: MainToolsHost['waitForDepartment']
   holdForDepartment?: MainToolsHost['holdForDepartment']
+  deferDepartment?: MainToolsHost['deferDepartment']
   resumeDepartment?: MainToolsHost['resumeDepartment']
   reportMissingDepartment?: ExecutorToolsHost['reportMissingDepartment']
   /** Runs after Store/composition is established, before initialize resolves setup. */
@@ -241,7 +242,7 @@ export class Runtime extends Service implements SourceHost {
         prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select, prepareReview: options.routing?.prepareReview,
         reportArtifacts: options.reportArtifacts,
         waitForDepartment: options.waitForDepartment,
-        holdForDepartment: options.holdForDepartment, resumeDepartment: options.resumeDepartment,
+        holdForDepartment: options.holdForDepartment, deferDepartment: options.deferDepartment, resumeDepartment: options.resumeDepartment,
         reportMissingDepartment: options.reportMissingDepartment,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),

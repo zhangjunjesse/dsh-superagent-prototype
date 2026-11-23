@@ -39,6 +39,7 @@ export interface MainToolsHost {
   prepareReview?(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void>
   waitForDepartment?(ticketId: string, requirement: DepartmentRequirement, summary: string): unknown
   holdForDepartment?(ticketId: string, assignmentId: string, reviewId: string, requirement: DepartmentRequirement, summary: string): unknown
+  deferDepartment?(ticketId: string, assignmentId: string, reviewId: string, attemptId: string, reason: string): unknown
   resumeDepartment?(ticketId: string, assignmentId: string, reviewId: string, target: string, summary: string): Promise<unknown>
 }
 /** Schedules an Engine pass to execute the recorded routing decision and formats the tool response. */
@@ -185,11 +186,18 @@ export function mainTools(host: MainToolsHost, agent: Pick<Agent, 'id'>): Tool[]
     routeTool(host),
     ...host.holdForDepartment ? [tool({
       name: 'orchestrator_department_wait',
-      description: 'Keep an original result review unaccepted because remaining authorized work requires a missing direct department. State its responsibility, every necessary tool and the remaining instructions. The original work, results and version evidence stay linked. Creating/configuring/starting the department will trigger automatic re-evaluation; no further user message is needed.',
+      description: 'Wait for a missing department with its responsibility, required tools and remaining instructions. A changed catalog is reconsidered automatically.',
       schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
         summary: z.string().trim().min(1).max(20000), ...DepartmentRequirementSchema.shape }).strict(),
       execute: async args => host.store.atomic(() => host.holdForDepartment!(args.ticket_id, args.assignment_id, args.review_id,
         { responsibility: args.responsibility, required_tools: args.required_tools, instructions: args.instructions }, args.summary)),
+    })] : [],
+    ...host.deferDepartment ? [tool({
+      name: 'orchestrator_department_defer',
+      description: 'Keep waiting after checking a department_ready card whose candidates cannot do the work. Record why for this exact attempt.',
+      schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
+        ready_attempt_id: z.string().min(1), summary: z.string().trim().min(1).max(20000) }).strict(),
+      execute: async args => host.store.atomic(() => host.deferDepartment!(args.ticket_id, args.assignment_id, args.review_id, args.ready_attempt_id, args.summary)),
     })] : [],
     ...host.resumeDepartment ? [tool({
       name: 'orchestrator_department_resume',

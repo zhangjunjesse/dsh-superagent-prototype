@@ -1,4 +1,5 @@
 /** Durable coordination on an original unresolved result review, not a second task lifecycle. */
+import { randomUUID } from 'node:crypto'
 import { key, latestAssignment, liveTicket, type Assignment, type ResultReviewDecision, type Ticket } from '../core/index.ts'
 import type { Engine } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
@@ -8,13 +9,17 @@ import { DepartmentRequirementSchema, type DepartmentRequirement } from '../app/
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
 import type { Capability, DepartmentWait } from './delegation-contract.ts'
 const waits = family<DepartmentWait, [string]>('process-department:wait:')
-interface ReadyCycle { signature: string; generation: number; targets: string[]; retryAt?: number; failures?: number }
+interface ReadyCycle {
+  signature: string; generation: number; targets: string[]; owner?: string; decideBy?: number; deferredReason?: string; retryAt?: number; failures?: number
+}
 const readyCycles = family<ReadyCycle, [string]>('process-department:readiness:')
+const readyAttempt = (waitId: string, cycle: ReadyCycle) => key('department-ready', waitId, String(cycle.generation), cycle.signature)
 
 /** A wait belongs to the exact task and assignment that discovered it; only its original owner can resume it. */
 export class DepartmentWaits {
+  private readonly owner = randomUUID()
   constructor(private config: { instanceId: string; organizationName: string }, private store: Store, private engine: Engine,
-    private sessions: Pick<Sessions, 'relay'>) {}
+    private sessions: Pick<Sessions, 'relay'>, private canReoffer: (requestId: string) => boolean = () => true) {}
 
   private current(wait: DepartmentWait): Ticket | undefined {
     const ticket = this.store.tickets.get(wait.ticketId), assignment = ticket && latestAssignment(ticket)
@@ -80,21 +85,37 @@ export class DepartmentWaits {
       // Later inputs and policy changes demand a new review CAS, while the original wait/notice identity stays fixed.
       const review = targets.length ? this.engine.stageResultReview(ticket.id, assignment.id, original.evidenceRef, original.summary) : original
       const signature = fingerprint([review.id, targets]), previous = this.store.get(readyCycles(wait.id))
-      if (previous?.signature === signature && (!previous.retryAt || previous.retryAt > Date.now())) return
-      const cycle: ReadyCycle = { signature, generation: (previous?.generation ?? 0) + 1, targets: targets.map(target => target.instanceId),
+      const now = Date.now()
+      if (previous?.signature === signature) {
+        if (!targets.length || previous.deferredReason) return
+        // A delivered card may have been interrupted before a decision. Preserve pending delivery and active reasoning.
+        const retryAt = previous.retryAt ?? (previous.owner === this.owner ? previous.decideBy : undefined)
+        if ((retryAt ?? 0) > now || !this.canReoffer(readyAttempt(wait.id, previous))) return
+      }
+      const cycle: ReadyCycle = { signature, generation: (previous?.generation ?? 0) + 1, owner: this.owner,
+        decideBy: now + 60_000, targets: targets.map(target => target.instanceId),
         ...(previous?.signature === signature && previous.failures ? { failures: previous.failures } : {}) }
       this.store.set(readyCycles(wait.id), cycle)
       if (!targets.length) return
-      const identity = key('department-ready', wait.id, String(cycle.generation), signature)
+      const identity = readyAttempt(wait.id, cycle)
       this.sessions.relay(identity, JSON.stringify({ kind: 'department_ready', ticket_id: ticket.id, assignment_id: assignment.id,
-        review_id: review.id, wait_id: wait.id, original_request: ticket.mandate.basis.via === 'delegation'
+        review_id: review.id, wait_id: wait.id, ready_attempt_id: identity, original_request: ticket.mandate.basis.via === 'delegation'
           ? `delegation/${ticket.origin.triggerId}/source` : `trigger/${ticket.origin.triggerId}`,
         original_assignment: `ticket/${ticket.id}/assignment`, inputs: `ticket/${ticket.id}/inputs`,
         history: `ticket/${ticket.id}/assignments`, read: `ticket/${ticket.id}/review/${review.id}`,
         missing_department: { responsibility: wait.responsibility, required_tools: wait.requiredTools, instructions: wait.instructions },
         execution_targets: targets,
-        instruction: 'Read the original goal, all inputs, prior versioned evidence and missing responsibility. Judge the actual configured responsibilities semantically; identical names or a partial tool overlap are insufficient. If a ready direct department meets the responsibility, use orchestrator_department_resume with that instance id and your judgement. Otherwise leave this task waiting. This is continuation of the original mandate, never new user authorization; do not ask the user to send another message.' }))
+        instruction: 'Read the original goal, inputs, evidence and configured responsibilities. Use orchestrator_department_resume for a qualified ready department. If none qualifies, record why with orchestrator_department_defer and the ready_attempt_id from this card. Continue the original mandate without a new user message.' }))
     })
+  }
+  /** A completed negative decision applies only to the exact review and set of candidates the main Session read. */
+  defer(ticketId: string, assignmentId: string, reviewId: string, attemptId: string, reason: string): DepartmentWait {
+    const wait = this.forTicket(ticketId).find(item => item.assignmentId === assignmentId)
+    const ticket = wait && this.current(wait), cycle = wait && this.store.get(readyCycles(wait.id))
+    if (!wait || !ticket || latestAssignment(ticket)?.resultReviews?.at(-1)?.id !== reviewId
+      || !cycle?.targets.length || readyAttempt(wait.id, cycle) !== attemptId) throw new Error('This readiness decision is no longer current')
+    this.store.set(readyCycles(wait.id), { ...cycle, deferredReason: reason, retryAt: undefined })
+    return wait
   }
   /** Reject a no-longer-ready or incomplete candidate before attempting any old-execution cleanup. */
   validateResume(ticketId: string, assignmentId: string, reviewId: string, target: string, targets: readonly Capability[]): void {

@@ -132,15 +132,16 @@ test('export acceptance uses the original group conversation and installed DSH t
         assert.equal(instanceId, 'management');
         const resources = [input.read, input.original_request, input.original_assignment, input.inputs, input.history];
         if (step < resources.length) return yield* invoke('orchestrator_read', { resource: resources[step], offset: 0, limit: 8000 });
+        const client = input.execution_targets.find(target => target.organizationName === '客户端组' && target.description.includes('浏览器界面验收'));
         if (step === resources.length) {
-          const client = input.execution_targets.find(target => target.organizationName === '客户端组' && target.description.includes('浏览器界面验收'));
-          if (!client) return yield* reply('现有研发部虽有部分工具，但职责不承担客户端界面验收；原工单继续等待客户端组。');
+          if (!client) return yield* invoke('orchestrator_department_defer', { ticket_id: input.ticket_id, assignment_id: input.assignment_id,
+            review_id: input.review_id, ready_attempt_id: input.ready_attempt_id, summary: '研发部的职责不包括客户端界面验收。' });
           assert.ok(clientTools.every(name => client.tools.includes(name)));
           return yield* invoke('orchestrator_department_resume', { ticket_id: input.ticket_id, assignment_id: input.assignment_id,
             review_id: input.review_id, target_instance_id: client.instanceId,
             summary: '客户端组职责和读取文件、PowerShell 权限满足剩余界面验收；让其核验同一修复版本的两条真实导出记录。' });
         }
-        return yield* reply('原工单已自动续派给就绪的客户端组。');
+        return yield* reply(client ? '原工单已自动续派给就绪的客户端组。' : '原工单继续等待具备界面验收职责的客户端组。');
       }
       if (input.kind === 'result_review') {
         const resources = [input.read, input.original_request, input.original_assignment, input.inputs, input.history];
