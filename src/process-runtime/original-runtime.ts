@@ -150,6 +150,7 @@ export class OriginalProcess {
           select: (id, target) => this.delegated.select(id, target),
         },
         executor: local => ({
+          requestCancellation: ticket => this.delegated.requestCancellation(ticket.id),
           start: (ticket, assignment) => this.delegated.remote(ticket) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
           stop: (ticket, assignment, reason) => {

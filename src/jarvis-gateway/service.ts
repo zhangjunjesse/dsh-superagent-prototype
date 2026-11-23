@@ -63,7 +63,7 @@ export class GatewayService {
         && ticket.ended?.outcome === 'completed' && ticket.ended.by !== 'human' && !resumesCompleted) {
         return { status: 'unsupported', reason: '这个已完成的下级任务暂不支持原任务续改；未提交新任务，请先明确新的交办要求。' }
       }
-      if (!ticket || ticket.decisionId !== target.decisionId || (ticket.ended && input.operation !== 'stop' && !resumesCompleted)) {
+      if (!ticket || ticket.decisionId !== target.decisionId || ((ticket.ended || ticket.cancellation) && input.operation !== 'stop' && !resumesCompleted)) {
         return { status: 'conflict', reason: '任务已结束或授权关联改变，请重新查询。' }
       }
       if (questionId && (ticket.attention?.id !== questionId || ticket.attention?.answeredBy)) return { status: 'conflict', reason: '原问题已不再等待回答。' }
@@ -116,7 +116,7 @@ export class GatewayService {
     this.ledger.target(target)
     const assignment = latestAssignment(ticket)
     // DSH validates the returned value before JSON rendering; absent fields must not contain undefined.
-    return { ...head, status: ticket.ended?.outcome ?? ticketStage(ticket), updatedAt: ticket.updatedAt, canSubmit: !ticket.ended,
+    return { ...head, status: ticket.ended?.outcome ?? (ticket.cancellation ? 'cancelling' : ticketStage(ticket)), updatedAt: ticket.updatedAt, canSubmit: !ticket.ended && !ticket.cancellation,
       ...(this.canResume(ticket) ? { canSubmit:true } : {}),
       targetToken: target.token, ...(!ticket.ended && ticket.attention && !ticket.attention.answeredBy
         ? { question: { id: ticket.attention.id, text: boundedText(ticket.attention.question) } } : {}),

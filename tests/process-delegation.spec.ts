@@ -226,6 +226,23 @@ describe('single-hop SuperJarvis delegation', () => {
     expect((await h.nodes.parent.state()).tickets[0]?.ended?.outcome).toBe('stopped')
   }, 10000) // The cancellation must cross both original owner runtimes and return a real stopped snapshot.
 
+  it('keeps the group cancellation pending until the bound native owner confirms cleanup', async () => {
+    const h = pair({ holdWorker: true }), port = h.nativePorts.child.executor;
+    await h.nodes.parent.chat({ id: 'cancel-group', text: 'Read the fixed delegated marker.' })
+    await h.until(() => [...h.waits.keys()].some(key => key.startsWith('worker:')))
+    const original = port.runningJobs
+    port.runningJobs = async () => [{ id: 'draining', name: 'Finishing this assignment' }]
+    try {
+      await h.control('stop')
+      const waiting = await h.until(state => state.delegations.outgoing[0]?.stopped === true)
+      expect(waiting.tickets[0]?.ended).toBeUndefined()
+      expect('items' in waiting.works && waiting.works.items?.[0]).toMatchObject({ status: 'cancelling', canSubmit: false })
+      expect(waiting.delegations.outgoing[0]?.finished).not.toBe(true)
+    } finally { port.runningJobs = original }
+    const settled = await h.until(state => state.tickets[0]?.ended?.outcome === 'stopped')
+    expect(settled.delegations.outgoing[0]?.snapshot?.executionStopped).toBe(true)
+  }, 15000)
+
   it('keeps foreground conversation and state available while a child IPC query is pending', async () => {
     const h = pair({ holdQuery: true })
     try {

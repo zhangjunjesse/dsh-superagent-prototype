@@ -42,6 +42,7 @@ const assignmentView = assignment => assignment ? { id: assignment.id, state: as
   startedAt: time(assignment.startedAt), endedAt: time(assignment.endedAt) } : null;
 function recordedState(ticket) {
   const stage = ticketStage(ticket);
+  if (ticket.cancellation) return { status: ticket.ended ? 'stopped' : 'waiting', statusLabel: ticket.ended ? '已取消' : '正在取消，等待确认', stage };
   if (ticket.ended) {
     const outcome = ticket.ended.outcome;
     return { status: ['completed', 'merged'].includes(outcome) ? 'completed' : 'stopped',
@@ -179,16 +180,16 @@ class TaskRead {
       if (candidate && authority?.delegationId === request.delegationId && authority.parentInstanceId === source.id
         && authority.parentTicketId === ticket.id && authority.parentAssignmentId === assignment.id && authority.parentDecisionId === ticket.decisionId) {
         executionTicket = candidate; progress = this.report(candidate, child) ?? progress;
-        if (!ticket.ended) state = candidate.ended
+        if (!ticket.ended && !ticket.cancellation) state = candidate.ended
           ? this.fresh(source, { status: 'waiting', statusLabel: '执行方已结束，等待任务汇总', stage: state.stage })
           : this.fresh(child, recordedState(candidate), Boolean(candidate.ended));
-      } else if (!ticket.ended && valid) {
+      } else if (!ticket.ended && !ticket.cancellation && valid) {
         const settled = ['completed', 'stopped'].includes(snapshot.status);
         const status = settled ? 'waiting' : snapshot.status === 'pending' ? 'routing' : snapshot.status === 'missing' ? 'unknown' : snapshot.status;
         state = this.fresh({ ...child, core: null }, { status: labels[status] ? status : 'unknown',
           statusLabel: settled ? '执行方已结束，等待任务汇总' : labels[status] ?? labels.unknown, stage: state.stage });
         if (snapshot.summary) progress = { summary: text(snapshot.summary), at: null, source: 'delegation-snapshot', organizationId: target };
-      } else if (!ticket.ended) {
+      } else if (!ticket.ended && !ticket.cancellation) {
         const status = snapshot ? 'unknown' : 'routing';
         state = this.fresh(source, { status, statusLabel: labels[status], stage: state.stage });
       }
