@@ -33,6 +33,19 @@
   const emptyDraft = () => ({ version: 1, nodes: [
     { id: 'root', parent: null, kind: 'root', name: 'SuperJarvis', description: '', capabilities: '', mode: 'local', concurrency: 3, model: 'follow', workspace: '', endpoint: '', credential: '', scope: '', recovery: false, autostart: false },
   ] });
+  function hasParentCycle(nodes) {
+    const parents = new Map(nodes.map(n => [n?.id, n?.parent]));
+    for (const id of parents.keys()) {
+      const visited = new Set([id]);
+      let parent = parents.get(id);
+      while (parent) {
+        if (visited.has(parent)) return true;
+        visited.add(parent);
+        parent = parents.get(parent);
+      }
+    }
+    return false;
+  }
   function load() {
     try {
       const value = JSON.parse(sessionStorage.getItem(STORAGE));
@@ -41,10 +54,7 @@
       if (value.nodes.filter(n => n.kind !== 'worker').length > 60 || value.nodes.filter(n => n.kind === 'worker').length > 59) return emptyDraft();
       const ids = new Set(value.nodes.map(n => n.id));
       if (ids.size !== value.nodes.length || value.nodes.some(n => n.id !== 'root' && !ids.has(n.parent))) return emptyDraft();
-      for (const n of value.nodes) {
-        const visited = new Set([n.id]); let parent = n.parent;
-        while (parent) { if (visited.has(parent)) return emptyDraft(); visited.add(parent); parent = value.nodes.find(item => item.id === parent)?.parent; }
-      }
+      if (hasParentCycle(value.nodes)) return emptyDraft();
       return value;
     } catch { return emptyDraft(); }
   }
@@ -95,7 +105,6 @@
     else openTopologyEditor(id,tab);
   }
   const rootId = () => service.snapshot?.rootId || 'root';
-  const canAddInstance = () => !connected() || currentInstanceId === rootId();
   const visible = () => !page.hidden && !document.getElementById('settings-page')?.hidden && !containingFrame?.hidden && document.visibilityState !== 'hidden';
   const runtimeOf = id => service.snapshot?.runtime?.instances?.find(item => item.instanceId === id);
   const phaseName = phase => ({ ready:'运行中', running:'运行中', starting:'启动中', stopping:'停止中', stopped:'已停止', failed:'启动失败', exited:'已退出', created:'未启动' }[phase] || phase || '未启动');
@@ -293,16 +302,16 @@
   const directInstances = () => children(currentInstanceId).filter(n => n.kind === 'instance');
   const matchesSearch = n => `${n.name} ${n.description} ${n.capabilities}`.toLowerCase().includes(search.toLowerCase());
   function childCards(items) {
-    if (!items.length) return `<div class="empty-state">${icon(search ? 'search' : 'layers')}<h2>${search ? '本层没有匹配的实例' : '还没有下级实例'}</h2><p>${search ? '试试其他名称或能力。' : canAddInstance()?'在这里为当前实例添加下级 SuperJarvis。':'当前支持根实例向直属下级委派。'}</p></div>`;
+    if (!items.length) return `<div class="empty-state">${icon(search ? 'search' : 'layers')}<h2>${search ? '本层没有匹配的实例' : '还没有下级实例'}</h2><p>${search ? '试试其他名称或能力。' : '在这里为当前实例添加下级 SuperJarvis。'}</p></div>`;
     return `<div class="child-list">${items.map(n => `<article class="child-row" data-instance-id="${escape(n.id)}">${tile(n)}<div class="row-main"><h3>${escape(n.name)}</h3><p>${escape(n.description)}</p></div><span class="child-count">${children(n.id).filter(child => child.kind === 'instance').length} 个下级实例</span>${pill(n)}${button('进入实例','enter-instance',n.id,'quiet','arrow')}</article>`).join('')}</div>`;
   }
   function childrenSection() {
-    return `<section class="children-section" aria-label="下级实例"><div class="section-title"><div><h2>下级实例 <span class="section-count">${directInstances().length}</span></h2><p>${canAddInstance()?`直属于 ${escape(nameOf(currentInstanceId))}`:'当前支持根实例向直属下级委派'}</p></div>${canAddInstance()?button('添加下级实例','add-instance','','secondary','plus'):''}</div><div id="instance-list">${childCards(directInstances())}</div></section>`;
+    return `<section class="children-section" aria-label="下级实例"><div class="section-title"><div><h2>下级实例 <span class="section-count">${directInstances().length}</span></h2><p>直属于 ${escape(nameOf(currentInstanceId))}</p></div>${button('添加下级实例','add-instance','','secondary','plus')}</div><div id="instance-list">${childCards(directInstances())}</div></section>`;
   }
   function renderOverview() {
     topologyObserver?.disconnect();
     const n = node(currentInstanceId);
-    main.innerHTML = `<section class="topology-workspace" aria-label="实例与 Worker 拓扑"><header class="topology-commandbar" data-current-instance="${escape(n.id)}"><div class="topology-context">${breadcrumb()}<h1 id="composition-title" class="sr-only" tabindex="-1">${escape(n.name)}</h1></div>${viewNavigation()}<div class="topology-command-actions">${button('实例配置','edit',n.id,'quiet','settings')}${canAddInstance()?button('添加 SuperJarvis','add-instance','','secondary','plus'):''}</div></header><div class="topology-canvas" id="topology-canvas" role="region" aria-label="执行拓扑画布" tabindex="0"><div class="topology-tree" id="topology-tree" style="zoom:${topologyZoom}"><svg class="topology-links" aria-hidden="true"></svg>${topologyBranch(n)}</div></div><div class="topology-legend"><span class="legend-brain">${icon('brain')}大脑</span><span class="legend-agent">${icon('bots')}普通 Worker</span><span class="legend-instance">${icon('portal')}虚拟入口 · SuperJarvis</span></div><div class="topology-controls">${button('全部展开','topology-expand','','quiet')}${button('收起下级','topology-collapse','','quiet')}<button type="button" class="btn quiet" data-action="topology-zoom-out" aria-label="缩小拓扑">−</button><output id="topology-zoom" aria-label="拓扑缩放比例">${Math.round(topologyZoom*100)}%</output><button type="button" class="btn quiet" data-action="topology-zoom-in" aria-label="放大拓扑">+</button>${button('100%','topology-reset','','quiet')}</div></section>`;
+    main.innerHTML = `<section class="topology-workspace" aria-label="实例与 Worker 拓扑"><header class="topology-commandbar" data-current-instance="${escape(n.id)}"><div class="topology-context">${breadcrumb()}<h1 id="composition-title" class="sr-only" tabindex="-1">${escape(n.name)}</h1></div>${viewNavigation()}<div class="topology-command-actions">${button('实例配置','edit',n.id,'quiet','settings')}${button('添加 SuperJarvis','add-instance','','secondary','plus')}</div></header><div class="topology-canvas" id="topology-canvas" role="region" aria-label="执行拓扑画布" tabindex="0"><div class="topology-tree" id="topology-tree" style="zoom:${topologyZoom}"><svg class="topology-links" aria-hidden="true"></svg>${topologyBranch(n)}</div></div><div class="topology-legend"><span class="legend-brain">${icon('brain')}大脑</span><span class="legend-agent">${icon('bots')}普通 Worker</span><span class="legend-instance">${icon('portal')}虚拟入口 · SuperJarvis</span></div><div class="topology-controls">${button('全部展开','topology-expand','','quiet')}${button('收起下级','topology-collapse','','quiet')}<button type="button" class="btn quiet" data-action="topology-zoom-out" aria-label="缩小拓扑">−</button><output id="topology-zoom" aria-label="拓扑缩放比例">${Math.round(topologyZoom*100)}%</output><button type="button" class="btn quiet" data-action="topology-zoom-in" aria-label="放大拓扑">+</button>${button('100%','topology-reset','','quiet')}</div></section>`;
     if (organizationMode() && service.snapshot?.configured) {
       for (const brain of main.querySelectorAll('[data-brain-id]')) {
         const id = brain.dataset.brainId;
@@ -711,12 +720,13 @@
       if (!n || !['root','instance'].includes(n.kind)) { problems.push(`${label}：不支持旧 Worker 组或未知节点类型。`); continue; }
       const unknown=Object.keys(n).filter(key=>!allowed.has(key));
       if (unknown.length) problems.push(`${label}：包含尚不支持的配置 ${unknown.join('、')}。`);
-      if (n.kind==='instance' && n.parent!==rootId()) problems.push(`${label}：仅支持根实例的直属下级。`);
+      if (n.kind==='instance' && !draft.nodes.some(parent => parent?.id === n.parent && ['root','instance'].includes(parent.kind))) problems.push(`${label}：上级组织不存在。`);
       if (!Number.isInteger(n.concurrency)||n.concurrency<1||n.concurrency>16) problems.push(`${label}：任务并发须为 1–16。`);
       if (!n.model || typeof n.model!=='object' || !n.model.provider || !n.model.model) problems.push(`${label}：需要明确的模型服务和模型。`);
       if (!Array.isArray(n.workerTools)||n.workerTools.some(tool=>!['read','glob','grep','read_image','write','edit','bash','pwsh','web_search','web_fetch'].includes(tool))) problems.push(`${label}：需要有效的 Worker 工具配置。`);
     }
-    if (!draft.nodes.some(n=>n.id===rootId()&&n.kind==='root')) problems.push('草稿缺少当前系统的根实例。');
+    if (!draft.nodes.some(n=>n?.id===rootId()&&n.kind==='root'&&n.parent===null)) problems.push('草稿缺少有效的根实例。');
+    if (hasParentCycle(draft.nodes)) problems.push('组织的上级关系形成循环。');
     return problems;
   }
   function renderDraftReview() {
@@ -743,7 +753,6 @@
     if (service.busy || settingsPending()) return;
     if (connected() && !editor) state={version:1,nodes:structuredClone(service.snapshot.nodes)};
     if (!node(id) || node(id).kind === 'worker') return;
-    if (isNew && connected() && id!==rootId()) { announce('当前仅支持添加根实例的直属下级。'); return; }
     if (editor?.dirty) {
       captureForm(); showLeaveRequest({ view: 'editor', id, isNew, tab }); return;
     }
@@ -944,10 +953,10 @@
     if (!n.name.trim()) return ['basic','请填写组织名称。','name'];
     if (n.name.trim().length>40) return ['basic','名称请控制在 40 个字符以内。','name'];
     if (!n.brainName.trim() || n.brainName.trim().length>40 || /[\u0000-\u001f\u007f]/.test(n.brainName)) return ['basic','请输入 1–40 个字符的大脑名称。','brainName'];
+    if (n.kind!=='root' && (!node(n.parent) || node(n.parent).kind==='worker' || ancestry(n.parent).some(item=>item.id===n.id))) return ['basic','请选择有效的上级，不能形成循环委派。','parent'];
     if (state.nodes.some(item=>item.kind!=='worker' && item.id!==n.id && item.parent===n.parent && item.name.trim()===n.name.trim())) return ['basic','同一上级下已存在这个名称，请使用不同名称。','name'];
     if (connected()) {
       if (!Number.isInteger(n.concurrency)||n.concurrency<1||n.concurrency>16) return ['access','任务并发上限应为 1–16 的整数。','concurrency'];
-      if (n.kind!=='root' && n.parent!==rootId()) return ['basic','当前仅支持根实例的直属下级。','parent'];
       for(const role of ['brain','router','worker']) {
         const model=role==='brain'?n.model:n.roleModels?.[role];if(role!=='brain'&&!model)continue;
         const tab=role==='worker'?'access':organizationMode()?(role==='router'?'router':'brain'):'basic';
@@ -958,7 +967,6 @@
       return null;
     }
     if (!Number.isInteger(n.concurrency) || n.concurrency<1 || n.concurrency>20) return ['access','任务并发上限应为 1–20 的整数。','concurrency'];
-    if (n.kind!=='root' && (!node(n.parent) || node(n.parent).kind==='worker' || ancestry(n.parent).some(item=>item.id===n.id))) return ['basic','请选择有效的上级，不能形成循环委派。','parent'];
     if (n.mode==='connect' && n.endpoint) {
       try { const url = new URL(n.endpoint); if (!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash) throw 0; }
       catch { return ['runtime','请填写不含账号、密钥或查询参数的 HTTP(S) 实例地址。','endpoint']; }
