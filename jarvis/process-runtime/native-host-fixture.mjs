@@ -92,13 +92,27 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
     }
     async create(request) {
       controllerCalls.push({ type: 'create', ...request });
-      assert.equal(request.cwd, undefined);
-      const workspace = [...workspaceAccounts.values()].find(value => value.id === request.workspaceId);
+      assert.ok(!request.cwd || !request.workspaceId, 'A controller request addresses one workspace source');
+      const workspace = request.cwd ? await ctx.workspaceRegistry.create(request.cwd)
+        : [...workspaceAccounts.values()].find(value => value.id === request.workspaceId);
       assert.ok(workspace);
       const handle = await ctx.agents.create({ sessionId: request.sessionId, meta: { cwd: workspace.path, agentPreset: request.agentPreset },
         agentOptions: { provider: 'fixture', model: 'fixture' }, setup: scope => ctx.agentPresets.mount(scope, request.agentPreset) });
       controllerHandles.push(handle); await workspace.attachSession(handle.agent.id);
       return { sessionId: handle.agent.id, agentPreset: request.agentPreset };
+    }
+    async prompt(request, signal) {
+      signal.throwIfAborted();
+      const resolved = await this.resolveAgent(request.sessionId);
+      assert.ok(resolved.agent, 'A daily prompt needs its actual registered Agent');
+      const agent = resolved.agent;
+      if (agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.source?.rpcId === request.requestId)) return { accepted: true };
+      // Match installed SessionController's text-only admission boundary. The
+      // actual registry, AgentLoop, tools and JSONL persistence own execution.
+      const message = llmModule.createUserMessage({ content: request.content,
+        source: { kind: 'user', rpcId: request.requestId, ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) } });
+      request.mode === 'steer' ? agent.steer(message) : agent.followup(message);
+      return { accepted: true };
     }
     async rename(request) { controllerCalls.push({ type: 'rename', ...request }); }
     async modelCatalog() { return { groups: [], default: { provider: 'fixture', model: 'fixture' } }; }
