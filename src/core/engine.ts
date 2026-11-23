@@ -11,7 +11,7 @@ import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest } from './replies.ts'
 import { Tickets } from './tickets.ts'
-import { ResultReviews } from './result-reviews.ts'
+import { ResultReviews, type ResultReportRecovery } from './result-reviews.ts'
 
 export type { EngineOptions } from './part.ts'
 export type { WorkerReport } from './assignments.ts'
@@ -302,9 +302,9 @@ export class Engine {
       return this.assignments.report(ticketId, report)
     })
   }
-  /** A verified executor result waits for the original main Session; this does not complete the ticket. */
-  stageResultReview(ticketId: string, assignmentId: string, evidenceRef: string, summary: string): ResultReview {
-    return this.repo.atomic(() => this.reviews.stage(ticketId, assignmentId, evidenceRef, summary))
+  /** A verified executor result waits for the owner; recovery can replace only the named stale transport report. */
+  stageResultReview(ticketId: string, assignmentId: string, evidenceRef: string, summary: string, recovery?: ResultReportRecovery): ResultReview {
+    return this.repo.atomic(() => this.reviews.stage(ticketId, assignmentId, evidenceRef, summary, undefined, recovery))
   }
   /** Accept evidence or start remaining work under the existing mandate, with stale decisions refused atomically. */
   resolveResultReview(ticketId: string, assignmentId: string, reviewId: string, decision: ResultReviewDecision): Ticket {

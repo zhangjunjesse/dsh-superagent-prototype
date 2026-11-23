@@ -25,6 +25,8 @@ const selections = family<string, [string]>('process-delegation:route:')
 type Binding = DelegationBinding
 const outgoing = family<Binding, [string]>('process-delegation:out:')
 const targetGrants = family<{ ticketId: string; target: string; tools: string[] }, [string]>('process-delegation:target-grant:')
+// Keep this exact legacy projection recognizable after restart, including rows whose error/hash were already cleared.
+const TRANSPORT_UNAVAILABLE = 'Child connection or command outcome is unavailable. The fixed task will be queried again; no replacement task was created.'
 type Config = { instanceId: string; workerTools: string[]; delegationTargets?: Capability[] }
 
 /** Keeps one parent Assignment bound to one child and reconciles its commands and evidence. */
@@ -406,7 +408,10 @@ export class DelegationExecutor {
       if (snapshot.status !== 'completed') this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed', summary: snapshot.summary, question: null })
       const summary = `${snapshot.summary}\n\n${JSON.stringify({ producer: { instanceId: snapshot.childInstanceId,
         ticketId: snapshot.ticketId, assignmentId: snapshot.assignmentId }, evidence_ref: evidence, artifacts: verifiedDelegationArtifacts(snapshot) })}`
-      row.reviewId = this.engine.stageResultReview(ticket.id, assignmentId, evidence, summary).id
+      const priorReport = latestAssignment(ticket)?.report
+      const recovery = snapshot.status === 'completed' && priorReport?.state === 'blocked' && priorReport.summary === TRANSPORT_UNAVAILABLE
+        ? { ...priorReport, state: 'blocked' as const } : undefined
+      row.reviewId = this.engine.stageResultReview(ticket.id, assignmentId, evidence, summary, recovery).id
     } else if (repeated) return
     else if (['blocked', 'failed', 'stopped'].includes(snapshot.status)) {
       this.engine.report(ticket.id, { state: snapshot.status === 'blocked' ? 'blocked' : 'failed',
@@ -490,8 +495,10 @@ export class DelegationExecutor {
         const latest = this.store.get(name)!
         if (this.pollSuperseded(latest)) continue
         const message = String(error), ticket = this.current(latest)
-        if (ticket && latest.error !== message) this.engine.report(ticket.id, { state: 'blocked',
-          summary: 'Child connection or command outcome is unavailable. The fixed task will be queried again; no replacement task was created.' })
+        const assignment = ticket && latestAssignment(ticket), report = assignment?.report
+        const preserve = assignment?.resultReviews?.at(-1)?.decision?.kind === 'accept'
+          || report && ['blocked', 'failed'].includes(report.state) && report.summary !== TRANSPORT_UNAVAILABLE
+        if (ticket && !preserve && latest.error !== message) this.engine.report(ticket.id, { state: 'blocked', summary: TRANSPORT_UNAVAILABLE })
         delete latest.reportHash
         const failures = (latest.failures ?? 0) + 1
         this.store.set(name, { ...latest, error: message, failures, retryAt: Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)) })

@@ -6,6 +6,9 @@ import { EnginePart, type EngineOptions } from './part.ts'
 import type { Tickets } from './tickets.ts'
 import type { Assignments, WorkerReport } from './assignments.ts'
 
+/** A trusted executor may replace only this exact stale transport projection, never a newer report. */
+export type ResultReportRecovery = { state: 'blocked'; summary: string; at: string }
+
 /** Holds executor evidence until the owner judges the original goal; decisions and continuation commit atomically. */
 export class ResultReviews extends EnginePart {
   constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly assignments: Assignments) { super(options) }
@@ -28,19 +31,26 @@ export class ResultReviews extends EnginePart {
     return { ticket, assignment }
   }
   /** The trusted executor supplies an evidence identity after checking its actual producer binding. */
-  stage(ticketId: string, assignmentId: string, evidenceRef: string, summary: string, report?: WorkerReport): ResultReview {
+  stage(ticketId: string, assignmentId: string, evidenceRef: string, summary: string, report?: WorkerReport, recovery?: ResultReportRecovery): ResultReview {
     if (!evidenceRef.trim() || !summary.trim()) throw new Error('Result review requires evidence identity and summary')
     let { ticket, assignment } = this.current(ticketId, assignmentId)
     const contextRef = this.context(ticket, assignment), previous = assignment.resultReviews?.at(-1)
+    const recovering = !!recovery && assignment.report?.state === recovery.state && assignment.report.summary === recovery.summary
+      && assignment.report.at === recovery.at
     if (previous?.evidenceRef === evidenceRef && previous.contextRef === contextRef && previous.summary === summary
-      && (previous.decision || assignment.report?.summary === summary)) return previous
+      && (previous.decision || assignment.report?.summary === summary)) {
+      // Recovered transport does not revoke an already committed judgement about this exact evidence and request.
+      if (recovering && previous.decision?.kind === 'accept' && !ticket.delivery && !ticket.attention && !ticket.undelivered.length)
+        this.assignments.report(ticketId, { state: 'ready', summary: previous.decision.summary, question: null })
+      return previous
+    }
     // The same evidence can return after a newer report or a transport failure. Restore its report and relay atomically
     // under a fresh CAS; chaining the last review prevents a historical decision from becoming current again.
     const id = key('result-review', ticketId, assignmentId, evidenceRef, contextRef, ...previous ? [previous.id] : [])
     if (assignment.state === 'pending') this.assignments.started(ticketId, assignmentId)
     // Blocked delivery remains visible; the owner can arrange remaining work with the undelivered input intact.
     const blocked = !!ticket.delivery || !!ticket.attention || report?.state === 'blocked' || report?.state === 'failed'
-      || assignment.report?.state === 'blocked' || assignment.report?.state === 'failed'
+      || !recovering && (assignment.report?.state === 'blocked' || assignment.report?.state === 'failed')
     this.assignments.report(ticketId, { ...report, state: report?.state === 'failed' ? 'failed' : blocked ? 'blocked' : 'waiting', summary,
       question: report?.question ?? ticket.attention?.question ?? null })
     ;({ ticket, assignment } = this.current(ticketId, assignmentId))
