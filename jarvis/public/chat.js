@@ -317,10 +317,15 @@
     heading.append(icon, taskNode('h4', '', label));
     if (report) {
       const via = taskProgressSource(report.source);
-      const state = report.state ? ' · ' + reportStateText(report.state) : '';
+      const completed = !archived && item?.status === 'completed' && report.state === 'ready';
+      const state = completed ? ' · ' + (item.acceptance ? '结果已验收' : '执行已完成')
+        : report.state ? ' · ' + reportStateText(report.state) : '';
       heading.append(taskNode('span', 'chat-task-result-source', via + state));
     }
     result.append(heading);
+    if (!archived && item?.acceptance?.summary) {
+      result.append(taskNode('p', 'chat-task-progress', '交办方验收意见：' + item.acceptance.summary));
+    }
     content.append(result);
     if (report?.summary) {
       const context = archived ? { instanceId: record.organizationId, workerId: record.workerId, ticketId: record.ticketId }

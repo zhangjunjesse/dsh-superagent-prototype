@@ -526,6 +526,10 @@ test('compact task headings retain the complete long title, request and Worker r
 test('short formatted progress distinguishes a pending result, a failure and a stored delegation snapshot', async t => {
   const items = [
     task({ workRef: 'JW-ready-report', progress: { summary: '**文件已生成**，仍在等待 `验收`。', state: 'ready', source: 'worker-report' } }),
+    task({ workRef: 'JW-accepted-report', status: 'completed', statusLabel: '已完成',
+      acceptance: { summary: '已核对两条导出记录。' }, progress: { summary: '已交回导出文件。', state: 'ready', source: 'worker-report' } }),
+    task({ workRef: 'JW-local-result', status: 'completed', statusLabel: '已完成',
+      progress: { summary: '本地工作完成。', state: 'ready', source: 'worker-report' } }),
     task({ workRef: 'JW-failed-report', status: 'failed', statusLabel: '执行失败',
       progress: { summary: '**导出失败**，请补充源材料。', state: 'failed', source: 'worker-report' } }),
     task({ workRef: 'JW-stored-snapshot', status: 'unknown', statusLabel: '状态尚未确认', availability: 'stored',
@@ -544,6 +548,10 @@ test('short formatted progress distinguishes a pending result, a failure and a s
     assert.equal(card.querySelector('.chat-task-files'), null, 'mentioning a file does not invent a downloadable deliverable');
   }
   const ready = w.document.querySelector('[data-work-ref="JW-ready-report"]');
+  const accepted = w.document.querySelector('[data-work-ref="JW-accepted-report"] .chat-task-result');
+  assert.match(accepted.textContent, /结果已验收/);
+  assert.match(accepted.textContent, /已核对两条导出记录/);
+  assert.match(w.document.querySelector('[data-work-ref="JW-local-result"] .chat-task-result').textContent, /执行已完成/);
   assert.match(ready.querySelector('.chat-task-result').textContent, /执行方最新回报.*结果待验收/s);
   assert.equal(ready.querySelector('.chat-task-progress strong').textContent, '文件已生成');
   assert.equal(ready.querySelector('.chat-task-progress code').textContent, '验收');

@@ -242,12 +242,15 @@ class TaskRead {
   }
   projectTicket(source, ticket, info = this.origin(source, ticket)) {
     const assignment = latestAssignment(ticket);
+    const decision = assignment?.resultReviews?.at(-1)?.decision;
     const { state, progress, updatedAt, execution, delegations } = this.executionView(source, ticket);
     return { id: `${source.id}:${ticket.id}`, workRef: info?.work.workRef ?? null, title: text(info?.command?.summary ?? info?.work.title ?? ticket.title, 500),
       ticketTitle: text(ticket.title, 500), originalRequest: this.detail ? text(info?.command?.quote, 20000) : null, ticketId: ticket.id,
       conversationId: info?.work.conversationId ?? null, userMessageId: info?.command?.origin?.userMessageId ?? null,
       owner: this.org(info?.source ?? source), organization: this.org(source), ...state, execution, assignment: assignmentView(assignment),
-      progress, receivedAt: time(info?.command?.receivedAt ?? ticket.createdAt),
+      progress, ...(ticket.ended?.outcome === 'completed' && decision?.kind === 'accept'
+        ? { acceptance: { summary: text(decision.summary), at: time(decision.at) } } : {}),
+      receivedAt: time(info?.command?.receivedAt ?? ticket.createdAt),
       updatedAt, ...(this.detail ? { delegations } : {}),
       logs: this.logs(source, ticket.id, info) };
   }

@@ -138,8 +138,15 @@ test('a child completing its work does not mark the owning JW complete before pa
   task.child.ended = { outcome: 'completed', by: 'executor', at: later }; f.stores.studio.tickets.save(task.child);
   const root = f.tasks.detail(task.workRef, new URLSearchParams('conversationId=conversation-a')).item;
   assert.equal(root.status, 'waiting'); assert.match(root.statusLabel, /等待任务汇总/);
+  assert.equal(root.acceptance, undefined);
   task.parent.ended = { outcome: 'completed', by: 'executor', at: later }; f.stores.root.tickets.save(task.parent);
-  assert.equal(f.tasks.detail(task.workRef, new URLSearchParams('conversationId=conversation-a')).item.status, 'completed');
+  const detail = () => f.tasks.detail(task.workRef, new URLSearchParams('conversationId=conversation-a')).item;
+  assert.equal(detail().status, 'completed');
+  assert.equal(detail().acceptance, undefined);
+  task.parent.assignments.at(-1).resultReviews = [{ id: 'group-review', evidenceRef: 'bound-child-result',
+    decision: { kind: 'accept', summary: 'Checked the two exported records against the original request.', at: later } }];
+  f.stores.root.tickets.save(task.parent);
+  assert.equal(detail().acceptance.summary, 'Checked the two exported records against the original request.');
 });
 
 test('group task follows historical assignment bindings to the actual leaf and its artifacts after a move', t => {
