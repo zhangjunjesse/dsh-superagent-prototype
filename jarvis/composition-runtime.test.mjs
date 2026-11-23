@@ -119,7 +119,23 @@ test('brain and ordinary Worker settings persist only the selected instance with
   assert.deepEqual(ui.backend.snapshot.nodes.filter(n=>n.id!=='child'),unchanged);
   assert.equal(ui.w.sessionStorage.length,0);assert.equal(ui.client.state.model.value.model,'ordinary-model');
   assert.equal(ui.requests.filter(r=>r.method==='PUT').length,1);assert.equal(ui.requests.some(r=>r.path==='/api/model'),false);
-  assert.equal(ui.page.querySelector('[data-action="add-instance"]'),null,'children cannot create a second hop');
+  assert.ok(ui.action('add-instance'), 'a department can add its own direct child');
+});
+
+test('creating a department from a connected child saves that child as its parent', async t => {
+  const initial = snapshot();
+  initial.nodes.push(instance('management', 'root'));
+  const ui = await open(t, { initial });
+  ui.action('enter-instance', 'management').click();
+  ui.action('add-instance').click();
+  ui.input('name', '研发部');
+  ui.input('description', '负责产品研发');
+  ui.save();
+  await until(() => ui.backend.snapshot.nodes.some(org => org.name === '研发部'), 'saved research department');
+  const saved = ui.backend.snapshot.nodes.find(org => org.name === '研发部');
+  assert.equal(saved.parent, 'management');
+  assert.equal(saved.description, '负责产品研发');
+  assert.deepEqual(ui.backend.snapshot.nodes.filter(org => org.id !== saved.id), initial.nodes);
 });
 
 test('Worker capabilities use real catalogs, preserve role models across tabs and keep unavailable selections visible',async t=>{
@@ -331,20 +347,21 @@ test('persisted cancellation and interruption remain visible when the process is
 });
 
 test('legacy or unsupported draft fields are reviewed explicitly and rejected without mutating the original draft',async t=>{
-  const draft={version:1,nodes:[{...instance(),autostart:true,unknownSetting:'retain'},instance('child','root'),{...instance('grandchild','child'),redelegate:true},{...instance('old-worker','root'),kind:'worker'}]};
+  const draft={version:1,nodes:[{...instance(),autostart:true,unknownSetting:'retain'},instance('child','grandchild'),{...instance('grandchild','child'),redelegate:true},{...instance('old-worker','root'),kind:'worker'}]};
   const ui=await open(t,{draft}),before=ui.w.sessionStorage.getItem(storageKey);
   assert.equal(ui.requests.some(r=>r.method==='PUT'),false);assert.equal(ui.page.querySelector('[data-topology-instance="child"]'),null);
-  ui.action('draft-review').click();assert.match(ui.page.textContent,/autostart.*unknownSetting/);assert.match(ui.page.textContent,/根实例的直属下级/);assert.match(ui.page.textContent,/旧 Worker 组/);
+  ui.action('draft-review').click();assert.match(ui.page.textContent,/autostart.*unknownSetting/);assert.match(ui.page.textContent,/上级关系形成循环/);assert.match(ui.page.textContent,/旧 Worker 组/);
   assert.equal(ui.action('draft-save').disabled,true);ui.action('draft-save').click();assert.equal(ui.requests.some(r=>r.method==='PUT'),false);
   assert.equal(ui.w.sessionStorage.getItem(storageKey),before);ui.action('draft-close').click();assert.ok(ui.query('[data-brain-id="root"]'));
 });
 
 test('supported window drafts save only after explicit review and keep the source draft unchanged',async t=>{
-  const draft={version:1,nodes:[{...instance(),name:'核对后的根名称'},instance('reviewed-child','root')]};
+  const draft={version:1,nodes:[{...instance(),name:'核对后的根名称'},instance('reviewed-child','root'),instance('reviewed-team','reviewed-child')]};
   const ui=await open(t,{draft}),before=ui.w.sessionStorage.getItem(storageKey);
   assert.equal(ui.requests.some(r=>r.method==='PUT'),false);ui.action('draft-review').click();assert.equal(ui.action('draft-save').disabled,false);
   assert.match(ui.page.textContent,/保存将替换系统的实例配置/);ui.action('draft-save').click();await until(()=>ui.page.querySelector('[data-brain-id="reviewed-child"]'),'explicit draft import');
   assert.equal(ui.backend.snapshot.nodes[0].name,'核对后的根名称');assert.equal(ui.w.sessionStorage.getItem(storageKey),before);assert.equal(ui.requests.filter(r=>r.method==='PUT').length,1);
+  assert.equal(ui.backend.snapshot.nodes.find(org => org.id === 'reviewed-team').parent, 'reviewed-child');
 });
 
 test('a snapshot read that began before a save cannot replace the confirmed configuration afterward',async t=>{
