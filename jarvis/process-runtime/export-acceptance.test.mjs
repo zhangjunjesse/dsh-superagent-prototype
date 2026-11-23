@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { appendFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { JarvisRuntime } from '../dsh/runtime.mjs';
@@ -46,6 +48,9 @@ function* invoke(name, args) {
 test('export acceptance uses the original group conversation and installed DSH through two real departments',
   { skip: !available, timeout: 55000 }, async t => {
   const evidence = mkdtempSync(resolve('..', 'ticket-13-native-'));
+  const codeRevision = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const dshPackage = process.env.JARVIS_DSH_PACKAGE ?? join(homedir(), 'AppData/Roaming/npm/node_modules/@deepseek-ai/dsh');
+  const dshVersion = JSON.parse(readFileSync(join(dshPackage, 'package.json'), 'utf8')).version;
   t.diagnostic(`Durable isolated acceptance evidence: ${evidence}`);
   const trace = value => appendFileSync(join(evidence, 'trace.jsonl'), JSON.stringify({ at: new Date().toISOString(), ...value }) + '\n');
   const f = await nativeFixture(t, { managementOnly: true, realCapabilities: true, searchCapabilities: true, inherited: [], local: [], allowedTools: [], pwshTimeoutMs: 15000 });
@@ -66,7 +71,8 @@ test('export acceptance uses the original group conversation and installed DSH t
   const save = async (phase, extra = {}) => {
     await f.ctx.sessionPersistence.flush();
     states = await Promise.all([...manager.instances.keys()].map(id => manager.state(id).catch(error => ({ instanceId: id, error: error.message }))));
-    const value = { phase, at: new Date().toISOString(), mode: 'Installed DSH AgentLoop and native filesystem/PowerShell tools; real Core/Gateway/SQLite/IPC business processes; controlled deterministic model adapter, no external model quality claim.',
+    const value = { phase, at: new Date().toISOString(), codeRevision, nodeVersion: process.version, dshPackage, dshVersion,
+      mode: 'Installed DSH AgentLoop and native filesystem/PowerShell tools; real Core/Gateway/SQLite/IPC business processes; controlled deterministic model adapter, no external model quality claim.',
       started, states, daily: await daily.state(), errors: f.errors.map(error => error.stack), ...extra };
     writeFileSync(join(evidence, `${phase}.json`), JSON.stringify(value, null, 2));
     cpSync(join(f.directory, 'sessions'), join(evidence, 'sessions'), { recursive: true });
@@ -124,10 +130,11 @@ test('export acceptance uses the original group conversation and installed DSH t
     if (tools.includes('orchestrator_route')) {
       if (input.kind === 'department_ready') {
         assert.equal(instanceId, 'management');
-        if (!step) return yield* invoke('orchestrator_read', { resource: `ticket/${input.ticket_id}`, offset: 0, limit: 10000 });
-        if (step === 1) {
-          const client = input.execution_targets.find(target => target.organizationName === '客户端组');
-          assert.ok(client, 'The current ready catalog must actually contain the configured client department');
+        const resources = [input.read, input.original_request, input.original_assignment, input.inputs, input.history];
+        if (step < resources.length) return yield* invoke('orchestrator_read', { resource: resources[step], offset: 0, limit: 8000 });
+        if (step === resources.length) {
+          const client = input.execution_targets.find(target => target.organizationName === '客户端组' && target.description.includes('浏览器界面验收'));
+          if (!client) return yield* reply('现有研发部虽有部分工具，但职责不承担客户端界面验收；原工单继续等待客户端组。');
           assert.ok(clientTools.every(name => client.tools.includes(name)));
           return yield* invoke('orchestrator_department_resume', { ticket_id: input.ticket_id, assignment_id: input.assignment_id,
             review_id: input.review_id, target_instance_id: client.instanceId,
@@ -277,7 +284,7 @@ test('export acceptance uses the original group conversation and installed DSH t
     const taskDetail = tasks.detail(workRef, new URLSearchParams({ conversationId: binding.conversationId }));
     await logs.refresh();
     const logRecords = await logs.list(new URLSearchParams({ limit: '100' }));
-    await page.screenshot({ path: join(evidence, 'original-conversation.png'), fullPage: true });
+    await page.screenshot({ path: join(evidence, 'original-conversation.png'), fullPage: true, animations: 'disabled' });
     await save('repair-stage-complete', { repairHash, repairedFile, taskDetail, logRecords });
     assert.notEqual(taskDetail.item.status, 'completed');
     assert.equal(daily.store.turns().filter(turn => turn.user === goal).length, 1);
@@ -286,7 +293,7 @@ test('export acceptance uses the original group conversation and installed DSH t
     assert.equal(middle.delegations.outgoing[0].snapshot.artifacts[0].version.sha256, repairHash, 'The trusted business registration binds the observed repaired bytes');
     await until(() => daily.state(), state => state.turns.some(turn => turn.source === 'gateway' && turn.assistant === reminder), 'The original group conversation must receive the missing client reminder');
     const waiting = await manager.state('management');
-    assert.equal(waiting.departmentWaits.filter(item => item.state === 'waiting').length, 1);
+    assert.equal(waiting.departmentWaits.length, 1, 'The state projection lists only active original department waits');
     assert.equal(waiting.tickets[0].id, middle.tickets[0].id);
     assert.equal(waiting.tickets[0].ended, undefined);
     await daily.gateway.poll(); await daily.gateway.poll();
@@ -303,9 +310,9 @@ test('export acceptance uses the original group conversation and installed DSH t
     await page.locator('#field-name').fill('客户端组');
     await page.locator('#field-description').fill('负责浏览器界面验收，实际点击导出，取得下载文件并逐条核对已知数据。');
     await page.locator('#field-capabilities').fill('客户端、Chrome、导出按钮、下载、双记录核验');
-    const createdResponse = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/api/system'));
-    await page.getByRole('button', { name: '保存并添加', exact: true }).click();
-    const response = await createdResponse, created = await response.json();
+    const [response] = await Promise.all([page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/api/system')),
+      page.getByRole('button', { name: '保存并添加', exact: true }).click()]);
+    const created = await response.json();
     assert.equal(response.status(), 200, `Normal organization creation failed: ${JSON.stringify(created)}`);
     const client = created.nodes.find(node => node.name === '客户端组');
     assert.ok(client); clientId = client.id; assert.equal(client.parent, 'management');
@@ -318,9 +325,9 @@ test('export acceptance uses the original group conversation and installed DSH t
       const name = await option.locator('small').first().innerText();
       await option.locator('input[type="checkbox"]').setChecked(clientTools.includes(name));
     }
-    const permissionsResponse = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/worker-capabilities'));
-    await capabilities.getByRole('button', { name: '保存', exact: true }).click();
-    const permissions = await (await permissionsResponse).json();
+    const [permissionsResponse] = await Promise.all([page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith('/worker-capabilities')),
+      capabilities.getByRole('button', { name: '保存', exact: true }).click()]);
+    const permissions = await permissionsResponse.json();
     assert.deepEqual(new Set(permissions.tools), new Set(clientTools));
     assert.equal(permissions.application?.state, 'applied', 'A never-started client must configure normally while unrelated parent work remains');
     await until(async () => await capabilities.locator('.dt-savebar').count() === 0
@@ -353,9 +360,30 @@ test('export acceptance uses the original group conversation and installed DSH t
     assert.ok(finishedDetail.item.delegations.some(link => link.to.instanceId === clientId));
     await logs.refresh();
     await page.goto(`${origin}/jarvis/`);
-    await page.getByText('导出修复和界面验收已完成', { exact: false }).waitFor();
-    await page.screenshot({ path: join(evidence, 'completed-original-conversation.png'), fullPage: true });
-    await save('complete', { repairHash, verification, taskDetail: finishedDetail, logRecords: await logs.list(new URLSearchParams({ limit: '100' })), userRequests });
+    await page.getByText('导出修复和界面验收已完成', { exact: false }).first().waitFor();
+    await page.screenshot({ path: join(evidence, 'completed-original-conversation.png'), fullPage: true, animations: 'disabled' });
+    const originalCard = page.locator(`.chat-task-card[data-work-ref="${workRef}"]`).first();
+    await originalCard.locator('summary.chat-task-heading').click();
+    await originalCard.locator('[data-task-part="delegations"] > summary').click();
+    for (const label of ['集团 → 管理部', '管理部 → 研发部', '管理部 → 客户端组']) await originalCard.getByText(label, { exact: true }).waitFor();
+    await originalCard.locator('[data-task-part="execution"] > summary').click();
+    await originalCard.getByText(`worker-${completedClient.tickets[0].id}`, { exact: true }).waitFor();
+    const renderedCard = await originalCard.innerText();
+    assert.ok(renderedCard.includes('双记录核验通过') && renderedCard.includes('实际浏览器导出双记录'));
+    writeFileSync(join(evidence, 'rendered-original-task-card.txt'), renderedCard);
+    await originalCard.screenshot({ path: join(evidence, 'original-task-card-details.png'), animations: 'disabled' });
+    await originalCard.getByRole('link', { name: '查看任务日志', exact: true }).click();
+    await page.locator('#logs-list .logs-event').first().waitFor();
+    await page.locator('#logs-query').fill('双记录核验通过');
+    await page.locator('#logs-filters').getByRole('button', { name: '搜索', exact: true }).click();
+    await page.locator('#logs-list .logs-event').filter({ hasText: '客户端组' }).filter({ hasText: 'orchestrator_report' }).first().click();
+    await page.locator('#logs-detail-meta').waitFor({ state: 'visible' });
+    await page.locator('#logs-detail-raw > summary').click();
+    await page.locator('#logs-detail-data').getByText('双记录核验通过', { exact: false }).waitFor();
+    writeFileSync(join(evidence, 'rendered-task-logs.txt'), await page.locator('#operation-logs-page').innerText());
+    await page.screenshot({ path: join(evidence, 'original-task-logs.png'), fullPage: true, animations: 'disabled' });
+    await save('complete', { repairHash, verification, taskDetail: finishedDetail, logRecords: await logs.list(new URLSearchParams({ limit: '100' })),
+      relatedResultLogs: await logs.list(new URLSearchParams({ limit: '100', trace: finishedDetail.item.logs.traceId, q: '双记录核验通过' })), userRequests });
     for (const error of f.errors) assert.equal(error.message, 'Ticket ended; new work needs a new authorized ticket', 'Only the original native post-completion guard is expected');
   } catch (error) {
     trace({ event: 'failure', error: error.stack });
