@@ -35,6 +35,11 @@ function organizationChain(leaf?: (turn: NativeTurn) => Promise<void>, configure
         if (request.sessionKey.startsWith('delegation:')) {
           const original = await call('delegation_context_read', { section: 'source', offset: 0 })
           expect(original.text).toContain('Read the original marker and produce the authorized result')
+          if (id === 'development') {
+            expect(JSON.parse(request.text).ancestor_constraints).toMatchObject([{ parent_scope: 'group bounded task' }])
+            const ancestor = await call('delegation_context_read', { section: 'ancestor_assignment', ancestorIndex: 0, offset: 0 })
+            expect(ancestor.text).toBe('')
+          }
           await call('delegation_prepare', { summary: `Complete only the original authorized goal in ${id}.` })
         } else if (request.text === 'hello while waiting') return { status: 'complete', text: 'Hello, the task is still tracked.' }
         else await call('jarvis_work_submit', { operation: 'new', request: { quote: request.text, summary: request.text } })
@@ -56,6 +61,25 @@ function organizationChain(leaf?: (turn: NativeTurn) => Promise<void>, configure
       if (!turn.text.startsWith('{')) return
       const input = JSON.parse(turn.text)
       if (turn.policy.role === 'orchestrator') {
+        if (input.kind === 'result_review') {
+          const read = async (resource: string) => {
+            let text = '', offset = 0
+            for (;;) {
+              const page = await turn.tool('orchestrator_read', { resource, offset, limit: 8000 }) as { text: string; next_offset: number | null }
+              text += page.text; if (page.next_offset === null) return text; offset = page.next_offset
+            }
+          }
+          const review = JSON.parse(await read(input.read)), development = await nodes.development.state()
+          expect(review.evidenceRef).toBe(input.evidence_ref)
+          expect(review.summary).toContain('Verified development-marker')
+          expect(await read(input.original_request)).toContain('Read the original marker and produce the authorized result')
+          await read(input.original_assignment); await read(input.inputs); await read(input.history)
+          expect(input.scope).toBe(`${id} bounded task`)
+          expect(readFileSync(join(development.tickets[0]!.execution!.directory, 'result.txt'), 'utf8')).toBe('Verified development-marker')
+          await turn.tool('orchestrator_result_review', { ticket_id: input.ticket_id, assignment_id: input.assignment_id, review_id: input.review_id,
+            decision: { kind: 'accept', summary: 'Verified development-marker; original goal and leaf file evidence checked.' } })
+          return
+        }
         if (input.kind !== 'candidate') return
         calls.push({ instance: id, role: 'router', text: turn.text })
         if (route && await route(id, turn)) return
@@ -65,6 +89,9 @@ function organizationChain(leaf?: (turn: NativeTurn) => Promise<void>, configure
       } else if (input.ticket_id) {
         calls.push({ instance: id, role: 'worker', text: turn.text })
         expect(id).toBe('development')
+        expect(input.trigger.delegation.ancestor_constraints).toMatchObject([{ parent_scope: 'group bounded task', assignment: { chars: 0 } }])
+        const ancestor = await turn.tool('orchestrator_read', { resource: input.trigger.delegation.ancestor_constraints[0].assignment.read, offset: 0 }) as { parent_scope: string }
+        expect(ancestor.parent_scope).toBe('group bounded task')
         expect(turn.policy.allowedTools).toContain('write'); expect(turn.policy.allowedTools).not.toContain('grep')
         const source = await turn.tool('orchestrator_read', { resource: input.trigger.delegation.original_source.read, offset: 0 }) as { text: string }
         expect(source.text).toContain('Read the original marker and produce the authorized result')

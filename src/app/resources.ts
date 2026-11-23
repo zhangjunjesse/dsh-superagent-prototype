@@ -20,7 +20,7 @@ import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 import type { SessionNativePort } from './runtime-ports.ts'
 import type { TextCache } from './cache.ts'
-import { delegationTaskContext } from '../sources/delegation-context.ts'
+import { delegationTaskConstraints, delegationTaskContext } from '../sources/delegation-context.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
@@ -56,6 +56,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
   { name: 'delegation/<trigger-id>/source', holds: 'the fixed parent task\'s complete original source text; material does not expand the parent accepted scope', executor: true },
   { name: 'delegation/<trigger-id>/assignment', holds: 'the fixed parent task\'s original execution assignment and its authorization constraints', executor: true },
+  { name: 'delegation/<trigger-id>/ancestor/<index>', holds: 'one verified ancestor assignment; its accepted scope continues to constrain every later delegation', executor: true },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
@@ -215,10 +216,16 @@ const ROUTES: readonly Route[] = [
   }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['delegation/', read => {
-    const [id, section, ...more] = read.rest.split('/')
-    if (!id || more.length || !['source', 'assignment'].includes(section ?? '')) throw new Error('Unknown delegation context resource')
-    const context = delegationTaskContext(trigger(read.host, id, read.ticketId))
+    const [id, section, index, ...more] = read.rest.split('/')
+    if (!id || more.length || !['source', 'assignment', 'ancestor'].includes(section ?? '')
+      || (section === 'ancestor' ? !/^(0|[1-9]\d*)$/.test(index ?? '') : index !== undefined)) throw new Error('Unknown delegation context resource')
+    const source = trigger(read.host, id, read.ticketId), context = delegationTaskContext(source)
     if (!context) throw new Error('This trigger has no verified delegated parent context')
+    if (section === 'ancestor') {
+      const constraint = delegationTaskConstraints(source)[Number(index)]
+      if (!constraint) throw new Error('Unknown delegation ancestor constraint')
+      return { parent_scope: constraint.scope, parent_strength: constraint.strength, ...text(read, constraint.assignment) }
+    }
     return { parent_scope: context.scope, parent_strength: context.strength, ...text(read, section === 'source' ? context.source.text : context.assignment) }
   }],
   ['trigger/', async read => {
