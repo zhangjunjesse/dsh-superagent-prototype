@@ -157,6 +157,8 @@ export class OriginalProcess {
         },
         localTicket: ticket => !this.delegated.remote(ticket) && !this.departments?.held(ticket),
         prepareHandoff: async (ticket, assignment) => this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket), async input => {
+          // A local task's registered versions retain their original binding and digest checks without a remote host.
+          if (input.artifact.instanceId === config.instanceId && input.artifact.ticketId === ticket.id) return this.taskFiles.read(input)
           if (!host.readArtifact) throw new Error('The authenticated artifact transfer is unavailable')
           return host.readArtifact({ ...input, ticketId: ticket.id, assignmentId: assignment.id })
         }),

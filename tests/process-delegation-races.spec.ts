@@ -223,11 +223,14 @@ describe('delegation completion fences', () => {
   })
 
   it('returns a failed validation to the parent for remaining work without an invented human retry', async () => {
-    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    const h = fixture(async request => childSnapshot(request, { status: 'completed',
+      ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
     await h.proxy.tick()
     const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
-    h.engine.resolveResultReview(h.current().id, first.id, review.id,
-      { kind: 'continue', summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' })
+    const decision = { kind: 'continue' as const, summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' }
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, decision)).toThrow('not been verified stopped')
+    await h.proxy.prepareReview(h.current().id, first.id, review.id)
+    h.engine.resolveResultReview(h.current().id, first.id, review.id, decision)
     h.engine.report(h.current().id, { state: 'failed', summary: 'The repaired revision failed its original acceptance check.' })
     const second = latestAssignment(h.current())!, failure = second.resultReviews!.at(-1)!
     expect(second.report?.state).toBe('failed')
