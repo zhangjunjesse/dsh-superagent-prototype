@@ -472,6 +472,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/process-handoff.spec.ts` | Verified producer cleanup, retries and handoff of immutable files to a different authorized Worker |
 | `tests/process-topology.spec.ts` | Idle and busy organization moves, frozen admission and restart with the committed parent |
 | `tests/result-review-recovery.spec.ts` | Real SQLite/Effects resume one pending review and one immutable continuation; followed-thread close cannot bypass parent acceptance |
+| `tests/handoff-recovery.spec.ts` | Reopens the original handoff after a crash or lost reply and cancels only its bound execution |
+| `tests/handoff-session-recovery.spec.ts` | Restores the original review Session and resumes the handoff, including work waiting for a department |
 | `tests/process-live-routing.spec.ts` | Live child discovery, readiness at selection and admission, and continuity of existing assignments |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
