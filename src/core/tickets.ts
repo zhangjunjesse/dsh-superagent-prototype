@@ -174,7 +174,7 @@ export class Tickets extends EnginePart {
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
     this.endAssignment(ticket, latest, 'retried')
     this.requeueUntaken(ticket, latest)
-    const assignment = this.newAssignment(ticket)
+    const assignment = this.newAssignment(ticket, latest)
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     this.options.executor.stop(ticket, latest, 'retried')
@@ -336,7 +336,7 @@ export class Tickets extends EnginePart {
   restart(ticket: Ticket, running: Assignment, reason: string, note: string): void {
     this.endAssignment(ticket, running, reason)
     this.requeueUntaken(ticket, running)
-    const assignment = this.newAssignment(ticket)
+    const assignment = this.newAssignment(ticket, running)
     const at = this.now()
     const input: TicketInput = { id: key('input', ticket.id, 'restart', assignment.id), kind: 'text', text: note, at }
     ticket.inputs.push(input); ticket.undelivered.push(input.id); ticket.updatedAt = at
@@ -409,8 +409,10 @@ export class Tickets extends EnginePart {
     return report?.state !== 'ready' || ticket.undelivered.length > 0 || later
   }
   /** Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket. */
-  private newAssignment(ticket: Ticket): Assignment {
+  private newAssignment(ticket: Ticket, replaced?: Assignment): Assignment {
     const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending', createdAt: this.now() }
+    if (replaced?.executionTarget) assignment.executionTarget = replaced.executionTarget
+    if (replaced?.continuation) assignment.continuation = { ...replaced.continuation }
     ticket.assignments.push(assignment)
     delete ticket.delivery
     return assignment

@@ -77,6 +77,26 @@ function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapsho
 }
 
 describe('delegation completion fences', () => {
+  it.each(['interruption', 'retry'] as const)('preserves the reviewed target and its remaining work on %s', async cause => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', executionStopped: request.operation === 'stop' }))
+    await h.proxy.tick()
+    const ticketId = h.current().id, producer = latestAssignment(h.current())!, review = producer.resultReviews!.at(-1)!
+    await h.proxy.prepareReview(ticketId, producer.id, review.id)
+    const instructions = 'Validate the exact registered revision locally and retain the evidence.'
+    h.engine.resolveResultReview(ticketId, producer.id, review.id, { kind: 'continue', instructions, summary: 'Repair complete; validation remains.' })
+    const validation = latestAssignment(h.current())!
+    h.engine.assignmentStarted(ticketId, validation.id)
+    if (cause === 'interruption') h.engine.assignmentInterrupted(ticketId, validation.id)
+    else {
+      h.engine.report(ticketId, { state: 'failed', summary: 'Transient local validation failure.' })
+      h.engine.retryTicket(ticketId)
+    }
+    const replacement = latestAssignment(h.current())!
+    expect(replacement.id).not.toBe(validation.id)
+    expect(replacement).toMatchObject({ executionTarget: 'local', continuation: { reviewId: review.id, instructions } })
+    expect(h.localStarts).toEqual([validation.id, replacement.id])
+    expect(h.proxy.list()).toHaveLength(1)
+  })
   it('restages the same stopped producer result when a newer input arrives during cleanup', async () => {
     const entering = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
     const h = fixture(async request => {
