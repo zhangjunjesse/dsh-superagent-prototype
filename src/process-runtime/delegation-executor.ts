@@ -3,7 +3,7 @@ import { Engine, key, latestAssignment, liveTicket, type Assignment, type Result
 import type { Store } from '../app/store.ts'
 import { family } from '../kv.ts'
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
-import { DelegationRequestSchema, verifiedArtifactLineages, verifiedDelegationArtifacts, verifiedDelegationLineage, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
+import { DelegationRequestSchema, verifiedArtifactLineages, verifiedDelegationArtifacts, verifiedDelegationLineage, verifiedDepartmentWaits, type Capability, type DelegationRequest, type DelegationSnapshot, type VerifiedArtifact } from './delegation-contract.ts'
 import { DelegationTaskContextSchema } from '../sources/delegation-context.ts'
 import type { InboundDelegations } from './delegation-ingress.ts'
 
@@ -122,6 +122,7 @@ export class DelegationExecutor {
         || first.strength !== r.taskContext.strength || first.assignment !== r.taskContext.assignment))))
       throw new Error('Child lineage changed the accepted parent scope or grant')
     verifiedDelegationArtifacts(snapshot)
+    verifiedDepartmentWaits(snapshot)
   }
   private controls(row: Binding, ticket: Ticket): void {
     for (const input of ticket.inputs.filter(input => ticket.undelivered.includes(input.id))) {
@@ -149,14 +150,17 @@ export class DelegationExecutor {
       throw new Error('Bound child stop has not acknowledged execution cleanup')
     return snapshot
   }
-  async shutdown(ticketId?: string): Promise<void> {
+  async shutdown(ticketId?: string, preserveWait?: (ticket: Ticket) => boolean): Promise<void> {
     // A completed business report can precede native job/subagent cleanup.
     // Only a verified lifecycle acknowledgement releases this parent's ownership.
-    const rows = this.list().filter(row => (!ticketId || row.request.parentTicketId === ticketId) && (!row.finished || row.snapshot?.executionStopped !== true))
+    const candidates = this.list().filter(row => (!ticketId || row.request.parentTicketId === ticketId) && (!row.finished || row.snapshot?.executionStopped !== true))
+    const retained = new Set(candidates.filter(row => { const ticket = this.current(row); return ticket && preserveWait?.(ticket) }).map(row => row.request.delegationId))
+    // A restart of the parent must not cancel a descendant whose original task is durably waiting for a department.
+    const rows = candidates.filter(row => !(retained.has(row.request.delegationId) && row.snapshot && verifiedDepartmentWaits(row.snapshot).length))
     for (const row of rows) {
       const ticket = this.current(row)
-      if (ticket) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
-      this.store.set(this.name(row.request.parentTicketId, row.request.parentAssignmentId), { ...this.store.get(this.name(row.request.parentTicketId, row.request.parentAssignmentId))!, stopped: true })
+      if (ticket && !retained.has(row.request.delegationId)) this.engine.stopTicket(ticket.id, 'Owning organization runtime stopped.')
+      if (!retained.has(row.request.delegationId)) this.store.set(this.name(row.request.parentTicketId, row.request.parentAssignmentId), { ...this.store.get(this.name(row.request.parentTicketId, row.request.parentAssignmentId))!, stopped: true })
     }
     const errors: Error[] = []
     for (const pending of rows) {
@@ -169,10 +173,11 @@ export class DelegationExecutor {
           const request: DelegationRequest = { ...row.request, operation: 'stop', commandId: key(row.request.delegationId, 'stop'), text: 'Parent ended this assignment. Stop this delegated task.' }
           snapshot = await this.send(request); this.verify(row, snapshot)
         }
-        this.store.set(name, { ...this.store.get(name)!, stopped: true, finished: true, snapshot: this.stoppedSnapshot(row, snapshot), error: undefined, retryAt: undefined })
+        this.store.set(name, { ...this.store.get(name)!, stopped: retained.has(row.request.delegationId) ? row.stopped : true, finished: true,
+          snapshot: this.stoppedSnapshot(row, snapshot), error: undefined, retryAt: undefined })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        this.store.set(name, { ...this.store.get(name)!, stopped: true, error: message })
+        this.store.set(name, { ...this.store.get(name)!, stopped: retained.has(row.request.delegationId) ? row.stopped : true, error: message })
         errors.push(new Error(`${row.request.targetInstanceId}/${row.request.delegationId}: ${message}`))
       }
     }
@@ -203,7 +208,7 @@ export class DelegationExecutor {
     if (snapshot.status === 'completed' && outstanding) {
       this.engine.report(ticket.id, { state: 'blocked', summary: 'Child completed before the newer input was admitted; review the result and pending request.' })
     }
-    const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question])
+    const hash = fingerprint([snapshot.status, snapshot.summary, snapshot.question, snapshot.departmentWaits])
     if (hash === row.reportHash && snapshot.status !== 'completed') return
     if (snapshot.status === 'completed' && snapshot.ticketId && snapshot.assignmentId && snapshot.summary?.trim()) {
       // Persist the transport binding in the same transaction as the review relay; completion remains the parent's decision.
@@ -218,7 +223,9 @@ export class DelegationExecutor {
         summary: snapshot.summary ?? `Child delegation ${snapshot.status}`, question: snapshot.question?.text ?? null })
       const attention = this.store.tickets.get(ticket.id)?.attention
       if (snapshot.question && attention) row.question = { parentId: attention.id, childId: snapshot.question.id }
-    } else this.engine.report(ticket.id, { state: 'waiting', summary: snapshot.ticketId ? 'Child accepted the task and is executing.' : 'Waiting for child admission.', question: null })
+    } else this.engine.report(ticket.id, { state: 'waiting', summary: snapshot.departmentWaits?.length
+      ? `Waiting for required departments: ${snapshot.departmentWaits.map(wait => wait.responsibility).join('; ')}`
+      : snapshot.ticketId ? 'Child accepted the task and is executing.' : 'Waiting for child admission.', question: null })
     row.reportHash = hash
   }
   async tick(): Promise<void> {

@@ -167,6 +167,8 @@ export class ProcessRuntime {
     if (this.stopping || this.closed) return
     return this.ticking ??= (async () => {
       this.inbound.tick(); await this.pump.tick(); await this.delegated.tick()
+      await this.original.reconcileDepartments()
+      this.original.reconcileDepartmentNotices()
       for (const ticket of this.store.tickets.cancelling()) {
         if (this.delegated.list().some(row => row.request.parentTicketId === ticket.id && row.snapshot?.executionStopped !== true)) continue
         await this.stopNativeTicket(ticket.id)
@@ -252,6 +254,7 @@ export class ProcessRuntime {
     this.available()
     const input = FeedbackSchema.parse(raw)
     await this.pump.tick()
+    this.original.reconcileDepartmentNotices()
     const questionStates: { workRef: string; questionId: string | null }[] = []
     for (let offset = 0;; offset += 20) {
       const works = this.ledger.works('', offset, 20)
@@ -381,7 +384,9 @@ export class ProcessRuntime {
     if (request.operation === 'query') {
       const projection = this.gateway.query(request.input)
       if (request.input.operation !== 'get') return projection
-      return { ...projection, artifacts: this.artifactsForTicket(this.ledger.work(request.input.workRef)?.ticketId) }
+      const ticketId = this.ledger.work(request.input.workRef)?.ticketId
+      return { ...projection, artifacts: this.artifactsForTicket(ticketId),
+        departmentWaits: ticketId ? this.original.departmentWaitsForTicket(ticketId) : [] }
     }
     const page = this.ledger.eventPage(request.conversationId, request.cursor, request.limit)
     const refs = new Set(page.items.map(event => event.workRef))
@@ -403,6 +408,7 @@ export class ProcessRuntime {
       turns: this.store.keys(turns).map(name => this.store.get(name)!).sort((a, b) => a.at.localeCompare(b.at)), tickets: this.store.tickets.list(),
       works: this.gateway.query({ operation: 'search', query: '', cursor: 0, limit: 20 }), events: this.ledger.eventPage(this.conversationId, 0, 50),
       delegations: { incoming: this.inbound.list(), outgoing: this.delegated.list() },
+      departmentWaits: this.store.tickets.open().flatMap(ticket => this.original.departmentWaitsForTicket(ticket.id)),
       execution: { evalModel: settings.eval.model, workerModel: settings.executor.model, maxWorkers: settings.executor.maxWorkers,
         directory: executionRoot(settings, this.original.runtime.machine.stateDir) },
       health: { ...this.original.runtime.health, ...this.board.all }, active: [...this.active.values()].map(({ sessionKey, role, requestId }) => ({ sessionKey, role, requestId })) }
@@ -433,6 +439,7 @@ export class ProcessRuntime {
     const paths = snapshot.ticketId ? this.delegated.artifactLineages(snapshot.ticketId).map(path =>
       [this.inbound.resultLink(snapshot.delegationId, path[0]!.parentAssignmentId), ...path]) : []
     return { ...snapshot, artifacts: this.artifactsForTicket(snapshot.ticketId),
+      ...(snapshot.ticketId ? { departmentWaits: this.original.departmentWaitsForTicket(snapshot.ticketId) } : {}),
       ...(snapshot.lineage ? { lineage: [...snapshot.lineage, ...(downstream && downstream.lineage || [])] } : {}),
       ...(paths.length ? { artifactLineages: paths } : {}) }
   }
@@ -475,10 +482,11 @@ export class ProcessRuntime {
     await this.options.native.sessions.flush()
   }
   /** A stopped management owner can finish persisted controls without starting Sources, Router or Workers. */
-  async drainDelegations(): Promise<void> {
+  async drainDelegations(raw: unknown = {}): Promise<void> {
+    const { preserveDepartmentWaits } = z.object({ preserveDepartmentWaits: z.boolean().optional() }).strict().parse(raw)
     await this.ready
     await this.original.beginShutdown()
-    await this.delegated.shutdown()
+    await this.delegated.shutdown(undefined, preserveDepartmentWaits ? ticket => this.original.departmentWaitsForTicket(ticket.id).length > 0 : undefined)
     for (const ticket of this.store.tickets.cancelling()) {
       await this.stopNativeTicket(ticket.id)
       this.engine.confirmCancellation(ticket.id)
@@ -578,15 +586,16 @@ export class ProcessRuntime {
     await this.tick()
     return this.capabilitySnapshot()
   }
-  close(): Promise<void> {
-    return this.closing ??= this.shutdown().catch(error => { this.closing = undefined; throw error })
+  close(raw: unknown = {}): Promise<void> {
+    const { preserveDepartmentWaits } = z.object({ preserveDepartmentWaits: z.boolean().optional() }).strict().parse(raw)
+    return this.closing ??= this.shutdown(preserveDepartmentWaits).catch(error => { this.closing = undefined; throw error })
   }
-  private async shutdown(): Promise<void> {
+  private async shutdown(preserveDepartmentWaits = false): Promise<void> {
     this.stopping = true; clearInterval(this.timer)
     await Promise.allSettled([...this.active.values()].map(request => this.host.cancel({ sessionKey: request.sessionKey })))
     await this.inbound.close()
     await this.ticking
-    if (!this.options.managementOnly) await this.drainDelegations()
+    if (!this.options.managementOnly) await this.drainDelegations({ preserveDepartmentWaits })
     await this.original.close(); this.closed = true
   }
 

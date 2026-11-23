@@ -88,6 +88,10 @@ export interface RuntimeOptions {
     prepareReview?(ticketId: string, target?: string): Promise<void>
   }
   reportArtifacts?: ExecutorToolsHost['reportArtifacts']
+  waitForDepartment?: MainToolsHost['waitForDepartment']
+  holdForDepartment?: MainToolsHost['holdForDepartment']
+  resumeDepartment?: MainToolsHost['resumeDepartment']
+  reportMissingDepartment?: ExecutorToolsHost['reportMissingDepartment']
   /** Runs after Store/composition is established, before initialize resolves setup. */
   initialize?(runtime: Runtime): void
 }
@@ -235,6 +239,9 @@ export class Runtime extends Service implements SourceHost {
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select, prepareReview: options.routing?.prepareReview,
         reportArtifacts: options.reportArtifacts,
+        waitForDepartment: options.waitForDepartment,
+        holdForDepartment: options.holdForDepartment, resumeDepartment: options.resumeDepartment,
+        reportMissingDepartment: options.reportMissingDepartment,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }

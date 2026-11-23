@@ -590,7 +590,7 @@ export class ProcessManager {
     if (item.child && item.phase === 'running' && !item.cleanupPending) return this.status();
     // A timed-out participant, native drain or bound child stop retains ownership.
     // Retry every old owner before creating another business generation.
-    await this.stopInstance(item);
+    await this.stopInstance(item, { preserveDepartmentWaits: this.cleanupIntent(item)?.preserveDepartmentWaits === true });
     if (this.closing) throw new Error('Runtime manager is closing');
     if (item.stopEpoch !== stopEpoch) throw new Error('Instance start was superseded by an explicit stop');
     item.phase = 'starting'; item.error = undefined; item.generation++;
@@ -748,6 +748,9 @@ export class ProcessManager {
     let result;
     if (control && target.phase !== 'running') {
       result = await this.exclusive(target, async () => {
+        // A query queued behind a restart must use the replacement live owner, not stop that newly ready generation.
+        if (target.phase === 'running' && target.peer && !target.cleanupPending)
+          return target.peer.call('lifecycle.delegation', { sourceInstanceId: sourceId, request }, 30000);
         if (target.phase !== 'stopped' || target.child || target.bridge || target.native || target.cleanupPending) await this.stopInstance(target);
         const owner = target.management ?? await this.openManagement(target);
         try { return await owner.peer.call('lifecycle.delegation', { sourceInstanceId: sourceId, request }, 30000); }
@@ -884,20 +887,22 @@ export class ProcessManager {
     const file = join(item.config.stateDir, 'lifecycle-cleanup.json');
     if (!existsSync(file)) return undefined;
     const value = JSON.parse(readFileSync(file, 'utf8'));
-    if (value.version !== 1 || value.instanceId !== item.config.instanceId || typeof value.pending !== 'boolean') throw new Error('Invalid organization cleanup intent');
+    if (value.version !== 1 || value.instanceId !== item.config.instanceId || typeof value.pending !== 'boolean'
+      || value.preserveDepartmentWaits !== undefined && typeof value.preserveDepartmentWaits !== 'boolean') throw new Error('Invalid organization cleanup intent');
     return value;
   }
-  saveCleanupIntent(item, pending) {
+  saveCleanupIntent(item, pending, { preserveDepartmentWaits = false } = {}) {
     const file = join(item.config.stateDir, 'lifecycle-cleanup.json'), temporary = `${file}.${randomUUID()}.tmp`, fd = openSync(temporary, 'wx', 0o600);
-    try { writeFileSync(fd, JSON.stringify({ version: 1, instanceId: item.config.instanceId, generation: item.generation, pending, at: new Date().toISOString() })); fsyncSync(fd); }
+    try { writeFileSync(fd, JSON.stringify({ version: 1, instanceId: item.config.instanceId, generation: item.generation, pending,
+      ...(preserveDepartmentWaits ? { preserveDepartmentWaits: true } : {}), at: new Date().toISOString() })); fsyncSync(fd); }
     finally { closeSync(fd); }
     replaceAtomic(temporary, file);
   }
-  async drainStoredDelegations(item) {
+  async drainStoredDelegations(item, { preserveDepartmentWaits = false } = {}) {
     if (!this.cleanupIntent(item)?.pending) return;
     if (existsSync(join(item.config.stateDir, 'orchestrator.sqlite'))) {
       const owner = item.management ?? await this.openManagement(item);
-      try { await owner.peer.call('lifecycle.drain', {}, 30000); }
+      try { await owner.peer.call('lifecycle.drain', preserveDepartmentWaits ? { preserveDepartmentWaits: true } : {}, 30000); }
       finally { await this.closeManagement(item); }
     }
     this.saveCleanupIntent(item, false);
@@ -906,7 +911,7 @@ export class ProcessManager {
     for (const item of this.stopOrder()) {
       if (this.closing) return;
       if (!item.cleanupPending) continue;
-      try { await this.exclusive(item, () => this.stopInstance(item)); }
+      try { await this.exclusive(item, () => this.stopInstance(item, { preserveDepartmentWaits: this.cleanupIntent(item)?.preserveDepartmentWaits === true })); }
       catch (error) { item.error = `Pending cleanup could not recover: ${error.message}`; this.record(); }
     }
   }
@@ -984,7 +989,7 @@ export class ProcessManager {
     this.beginStop(item, 'Organization runtime stopped');
     return this.exclusive(item, () => this.stopInstance(item), { queue: true });
   }
-  async stopInstance(item) {
+  async stopInstance(item, { preserveDepartmentWaits = false } = {}) {
     if (item.phase !== 'stopping') this.beginStop(item, 'Organization runtime stopped');
     const failures = [];
     const attempt = async operation => { try { await operation(); return true; } catch (error) { failures.push(error); return false; } };
@@ -998,7 +1003,7 @@ export class ProcessManager {
       this.event(item, 'stop');
       // The business owner first stops its exact durable child bindings while
       // its native ports and IPC still exist. A failed acknowledgement is retryable.
-      const closing = attempt(() => item.peer.call('close', {}, 30000));
+      const closing = attempt(() => item.peer.call('close', preserveDepartmentWaits ? { preserveDepartmentWaits: true } : {}, 30000));
       const [closed] = await Promise.all([closing, suspension, management, bridgeClosed]);
       if (closed) {
         const native = item.native;
@@ -1012,7 +1017,7 @@ export class ProcessManager {
     if (!item.child) {
       if (item.bridge && await attempt(() => item.bridge.close())) item.bridge = null;
       if (item.native && await attempt(() => item.native.close())) item.native = null;
-      await attempt(() => this.drainStoredDelegations(item));
+      await attempt(() => this.drainStoredDelegations(item, { preserveDepartmentWaits }));
     }
     if (failures.length || item.child || item.bridge || item.native || item.management) {
       item.phase = 'failed'; item.cleanupPending = true;
@@ -1030,8 +1035,9 @@ export class ProcessManager {
     const item = this.instance(id);
     this.capabilityLifecycle(item, capabilityOperationId);
     const stopEpoch = item.stopEpoch;
+    this.saveCleanupIntent(item, true, { preserveDepartmentWaits: true });
     if (!item.operation || item.operationKind === 'management') this.beginStop(item, 'Organization runtime restarting');
-    return this.exclusive(item, async () => { await this.stopInstance(item); return this.startInstance(item, stopEpoch); });
+    return this.exclusive(item, async () => { await this.stopInstance(item, { preserveDepartmentWaits: true }); return this.startInstance(item, stopEpoch); });
   }
   async close() {
     if (this.closePromise) return this.closePromise;
