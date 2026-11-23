@@ -166,10 +166,14 @@ describe('single-hop SuperJarvis delegation', () => {
     const runningJobs = port.runningJobs, untilQuiet = port.untilQuiet
     port.runningJobs = async () => remaining === 'jobs' ? [{ id: 'still-owned', name: 'Still running owned job' }] : []
     port.untilQuiet = async () => remaining !== 'descendants'
-    await expect(h.nodes.parent.close()).rejects.toThrow('native execution cleanup has not completed')
-    expect((await h.nodes.child.state()).tickets[0]?.ended?.outcome).toBe('stopped')
-    port.runningJobs = runningJobs; port.untilQuiet = untilQuiet
+    try {
+      await expect(h.nodes.parent.close()).rejects.toThrow('native execution cleanup has not completed')
+      const pending = (await h.nodes.child.state()).tickets[0]!
+      expect(pending.cancellation).toBeDefined()
+      expect(pending.ended).toBeUndefined()
+    } finally { port.runningJobs = runningJobs; port.untilQuiet = untilQuiet }
     await h.nodes.parent.close()
+    expect((await h.nodes.child.state()).tickets[0]?.ended?.outcome).toBe('stopped')
     const controls = h.transport.filter(request => request.operation === 'stop')
     expect(controls.length).toBeGreaterThanOrEqual(2)
     expect(new Set(controls.map(request => request.commandId)).size).toBe(1)
@@ -264,14 +268,18 @@ describe('single-hop SuperJarvis delegation', () => {
     const h = pair({ holdWorker: true }), port = h.nativePorts.child.executor;
     await h.nodes.parent.chat({ id: 'cancel-group', text: 'Read the fixed delegated marker.' })
     await h.until(() => [...h.waits.keys()].some(key => key.startsWith('worker:')))
-    const original = port.runningJobs
-    port.runningJobs = async () => [{ id: 'draining', name: 'Finishing this assignment' }]
+    const original = port.runningJobs, queried = Promise.withResolvers<void>()
+    port.runningJobs = async () => { queried.resolve(); return [{ id: 'draining', name: 'Finishing this assignment' }] }
     try {
       await h.control('stop')
       const waiting = await h.until(state => state.delegations.outgoing[0]?.stopped === true)
       expect(waiting.tickets[0]?.ended).toBeUndefined()
       expect('items' in waiting.works && waiting.works.items?.[0]).toMatchObject({ status: 'cancelling', canSubmit: false })
       expect(waiting.delegations.outgoing[0]?.finished).not.toBe(true)
+      await queried.promise
+      const leaf = (await h.nodes.child.state()).tickets[0]!
+      expect(leaf.cancellation).toBeDefined()
+      expect(leaf.ended).toBeUndefined()
     } finally { port.runningJobs = original }
     const settled = await h.until(state => state.tickets[0]?.ended?.outcome === 'stopped')
     expect(settled.delegations.outgoing[0]?.snapshot?.executionStopped).toBe(true)

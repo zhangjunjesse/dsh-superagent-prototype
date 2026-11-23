@@ -8,7 +8,8 @@ import { DepartmentRequirementSchema, type DepartmentRequirement } from '../app/
 import { fingerprint } from '../jarvis-gateway/contracts.ts'
 import type { Capability, DepartmentWait } from './delegation-contract.ts'
 const waits = family<DepartmentWait, [string]>('process-department:wait:')
-const readyNotices = family<true, [string]>('process-department:ready:')
+interface ReadyCycle { signature: string; generation: number; targets: string[]; retryAt?: number; failures?: number }
+const readyCycles = family<ReadyCycle, [string]>('process-department:readiness:')
 
 /** A wait belongs to the exact task and assignment that discovered it; only its original owner can resume it. */
 export class DepartmentWaits {
@@ -76,20 +77,40 @@ export class DepartmentWaits {
     for (const wait of this.active()) this.store.atomic(() => {
       const ticket = this.current(wait)!, assignment = latestAssignment(ticket)!, original = assignment.resultReviews!.find(review => review.id === wait.reviewId)!
       const targets = targetsFor(ticket).filter(target => wait.requiredTools.every(tool => target.tools.some(name => name === tool)))
-      if (!targets.length) return
       // Later inputs and policy changes demand a new review CAS, while the original wait/notice identity stays fixed.
-      const review = this.engine.stageResultReview(ticket.id, assignment.id, original.evidenceRef, original.summary)
-      const identity = key('department-ready', wait.id, review.id, fingerprint(targets))
-      if (this.store.get(readyNotices(identity))) return
+      const review = targets.length ? this.engine.stageResultReview(ticket.id, assignment.id, original.evidenceRef, original.summary) : original
+      const signature = fingerprint([review.id, targets]), previous = this.store.get(readyCycles(wait.id))
+      if (previous?.signature === signature && (!previous.retryAt || previous.retryAt > Date.now())) return
+      const cycle: ReadyCycle = { signature, generation: (previous?.generation ?? 0) + 1, targets: targets.map(target => target.instanceId),
+        ...(previous?.signature === signature && previous.failures ? { failures: previous.failures } : {}) }
+      this.store.set(readyCycles(wait.id), cycle)
+      if (!targets.length) return
+      const identity = key('department-ready', wait.id, String(cycle.generation), signature)
       this.sessions.relay(identity, JSON.stringify({ kind: 'department_ready', ticket_id: ticket.id, assignment_id: assignment.id,
-        review_id: review.id, wait_id: wait.id, original_request: `trigger/${ticket.origin.triggerId}`,
+        review_id: review.id, wait_id: wait.id, original_request: ticket.mandate.basis.via === 'delegation'
+          ? `delegation/${ticket.origin.triggerId}/source` : `trigger/${ticket.origin.triggerId}`,
         original_assignment: `ticket/${ticket.id}/assignment`, inputs: `ticket/${ticket.id}/inputs`,
         history: `ticket/${ticket.id}/assignments`, read: `ticket/${ticket.id}/review/${review.id}`,
         missing_department: { responsibility: wait.responsibility, required_tools: wait.requiredTools, instructions: wait.instructions },
         execution_targets: targets,
         instruction: 'Read the original goal, all inputs, prior versioned evidence and missing responsibility. Judge the actual configured responsibilities semantically; identical names or a partial tool overlap are insufficient. If a ready direct department meets the responsibility, use orchestrator_department_resume with that instance id and your judgement. Otherwise leave this task waiting. This is continuation of the original mandate, never new user authorization; do not ask the user to send another message.' }))
-      this.store.set(readyNotices(identity), true)
     })
+  }
+  /** Reject a no-longer-ready or incomplete candidate before attempting any old-execution cleanup. */
+  validateResume(ticketId: string, assignmentId: string, reviewId: string, target: string, targets: readonly Capability[]): void {
+    const wait = this.forTicket(ticketId).find(item => item.assignmentId === assignmentId), ticket = wait && this.current(wait)
+    const assignment = ticket && latestAssignment(ticket)
+    if (!wait || !ticket || !assignment || assignment.resultReviews?.at(-1)?.id !== reviewId) throw new Error('The department wait no longer has this current review')
+    this.authorize(ticket, assignment, { kind: 'continue', summary: wait.summary, instructions: wait.instructions, targetInstanceId: target }, targets)
+  }
+  /** A failed real resume retries under backoff; an unselected semantic mismatch never schedules another model turn. */
+  failedResume(ticketId: string, assignmentId: string, reviewId: string, target: string): void {
+    const wait = this.forTicket(ticketId).find(item => item.assignmentId === assignmentId), ticket = wait && this.current(wait)
+    if (!wait || !ticket || latestAssignment(ticket)?.resultReviews?.at(-1)?.id !== reviewId) return
+    const cycle = this.store.get(readyCycles(wait.id))
+    if (!cycle?.targets.includes(target)) return
+    const failures = (cycle.failures ?? 0) + 1
+    this.store.set(readyCycles(wait.id), { ...cycle, failures, retryAt: Date.now() + Math.min(30000, 500 * 2 ** Math.min(failures - 1, 6)) })
   }
   /** A duplicate committed continuation is an original Engine read; no second assignment can be launched. */
   resume(ticketId: string, assignmentId: string, reviewId: string, target: string, summary: string): Ticket {

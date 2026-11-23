@@ -9,6 +9,7 @@ const within = (root, path) => { const part = relative(root, path); return !isAb
 const types = { '.html':'text/html; charset=utf-8', '.htm':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8',
   '.js':'text/javascript; charset=utf-8', '.json':'application/json; charset=utf-8', '.txt':'text/plain; charset=utf-8', '.md':'text/plain; charset=utf-8',
   '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.webp':'image/webp', '.svg':'image/svg+xml', '.pdf':'application/pdf' };
+const recordedDirectory = path => realpath(path).catch(error => { if (error.code === 'ENOENT') return resolve(path); throw error; });
 
 function ticketRecord(stateDir, ticketId) {
   const db = new DatabaseSync(join(stateDir, 'orchestrator.sqlite'), { readOnly: true });
@@ -39,17 +40,20 @@ export async function handleArtifactRequest({ path, req, res, system }) {
   if (version ? !registered : !task?.artifacts?.some(artifact => artifact.path === fileName)) throw new UserError('未找到已登记的任务成果', 404);
   let handle;
   try {
-    const root = await realpath(item.config.workspace), workspace = await realpath(task.workspace);
+    const root = await realpath(item.config.workspace), workspace = await (registered ? recordedDirectory(task.workspace) : realpath(task.workspace));
     let file, immutable;
     if (registered) {
+      if (!/^[a-f0-9]{64}$/.test(registered.version.sha256) || !Number.isSafeInteger(registered.version.size) || registered.version.size < 0
+        || registered.path.split('/').some(part => !part || part === '.' || part === '..')) throw new UserError('成果版本记录无效', 409);
       const ticket = ticketRecord(item.config.stateDir, ticketId);
       if (!ticket?.assignments?.some(assignment => assignment.id === registered.assignmentId)
-        || !ticket.execution?.directory || relative(await realpath(ticket.execution.directory), workspace) !== '') throw new UserError('成果没有匹配的原工单执行记录', 409);
+        || !ticket.execution?.directory || relative(await recordedDirectory(ticket.execution.directory), workspace) !== '') throw new UserError('成果没有匹配的原工单执行记录', 409);
       const managedRoot = join(await realpath(item.config.stateDir), 'task-artifact-versions');
-      const expected = resolve(managedRoot, createHash('sha256').update(ticketId).digest('hex'),
-        createHash('sha256').update(registered.assignmentId).digest('hex'), registered.version.sha256, registered.path);
+      const versionRoot = resolve(managedRoot, createHash('sha256').update(ticketId).digest('hex'),
+        createHash('sha256').update(registered.assignmentId).digest('hex'), registered.version.sha256);
+      const expected = resolve(versionRoot, registered.path);
       file = await realpath(expected);
-      if (!within(managedRoot, file) || relative(expected, file) !== '') throw new UserError('成果版本路径已改变', 409);
+      if (!within(versionRoot, file) || relative(expected, file) !== '') throw new UserError('成果版本路径已改变', 409);
       immutable = await readFile(file);
       if (immutable.length !== registered.version.size || createHash('sha256').update(immutable).digest('hex') !== registered.version.sha256) throw new UserError('成果版本核验失败', 409);
     } else file = await realpath(resolve(workspace, fileName));
@@ -58,7 +62,7 @@ export async function handleArtifactRequest({ path, req, res, system }) {
     let allowed = within(root, workspace);
     if (!allowed) {
       const execution = ticketRecord(item.config.stateDir, ticketId)?.execution?.directory;
-      allowed = typeof execution === 'string' && isAbsolute(execution) && relative(await realpath(execution), workspace) === '';
+      allowed = typeof execution === 'string' && isAbsolute(execution) && relative(await (registered ? recordedDirectory(execution) : realpath(execution)), workspace) === '';
     }
     if (!allowed || !registered && !within(workspace, file)) throw new UserError('成果路径已改变，请重新生成', 409);
     handle = await open(file, 'r');
@@ -67,7 +71,7 @@ export async function handleArtifactRequest({ path, req, res, system }) {
     const download = new URL(req.url, 'http://localhost').searchParams.get('download') === '1';
     res.writeHead(200, {
       'Content-Type': download ? 'application/octet-stream' : (types[extname(file).toLowerCase()] ?? 'application/octet-stream'),
-      'Content-Length': stat.size, 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff',
+      'Content-Length': immutable ? immutable.length : stat.size, 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff',
       'Content-Disposition': `${download ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(basename(file))}`,
       // Generated HTML must never gain this application's origin or access its authenticated APIs.
       'Content-Security-Policy': "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'none'; form-action 'none'; frame-ancestors 'self'",

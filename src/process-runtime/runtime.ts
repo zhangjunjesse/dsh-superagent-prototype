@@ -177,11 +177,16 @@ export class ProcessRuntime {
       this.inbound.tick(); await this.pump.tick(); await this.delegated.tick()
       await this.original.reconcileDepartments()
       this.original.reconcileDepartmentNotices()
-      for (const ticket of this.store.tickets.cancelling()) {
-        if (this.delegated.list().some(row => row.request.parentTicketId === ticket.id && row.snapshot?.executionStopped !== true)) continue
+      const cancelling = this.store.tickets.cancelling()
+      if (!cancelling.length) return
+      const outstanding = new Set(this.delegated.list().filter(row => row.snapshot?.executionStopped !== true).map(row => row.request.parentTicketId))
+      const localStops = cancelling.filter(ticket => !outstanding.has(ticket.id))
+      const results = await Promise.allSettled(localStops.map(async ticket => {
         await this.stopNativeTicket(ticket.id)
         this.engine.confirmCancellation(ticket.id)
-      }
+      }))
+      const failed = results.find(result => result.status === 'rejected')
+      if (failed?.status === 'rejected') throw failed.reason
     })().finally(() => { this.ticking = undefined })
   }
   private recover(): void {

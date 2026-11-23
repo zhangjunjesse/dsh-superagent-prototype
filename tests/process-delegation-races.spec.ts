@@ -77,6 +77,31 @@ function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapsho
 }
 
 describe('delegation completion fences', () => {
+  it('restages the same stopped producer result when a newer input arrives during cleanup', async () => {
+    const entering = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const h = fixture(async request => {
+      if (request.operation === 'stop') { entering.resolve(); await release.promise }
+      return childSnapshot(request, { status: 'completed', ...(request.operation === 'stop' ? { executionStopped: true } : {}) })
+    })
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    const preparing = h.proxy.prepareReview(h.current().id, first.id, review.id)
+    await entering.promise
+    const input = h.append('new-input-during-stop', 'Also retain the existing tested revision in the report.')
+    release.resolve(); await preparing
+    const decision = { kind: 'continue' as const, summary: 'The original validation and new reporting input remain.', instructions: 'Validate the same revision and include the later reporting input.' }
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, decision)).toThrow('stale')
+    expect(h.current().assignments).toHaveLength(1)
+    await h.proxy.tick()
+    const refreshed = latestAssignment(h.current())!.resultReviews!.at(-1)!
+    expect(refreshed.id).not.toBe(review.id)
+    expect(refreshed.evidenceRef).toBe(review.evidenceRef)
+    await h.proxy.prepareReview(h.current().id, first.id, refreshed.id)
+    h.engine.resolveResultReview(h.current().id, first.id, refreshed.id, decision)
+    expect(h.current().assignments).toHaveLength(2)
+    expect(h.current().undelivered).toContain(input.id)
+    expect(h.proxy.list()[0]!.handoff!.stopped!.executionStopped).toBe(true)
+  })
   it('keeps the parent ticket open for its own goal verification after a child completes', async () => {
     const h = fixture(async request => childSnapshot(request, { status: 'completed',
       summary: 'Marker A was checked. Marker B has not been verified.' }), {

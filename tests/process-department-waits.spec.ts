@@ -1,5 +1,5 @@
 /** Missing departments use the original native tools, durable task bindings and Gateway. */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -60,9 +60,10 @@ it('holds the original newly accepted task once without launching a local Worker
   expect(native.errors).toEqual([])
 }, 10000)
 
-it('reopens a wait, filters all required permissions and automatically resumes the same task only after the original main Session matches real responsibilities', async () => {
+it.each(['cleanup-failure', 'offline'] as const)('reopens a wait and automatically resumes only after matching real responsibility, recovering %s without user input', async mode => {
   const config = configuration('root'), nodes = new Map<string, ProcessRuntime>(), catalogs: NonNullable<ProcessRuntimeConfig['delegationTargets']> = []
   const nativeErrors: unknown[][] = [], submitted: string[] = [], workerCalls: string[] = [], readyCards: NativeTurn[] = []
+  let failCleanup = false, failedResume = false, completedResumes = 0, observedOffline = false
   let root: ProcessRuntime
   function open(input: ProcessRuntimeConfig) {
     const host: ProcessHost = { run: async request => {
@@ -71,6 +72,7 @@ it('reopens a wait, filters all required permissions and automatically resumes t
       else await owner.tool({ ...request, name: 'jarvis_work_submit', args: { operation: 'new', request: { quote: request.text, summary: request.text } } })
       return { status: 'complete', text: 'Accepted.' }
     }, cancel: async () => ({ cancelled: true }),
+      readArtifact: async request => { nodes.get(input.instanceId)!.authorizeArtifact(request); return nodes.get(request.artifact.instanceId)!.readArtifact({ artifact: request.artifact, offset: request.offset, limit: request.limit }) },
       delegationCatalog: async () => ({ targets: input.instanceId === 'root' ? catalogs : [], readyInstanceIds: input.instanceId === 'root'
         ? (await Promise.all(catalogs.map(async target => await nodes.get(target.instanceId)?.delegationReadiness().then(value => value.ready) ? target.instanceId : undefined))).filter((id): id is string => !!id) : [] }),
       delegate: async request => {
@@ -96,11 +98,23 @@ it('reopens a wait, filters all required permissions and automatically resumes t
           await expect(turn.tool('orchestrator_department_resume', { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
             target_instance_id: 'read-only', summary: 'Read-only is missing a necessary permission.' })).rejects.toThrow('required')
           const target = card.execution_targets.find((item: { description: string }) => item.description === requirement.responsibility)
-          if (!target) return // The real main Session rejects an unrelated responsibility, even with the same display name.
+          if (!target) { if (failedResume) observedOffline = true; return } // Same display name does not satisfy the responsibility.
           const args = { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id, target_instance_id: target.instanceId,
             summary: 'The actual ready direct department is responsible for independent measurement and certification.' }
+          if (!failedResume) {
+            failedResume = true
+            if (mode === 'cleanup-failure') {
+              failCleanup = true
+              await expect(turn.tool('orchestrator_department_resume', args)).rejects.toThrow('transient native cleanup failure')
+            } else {
+              const child = nodes.get('certifier')!; await child.close(); owners.splice(owners.indexOf(child), 1); nodes.delete('certifier')
+              await expect(turn.tool('orchestrator_department_resume', args)).rejects.toThrow('required')
+            }
+            return // There is no user message or manual tool retry; the durable owner must drive the next attempt.
+          }
           await turn.tool('orchestrator_department_resume', args)
           await turn.tool('orchestrator_department_resume', args)
+          completedResumes++
           return
         }
         if (card.kind === 'result_review' && card.summary.includes('Validation passed')) await acceptOriginalReview(turn)
@@ -111,6 +125,7 @@ it('reopens a wait, filters all required permissions and automatically resumes t
       writeFileSync(join(turn.policy.cwd, 'certificate.txt'), 'tested_version=marker-v1\npassed=true\n')
       await turn.tool('orchestrator_report', { state: 'ready', summary: 'Validation passed for marker-v1.', artifacts: [{ path: 'certificate.txt', title: 'Versioned certificate' }] })
     })
+    native.native.executor.stopBackground = async () => { if (failCleanup) { failCleanup = false; throw new Error('transient native cleanup failure') } }
     nativeErrors.push(native.errors)
     const owner = createProcessRuntime(input, host, { native: native.native }); owners.push(owner); nodes.set(input.instanceId, owner)
     return owner
@@ -135,7 +150,15 @@ it('reopens a wait, filters all required permissions and automatically resumes t
   await vi.waitFor(() => expect(readyCards.length).toBeGreaterThan(0), { timeout: 3000 })
   expect(submitted).toEqual([]); expect(workerCalls).toEqual([])
   expect((await root.state()).tickets[0]!.assignments).toHaveLength(1)
+  const unmatchedTurns = readyCards.length
+  for (let attempt = 0; attempt < 3; attempt++) await root.gatewayRequest({ operation: 'query', input: { operation: 'search' } })
+  expect(readyCards).toHaveLength(unmatchedTurns)
   open(certifier)
+  if (mode === 'offline') {
+    await vi.waitFor(() => expect(observedOffline).toBe(true), { timeout: 3000 })
+    expect(submitted).toEqual([])
+    open(certifier)
+  }
   await vi.waitFor(async () => expect((await root.state()).tickets[0]?.ended?.outcome).toBe('completed'), { timeout: 6000 })
   const completed = (await root.state()).tickets[0]!
   expect(completed.id).toBe(original.id); expect(completed.decisionId).toBe(original.decisionId); expect(completed.mandate).toEqual(original.mandate)
@@ -144,6 +167,7 @@ it('reopens a wait, filters all required permissions and automatically resumes t
   expect(completed.assignments[1]?.continuation?.instructions).toContain(requirement.instructions)
   expect(completed.assignments[0]?.resultReviews?.[0]?.decision?.kind).toBe('continue')
   expect(submitted).toHaveLength(1); expect(workerCalls).toEqual(['certifier'])
+  expect(failedResume).toBe(true); expect(completedResumes).toBe(1)
   expect((await root.feedback()).items.filter(event => event.kind === 'message')).toHaveLength(1)
   expect((await root.conversation()).turns).toEqual(oldConversation)
   expect(nativeErrors.flat()).toEqual([])
@@ -164,6 +188,7 @@ it('forwards a partial-result department wait up the immutable delegation path a
           : { operation: 'new', request: { quote: request.text, summary: request.text } } })
       return { status: 'complete', text: 'Accepted.' }
     }, cancel: async () => ({ cancelled: true }),
+      readArtifact: async input => { nodes[id].authorizeArtifact(input); return nodes[input.artifact.instanceId as keyof typeof nodes].readArtifact({ artifact: input.artifact, offset: input.offset, limit: input.limit }) },
       delegationCatalog: async () => {
         const targets = id === 'division' ? divisionCatalog : configs[id].delegationTargets ?? []
         const readyInstanceIds: string[] = []
@@ -182,6 +207,7 @@ it('forwards a partial-result department wait up the immutable delegation path a
         if (card.kind === 'department_ready') {
           const review = await originalText(turn, card.read)
           expect(review).toContain(repairHash)
+          expect(await originalText(turn, card.original_request)).toContain('independently certify the exact delivered version')
           const args = { ticket_id: card.ticket_id, assignment_id: card.assignment_id, review_id: card.review_id,
             target_instance_id: 'lab', summary: 'The ready laboratory certifies the delivered version within every original permission.' }
           await turn.tool('orchestrator_department_resume', args); await turn.tool('orchestrator_department_resume', args); return
@@ -198,6 +224,8 @@ it('forwards a partial-result department wait up the immutable delegation path a
         heldReport = await turn.tool('orchestrator_report', args)
       } else if (id === 'lab') {
         expect(await originalText(turn, card.trigger.delegation.assignment.read)).toContain(repairHash)
+        const [file] = card.execution.handoff
+        expect(createHash('sha256').update(readFileSync(join(turn.policy.cwd, file.path))).digest('hex')).toBe(repairHash)
         writeFileSync(join(turn.policy.cwd, 'validation.txt'), `tested_sha256=${repairHash}\npassed=true\nsource=${repairFile}\n`)
         await turn.tool('orchestrator_report', { state: 'ready', summary: `Certified sha256 ${repairHash}; observed the repaired marker.`, artifacts: [{ path: 'validation.txt', title: 'Certification of original version' }] })
       } else throw new Error('The group must not execute a local Worker')
