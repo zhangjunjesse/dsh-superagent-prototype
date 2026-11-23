@@ -13,6 +13,24 @@ import { NativeJournal } from '../process-runtime/native-journal.mjs';
 const event=(seq,type,data={})=>({seq,time:1700000000000+seq,type,data});
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const identity=(...parts)=>hash(JSON.stringify(parts));
+
+test('out-of-order confirmed delegation edges relink the leaf execution to the original group trace',async t=>{
+  const ui=await fixture(t), sources=ui.logs.sources, org=id=>({organizationId:id,organizationName:id});
+  function edge(parent,child,parentId,childId,delegationId) {
+    const request={targetInstanceId:child,parentTicketId:parentId,parentAssignmentId:'a-'+parentId,parentDecisionId:'d-'+parentId,delegationId};
+    const snapshot={...request,childInstanceId:child,ticketId:childId};
+    const authority={...request,parentInstanceId:parent};
+    sources.coreRow('ticket',{id:childId,value:JSON.stringify({id:childId,mandate:{basis:{via:'delegation',delegation:authority}}})},org(child),'core:'+child);
+    sources.processRow({key:'process-delegation:out:'+delegationId,value:JSON.stringify({request,snapshot})},org(parent));
+  }
+  edge('manager','research','middle','leaf','second');
+  edge('root','manager','top','middle','first');
+  sources.coreRow('ticket',{id:'unrelated',value:JSON.stringify({id:'unrelated'})},org('research'),'core:research');
+  ui.logs.links.command('root',{id:'cmd',workRef:'JW-chain',origin:{}},{ticketId:'top'});
+  const linked=await ui.list({trace:'work:root:JW-chain'});
+  assert.ok(linked.some(row=>row.organizationId==='research'&&row.refs.ticketId==='leaf'&&row.event==='core/ticket/snapshot'));
+  assert.ok(!linked.some(row=>row.refs.ticketId==='unrelated'));
+});
 function syntheticStore(file) {
   const db=new DatabaseSync(file);db.exec(`CREATE TABLE turns(id TEXT,value TEXT);CREATE TABLE session_switches(id TEXT,value TEXT);
     CREATE TABLE trigger(id TEXT,value TEXT);CREATE TABLE disposition(id TEXT,value TEXT);CREATE TABLE decision(id TEXT,value TEXT);

@@ -30,6 +30,23 @@ const partSummary = (card, name) => taskPart(card, name).querySelector(':scope >
 const artifactUrl = (name, organization = 'culture', ticketId = 'child-ticket') =>
   `/jarvis/api/system/${organization}/artifacts/${ticketId}/` + name.split('/').map(encodeURIComponent).join('/');
 const artifactLine = (title, url) => `- ${title}：[打开](${url}) · [下载](${url}?download=1)`;
+
+test('expanded group card renders each fixed handoff and only the matching child file', async t => {
+  const url = artifactUrl('report.csv', 'research', 'leaf');
+  const root = { instanceId: 'root', name: '集团' }, manager = { instanceId: 'manager', name: '管理部' };
+  const leaf = { instanceId: 'research', name: '研发部' };
+  const delegations = [{ from: root, to: manager, ticketId: 't1', assignmentId: 'a1', childTicketId: 't2', statusLabel: '执行中' },
+    { from: manager, to: leaf, ticketId: 't2', assignmentId: 'a2', childTicketId: 'leaf', statusLabel: '已完成',
+      report: { summary: '已导出两条记录' }, artifacts: [{ url, downloadUrl: url+'?download=1', title: '导出文件' },
+        { url: artifactUrl('other.csv'), downloadUrl: artifactUrl('other.csv')+'?download=1', title: '其他工单' }] }];
+  const { w } = await openPage(t, { state: visibleState, api: async path => path.startsWith('/api/tasks/') ? taskDetail(task({ delegations })) : taskPage([task()]) });
+  const card = w.document.querySelector('.chat-task-card'); card.querySelector('details').open = true;
+  await until(() => taskPart(card, 'delegations'), 'department trace');
+  const route = taskPart(card, 'delegations');
+  assert.deepEqual([...route.querySelectorAll('li > strong')].map(node => node.textContent), ['集团 → 管理部', '管理部 → 研发部']);
+  assert.match(route.textContent, /已导出两条记录/); assert.equal(route.querySelector('.chat-task-file-open').getAttribute('href'), url);
+  assert.doesNotMatch(route.textContent, /其他工单/);
+});
 const artifactTask = (summary, overrides = {}) => task({
   execution: { ...task().execution, workerId: 'worker-child-ticket' },
   progress: { summary, state: 'ready', source: 'worker-report', organizationId: 'culture', at: '2026-11-18T08:05:00.000Z' }, ...overrides,

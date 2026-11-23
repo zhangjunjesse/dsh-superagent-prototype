@@ -142,6 +142,31 @@ test('a child completing its work does not mark the owning JW complete before pa
   assert.equal(f.tasks.detail(task.workRef, new URLSearchParams('conversationId=conversation-a')).item.status, 'completed');
 });
 
+test('group task follows historical assignment bindings to the actual leaf and its artifacts after a move', t => {
+  const f = fixture(t, ['root', 'studio', 'research']), first = delegated(f);
+  const leaf = ticket('leaf'), manager = first.child, assignment = manager.assignments[0];
+  const request = { ...first.request, delegationId: 'second', parentTicketId: manager.id, parentAssignmentId: assignment.id,
+    parentDecisionId: manager.decisionId, targetInstanceId: 'research', path: ['root', 'studio'] };
+  leaf.mandate.basis = { via: 'delegation', delegation: { ...request, parentInstanceId: 'studio' } };
+  const url = '/jarvis/api/system/research/artifacts/leaf/report.csv';
+  const artifact = { instanceId: 'research', ticketId: 'leaf', title: 'report.csv', url, downloadUrl: `${url}?download=1` };
+  leaf.assignments[0].report = { state: 'ready', at: later, summary: 'export verified' };
+  const snapshot = { delegationId: 'second', parentTicketId: manager.id, parentAssignmentId: assignment.id, childInstanceId: 'research',
+    ticketId: leaf.id, assignmentId: leaf.assignments[0].id, status: 'completed', summary: 'export verified', artifacts: [artifact], receipts: {} };
+  f.stores.studio.set(`process-delegation:route:${manager.origin.triggerId}`, 'research');
+  f.stores.studio.set(`process-delegation:out:${key(manager.id, assignment.id)}`, { request, snapshot });
+  f.stores.research.tickets.save(leaf);
+  const item = f.tasks.detail(first.workRef, { conversationId: 'conversation-a' }).item;
+  assert.deepEqual(item.delegations.map(hop => [hop.from.instanceId, hop.to.instanceId, hop.ticketId, hop.childTicketId]),
+    [['root', 'studio', first.parent.id, manager.id], ['studio', 'research', manager.id, leaf.id]]);
+  assert.equal(item.execution.workerId, 'worker-leaf'); assert.equal(item.execution.instanceId, 'research');
+  assert.deepEqual(item.delegations[1].artifacts, [artifact]); assert.equal(item.delegations[1].report.summary, 'export verified');
+  assert.equal(f.tasks.list({ organizationId: 'research' }).items[0].logs.traceId, `work:root:${first.workRef}`);
+  leaf.mandate.basis.delegation.parentAssignmentId = 'other-assignment'; f.stores.research.tickets.save(leaf);
+  const mismatch = f.tasks.detail(first.workRef, { conversationId: 'conversation-a' }).item;
+  assert.equal(mismatch.execution.workerId, null); assert.equal(mismatch.delegations[1].childTicketId, null);
+});
+
 test('preparing child work is visible without a fictitious Worker and does not duplicate a later Core ticket', t => {
   const f = fixture(t), task = delegated(f, { snapshot: false, phase: 'preparing' });
   let child = f.tasks.list(new URLSearchParams('organizationId=studio')).items;
