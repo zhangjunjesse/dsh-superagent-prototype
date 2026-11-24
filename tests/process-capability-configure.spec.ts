@@ -174,16 +174,35 @@ describe('in-place original Worker capability configuration', () => {
       if (turn.policy.role === 'orchestrator') await routeOriginal(turn)
       else await complete(turn)
     })
-    await runtime.delegation(delegation('queued'))
+    const queued = delegation('queued'), expanded = delegation('after-expansion')
+    await runtime.delegation(queued)
     expect(await freeze(runtime)).toMatchObject({ busy: false, queued: { delegations: 1 } })
     await configure(runtime, ['read'], ['parent'])
     await configure(runtime, ['read', 'write'], ['parent'])
     await runtime.capabilitiesHold({ operationId: 'change', held: false })
-    await wait(async () => expect((await runtime.delegation(query(delegation('queued')))).status).toBe('completed'))
-    expect(native.policies.find(policy => policy.role === 'worker')!.allowedTools).not.toContain('write')
-    await runtime.delegation(delegation('after-expansion'))
-    await wait(async () => expect((await runtime.delegation(query(delegation('after-expansion')))).status).toBe('completed'))
-    expect(native.policies.filter(policy => policy.role === 'worker').at(-1)!.allowedTools).toContain('write')
+    // Both grants coexist before we wait; bind each permission check to its actual execution, not turn order.
+    await runtime.delegation(expanded)
+    let completed: Awaited<ReturnType<ProcessRuntime['delegation']>>[] = []
+    await wait(async () => {
+      completed = await Promise.all([queued, expanded].map(envelope => runtime.delegation(query(envelope))))
+      expect(completed.map(snapshot => snapshot.status)).toEqual(['completed', 'completed'])
+    })
+    await native.idle()
+    expect(new Set(completed.map(snapshot => snapshot.ticketId)).size).toBe(2)
+    for (const [index, envelope] of [queued, expanded].entries()) {
+      const snapshot = completed[index]!
+      expect(snapshot).toMatchObject({ delegationId: envelope.request.delegationId, parentTicketId: envelope.request.parentTicketId,
+        parentAssignmentId: envelope.request.parentAssignmentId, receipts: { [envelope.request.commandId]: 'applied' } })
+      expect(snapshot.ticketId).toBeTruthy(); expect(snapshot.assignmentId).toBeTruthy()
+      const workers = native.deliveries.filter(turn => turn.policy.role === 'worker'
+        && turn.policy.ticketId === snapshot.ticketId && turn.policy.assignmentId === snapshot.assignmentId)
+      expect(workers.length).toBeGreaterThan(0)
+      for (const worker of workers) {
+        expect(worker.sessionId).toBe(`worker-${snapshot.ticketId}`)
+        if (envelope === queued) expect(worker.policy.allowedTools).not.toContain('write')
+        else expect(worker.policy.allowedTools).toContain('write')
+      }
+    }
     expect(native.errors).toEqual([])
   })
 
@@ -206,8 +225,13 @@ describe('in-place original Worker capability configuration', () => {
     targets = [{ ...child, tools: ['read', 'write'] }]
     await runtime.capabilitiesConfigure({ operationId: 'change', workerTools: ['read', 'write'], workerSkills: [], delegationTargets: targets, delegationLimits: [] })
     await runtime.capabilitiesHold({ operationId: 'change', held: false })
-    expect(await runtime.management({ method: 'POST', path: `tickets/${ticket.id}/retry` })).toMatchObject({ status: 200, body: { retried: true } })
+    expect(await runtime.management({ method: 'POST', path: `tickets/${ticket.id}/retry` }))
+      .toMatchObject({ status: 200, body: { retried: false, pending: true } })
     await wait(() => expect(new Set(sent.map(request => request.parentAssignmentId)).size).toBe(2))
+    const original = ticket.assignments.at(-1)!.id
+    const stopped = sent.findIndex(request => request.parentAssignmentId === original && request.operation === 'stop')
+    expect(stopped).toBeGreaterThanOrEqual(0)
+    expect(sent.findIndex(request => request.parentAssignmentId !== original)).toBeGreaterThan(stopped)
     expect(sent.every(request => request.tools.length === 1 && request.tools[0] === 'read')).toBe(true)
     expect((await runtime.state()).tickets).toHaveLength(1)
     expect(native.errors).toEqual([])

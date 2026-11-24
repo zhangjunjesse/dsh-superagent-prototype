@@ -13,7 +13,7 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, reasonText, type EngineForSettings, type EngineOptions, type Executor, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, reasonText, type Assignment, type EngineForSettings, type EngineOptions, type Executor, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
@@ -72,7 +72,7 @@ export interface RuntimeOptions {
   localTicket?(ticket: Ticket): boolean
   workerTools?(ticket: Ticket): readonly string[]
   workerSkills?(ticket: Ticket): readonly string[]
-  engine?: Pick<EngineOptions, 'delegation' | 'resumeCompletedCommands' | 'admission'>
+  engine?: Pick<EngineOptions, 'delegation' | 'resumeCompletedCommands' | 'admission' | 'resultReview' | 'retry'>
   /** Freezes launches/continuations for an exact forced-stop confirmation; replies remain available. */
   executionHeld?(): boolean
   /** Exact owner check for durable cancellation of an already staged/accepted native input. */
@@ -85,8 +85,15 @@ export interface RuntimeOptions {
     /** Refresh trusted availability before the synchronous target selection transaction. */
     prepare?(triggerId: string, target?: string): Promise<void>
     select(triggerId: string, target?: string): void
+    prepareReview?(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void>
   }
   reportArtifacts?: ExecutorToolsHost['reportArtifacts']
+  prepareHandoff?(ticket: Ticket, assignment: Assignment): Promise<unknown[]>
+  waitForDepartment?: MainToolsHost['waitForDepartment']
+  holdForDepartment?: MainToolsHost['holdForDepartment']
+  deferDepartment?: MainToolsHost['deferDepartment']
+  resumeDepartment?: MainToolsHost['resumeDepartment']
+  reportMissingDepartment?: ExecutorToolsHost['reportMissingDepartment']
   /** Runs after Store/composition is established, before initialize resolves setup. */
   initialize?(runtime: Runtime): void
 }
@@ -185,7 +192,7 @@ export class Runtime extends Service implements SourceHost {
       this.githubConnection = new GithubConnection({ stateDir: machine.stateDir, settings: this.settings, lifetime: this.lifetime })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         native: options.native?.executor, workerEnvironment: () => setup.workerEnvironment,
-        localTicket: options.localTicket,
+        localTicket: options.localTicket, prepareHandoff: options.prepareHandoff,
         prepareCommand: (ticket, configured) => options.localTasks && sourceTrigger({ store }, ticket)?.source !== 'github' ? '' : configured,
         workspaceContext: options.localTasks ? ticket => ({ kind: sourceTrigger({ store }, ticket)?.source === 'github' ? 'github' : 'local',
           directory: ticket.execution?.directory ?? '', ...(sourceTrigger({ store }, ticket)?.source === 'github' ? { repository: setup.deployment.repository } : {}) }) : undefined,
@@ -232,8 +239,11 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
-        prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select,
+        prepareTarget: options.routing?.prepare, selectTarget: options.routing?.select, prepareReview: options.routing?.prepareReview,
         reportArtifacts: options.reportArtifacts,
+        waitForDepartment: options.waitForDepartment,
+        holdForDepartment: options.holdForDepartment, deferDepartment: options.deferDepartment, resumeDepartment: options.resumeDepartment,
+        reportMissingDepartment: options.reportMissingDepartment,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }

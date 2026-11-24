@@ -19,6 +19,7 @@ const peer = new ProcessPeer(process, {
     return { pid: process.pid, instanceId: config.instanceId };
   },
   async chat(input) {
+    if (input.text === 'delegation-catalog') return peer.call('delegation.catalog', {});
     if (input.text === 'hold') {
       active = true;
       try { return await peer.call('session.run', { role: 'worker', sessionKey: 'worker-1', requestId: input.id, text: input.text }); }
@@ -27,6 +28,7 @@ const peer = new ProcessPeer(process, {
     writeFileSync(join(config.stateDir, 'fixture-value.json'), JSON.stringify(input));
     return { text: input.text };
   },
+  'delegation.readiness'() { return { ready: true }; },
   state() {
     const file = join(config.stateDir, 'fixture-value.json');
     return { instanceId: config.instanceId, value: existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null,
@@ -74,6 +76,42 @@ async function setup(control, extras = [child()]) {
 }
 const status = (snapshot, id) => snapshot.runtime.instances.find(instance => instance.instanceId === id);
 const rejectsStatus = (work, expected) => assert.rejects(work, error => error instanceof SystemControlError && error.status === expected);
+
+test('ordinary saves cannot move a saved organization to a different parent', async t => {
+  const config = options();
+  let control = new SystemControl({}, config);
+  t.after(() => control.close());
+  await setup(control, [child({ id: 'management', name: '管理' }), child({ parent: 'management' })]);
+  await control.close();
+  control = new SystemControl({}, config);
+  const saved = await control.get({ view: 'topology' });
+  const changed = structuredClone(saved.nodes);
+  changed.find(node => node.id === 'research').parent = 'root';
+  await rejectsStatus(control.save({ revision: saved.revision, nodes: changed }), 409);
+  const current = await control.get({ view: 'topology' });
+  assert.equal(current.revision, saved.revision);
+  assert.deepEqual(current.nodes, saved.nodes);
+  await control.close();
+  control = new SystemControl({}, config);
+  const restored = await control.get({ view: 'topology' });
+  assert.equal(restored.revision, saved.revision);
+  assert.deepEqual(restored.nodes, saved.nodes);
+});
+
+test('a saved organization tree exposes only each parent\'s direct ready children after reopening', { timeout: 10000 }, async t => {
+  const config = options();
+  let control = new SystemControl({}, config);
+  t.after(() => control.close());
+  const saved = await setup(control, [child({ parent: 'management' }), child({ id: 'management', name: '管理' })]);
+  await control.close();
+  control = new SystemControl({}, config);
+  for (const id of ['root', 'management', 'research']) await control.action(id, 'start', saved.revision);
+  for (const [id, expected] of [['root', ['management']], ['management', ['research']], ['research', []]]) {
+    const catalog = await control.manager.chat(id, { id: `catalog-${id}`, text: 'delegation-catalog' });
+    assert.deepEqual(catalog.targets.map(target => target.instanceId), expected);
+    assert.deepEqual(catalog.readyInstanceIds, expected);
+  }
+});
 
 test('a topology action validates the target and avoids opening other organizations to acknowledge startup', async t => {
   const control = new SystemControl({}, options());
@@ -279,7 +317,7 @@ test('invalid graph, tool, model, concurrency and path configurations are never 
     const { nodes } = await control.get();
     const cases = [
       [child({ parent: 'research' })], [child({ parent: 'missing' })], [child({ kind: 'root' })],
-      [child(), child({ id: 'nested', parent: 'research', redelegate: true })],
+      [child({ parent: 'nested' }), child({ id: 'nested', parent: 'research', redelegate: true })],
       ...[null, 'false', 0, {}, []].map(redelegate => [child({ redelegate })]),
       [child(), child()], [child({ id: 'CON' })], [child({ id: '../escape' })], [child({ concurrency: 17 })], [child({ concurrency: null })],
       [child({ workerTools: ['read', 'write'] })], [child({ workerTools: 'read' })], [child({ workerTools: null })],

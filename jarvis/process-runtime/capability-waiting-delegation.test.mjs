@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SystemControl } from './control.mjs';
-import { controlledNativeFactory } from './controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from './controlled-native-fixture.mjs';
 import { nativeHash } from './native-journal.mjs';
 import { effectiveWorkerTools } from '../../lib/process-runtime.js';
 
@@ -63,6 +63,21 @@ test('waiting delegated questions survive automatic Worker capability applicatio
       if (!text.startsWith('{')) return;
       const card = JSON.parse(text);
       if (policy.role === 'orchestrator') {
+        if (card.kind === 'result_review') {
+          assert.equal(config.instanceId, 'root');
+          await reviewDelegatedResult(tool, card, ({ original, summary, producer }) => {
+            assert.equal(producer.instanceId, 'child');
+            if (oldTickets.has(producer.ticketId)) {
+              assert.match(original, /bounded delegated (first|second) file/);
+              assert.ok(deniedNewTool.has(producer.ticketId));
+              assert.equal(summary, `Original assignment completed from its exact answer: ${answered.get(producer.ticketId)}`);
+            } else {
+              assert.match(original, /newly authorized bounded file/);
+              assert.equal(summary, 'New delegated work received the current read and glob capability.');
+            }
+          });
+          return;
+        }
         if (card.kind !== 'candidate') return;
         const dispatch = card.dispatch;
         const decision = dispatch && dispatch.operation !== 'new'

@@ -279,13 +279,14 @@ test('new settings code continues to support an already-open index without compo
 
 const organizationRoute='#settings/organization';
 const engineFixture = prefix => ({prompts:Object.fromEntries(['router','worker','communication','scope','delivery'].map(key=>[key,prefix+' '+key+' guidance']))});
-async function openOrganization(t, hash='#settings/model', { systemUnavailable=false, engineAvailable=true, reorderedModel=false, workerTools=['read'], workerSkills=[], runtimeInstances=[], draft, modelCatalog } = {}) {
+async function openOrganization(t, hash='#settings/model', { systemUnavailable=false, engineAvailable=true, reorderedModel=false, workerTools=['read'], workerSkills=[], runtimeInstances=[], draft, modelCatalog, tree } = {}) {
   const roleModel={provider:'provider',model:'execution-model',reasoningEffort:'max'};
   const instance=(id,parent=null)=>({id,parent,kind:parent?'instance':'root',name:parent?'研发':'集团中枢',brainName:'旧名称',description:'组织职责',capabilities:'开发',concurrency:3,workerTools:[...workerTools],workerSkills:[...workerSkills],workspace:'D:/fixture/'+id,redelegate:!parent,model:{...roleModel},roleModels:{router:{...roleModel},worker:{...roleModel}},engine:engineFixture(id)});
   const backend={state:{runtime:'dsh',csrf:'fixture',basic:{revision:1,value:{assistantName:'贾维斯'}},model:{revision:2,hasKey:false,value:{endpoint:'provider',model:'chat-model',temperature:'',maxTokens:'',reasoning:'max',timeout:'120',stream:true}},models:{groups:[{id:'provider',name:'已连接服务',models:[{id:'chat-model',name:'对话模型',reasoning:{efforts:[{id:'max',name:'Max'},{id:'low',name:'Low'}]}},{id:'execution-model',name:'执行模型'}]}]},turns:[],active:null},system:{available:true,configured:true,revision:3,rootId:'root',nodes:[instance('root'),instance('child','root')],defaults:{model:{...roleModel},workerTools:['read']},catalogs:{root:{complete:true,tools:[{name:'read',label:'读取文件',available:true,group:'文件'}],skills:[{name:'review-code',description:'代码审查'}]}},runtime:{hostPid:100,instances:[]}},tools:{revision:1,tools:[{name:'read',description:'读取指定文件',parameters:{},allowed:true}]},hook:null};
   const dom=new JSDOM(html,{url:'http://organization.invalid/jarvis/'+hash,runScripts:'dangerously',pretendToBeVisual:true});
   if(modelCatalog)backend.state.models=structuredClone(modelCatalog);
   backend.state.tasksAvailable=true;
+  if(tree)backend.system.nodes=tree.map(item=>({...instance(item.id,item.parent),name:item.name||item.id}));
   backend.system.runtime.instances=structuredClone(runtimeInstances);
   backend.systemUnavailable=systemUnavailable;
   if(reorderedModel)backend.state.model.value=Object.fromEntries(Object.entries(backend.state.model.value).reverse());
@@ -333,7 +334,7 @@ async function openOrganization(t, hash='#settings/model', { systemUnavailable=f
       assert.equal(body.revision,backend.system.revision);
       const nodes=body.update?backend.system.nodes.map(node=>node.id===body.update.id?{...node,...body.update.changes}:node):body.nodes;
       backend.system={...backend.system,revision:body.revision+1,nodes};
-      return Response.json({...systemView(),...body.update?{view:'configuration',saved:{instanceId:body.update.id,fields:Object.keys(body.update.changes),effect:'next-start'}}:{}});
+      return Response.json({...systemView(),...body.update?{view:'configuration',saved:{instanceId:body.update.id,fields:Object.keys(body.update.changes),effect:Object.hasOwn(body.update.changes,'parent')?'immediate':'next-start'}}:{}});
     }
     if(path==='/api/tools'){assert.equal(body.revision,backend.tools.revision);backend.tools.revision++;backend.tools.tools.find(tool=>tool.name===body.name).allowed=body.allowed;return Response.json(backend.tools);}
     throw Error('Unexpected request '+path);
@@ -776,6 +777,28 @@ test('metadata conflict review resubmits only edited fields and preserves newer 
   ]);
   assert.equal(ui.backend.system.nodes[1].description,'其他窗口的新职责');assert.equal(ui.backend.system.nodes[1].brainName,'其他窗口的新大脑');
   assert.deepEqual(ui.backend.system.nodes[1].model,actual.model);
+});
+
+test('an existing department selects its new direct parent, retains blocked drafts and confirms the saved live relationship',async t=>{
+  const tree=[{id:'root',parent:null},{id:'old',parent:'root'},{id:'new',parent:'root'},
+    {id:'research',parent:'old',name:'研究'},{id:'leaf',parent:'research'}];
+  const ui=await openOrganization(t,organizationRoute+'/research/organization',{tree});
+  await until(()=>ui.id('field-name'),'department editor');
+  const parent=ui.id('field-parent');assert.ok(parent,'saved departments expose their real parent editor');
+  assert.deepEqual([...parent.options].map(item=>item.value).sort(),['new','old','root']);
+  assert.equal(parent.value,'old');ui.input('field-parent','new');
+  ui.backend.hook=({path,method})=>path==='/api/system'&&method==='PUT'
+    ?Response.json({error:'请等待研究的旧工单结束：等待人工，工单 ticket-old。旧工单继续沿原路径处理。'},{status:409}):null;
+  ui.submit('unit-form');await until(()=>ui.id('form-error')&&!ui.id('form-error').hidden,'blocked move');
+  assert.match(ui.id('form-error').textContent,/等待人工.*ticket-old/);
+  assert.equal(ui.id('field-parent').value,'new');assert.equal(ui.w.compositionUI.isDirty(),true);
+  assert.equal(ui.backend.system.nodes.find(node=>node.id==='research').parent,'old');
+  ui.backend.hook=null;ui.submit('unit-form');await until(()=>!ui.id('unit-form'),'move saved');
+  assert.deepEqual(ui.requests.filter(request=>request.method==='PUT').at(-1).body,{revision:3,update:{id:'research',changes:{parent:'new'}}});
+  assert.equal(ui.backend.system.nodes.find(node=>node.id==='research').parent,'new');
+  assert.match(ui.id('composition-toast').textContent,/上级已更新.*历史/);
+  await ui.go(organizationRoute+'/research/organization');await until(()=>ui.id('field-parent'),'reopen department');
+  assert.equal(ui.id('field-parent').value,'new');
 });
 
 test('a failed readback preserves the committed metadata draft and distinguishes saved state from confirmation',async t=>{

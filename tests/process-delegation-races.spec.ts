@@ -32,18 +32,25 @@ const childSnapshot = (request: DelegationRequest, patch: Partial<DelegationSnap
 function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapshot>, task?: { text: string; scope: string; assignment: string }) {
   const directory = mkdtempSync(join(tmpdir(), 'process-delegation-race-')), store = new Store(join(directory, 'core.sqlite'))
   opened.push({ directory, store })
-  let clock = 0, proxy: DelegationExecutor
+  let clock = 0, proxy: DelegationExecutor, held = false
+  const localStarts: string[] = [], reviews: string[] = []
+  const config = { instanceId: 'parent', workerTools: ['read'], delegationTargets: [
+    { instanceId: 'child', organizationName: 'Child', description: 'Bounded reader', tools: ['read' as const] },
+  ] }
   const policy: Policy = { version: 'v1', paused: false, evalTimeoutMs: 60_000,
     gate: () => ({ admissible: true, strength: 'explicit', basis: { via: 'listed' } }),
     revalidate: () => true, admitsInferred: () => false }
   const engine = new Engine({ repo: store, policy: () => policy, scope: { scope: () => ({ listened: true, observed: false }) },
     assessor: { request: vi.fn(), release: vi.fn() }, outbox: { send: vi.fn(), withdraw: vi.fn(), status: () => undefined },
-    executor: { start: (ticket, assignment) => proxy.start(ticket, assignment), deliver: vi.fn(), stop: (ticket, assignment) => proxy.stop(ticket, assignment) },
+    executor: { start: (ticket, assignment) => proxy.remote(ticket, assignment) ? proxy.start(ticket, assignment) : void localStarts.push(assignment.id),
+      deliver: vi.fn(), stop: (ticket, assignment) => proxy.stop(ticket, assignment) },
+    resultReview: { request: (_ticket, _assignment, review) => { reviews.push(review.id) },
+      context: (ticket, assignment) => proxy.reviewContext(ticket, assignment),
+      authorize: (ticket, assignment, decision) => proxy.authorizeReview(ticket, assignment, decision) },
+    admission: { evaluate: () => !held, resume: () => !held, frozen: () => held },
     prepareTicket: ticket => task ? { ...ticket, execution: { name: 'bounded-task', directory, assignment: task.assignment } } : ticket,
     now: () => new Date(Date.UTC(2026, 10, 15, 0, 0, clock++)).toISOString() })
-  proxy = new DelegationExecutor({ instanceId: 'parent', workerTools: ['read'], delegationTargets: [
-    { instanceId: 'child', organizationName: 'Child', description: 'Bounded reader', tools: ['read'] },
-  ] }, store, engine, send, () => false, id => id === 'child')
+  proxy = new DelegationExecutor(config, store, engine, send, () => held, id => id === 'child')
   const message = (id: string, operation: 'new' | 'append' = 'new', target?: Ticket): Trigger => ({
     id, source: 'jarvis', threads: [{ source: 'jarvis', id }], actor: { source: 'jarvis', id: 'user' },
     human: true, addressed: 'direct', at: '2026-11-15T00:00:00.000Z', text: `read requirement ${id}`, meta: {},
@@ -62,10 +69,72 @@ function fixture(send: (request: DelegationRequest) => Promise<DelegationSnapsho
     engine.receive(trigger); engine.attach(ticketId, trigger.id)
     return current().inputs.find(input => input.kind === 'trigger' && input.triggerId === trigger.id)!
   }
-  return { store, engine, proxy, current, append }
+  const accept = () => {
+    const assignment = latestAssignment(current())!, review = assignment.resultReviews!.at(-1)!
+    return engine.resolveResultReview(ticketId, assignment.id, review.id, { kind: 'accept', summary: 'Original goal and current evidence verified.' })
+  }
+  return { store, engine, proxy, current, append, accept, config, policy, localStarts, reviews, freeze: (value: boolean) => { held = value } }
 }
 
 describe('delegation completion fences', () => {
+  it.each(['interruption', 'retry'] as const)('preserves the reviewed target and its remaining work on %s', async cause => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', executionStopped: request.operation === 'stop' }))
+    await h.proxy.tick()
+    const ticketId = h.current().id, producer = latestAssignment(h.current())!, review = producer.resultReviews!.at(-1)!
+    await h.proxy.prepareReview(ticketId, producer.id, review.id)
+    const instructions = 'Validate the exact registered revision locally and retain the evidence.'
+    h.engine.resolveResultReview(ticketId, producer.id, review.id, { kind: 'continue', instructions, summary: 'Repair complete; validation remains.' })
+    const validation = latestAssignment(h.current())!
+    h.engine.assignmentStarted(ticketId, validation.id)
+    if (cause === 'interruption') h.engine.assignmentInterrupted(ticketId, validation.id)
+    else {
+      h.engine.report(ticketId, { state: 'failed', summary: 'Transient local validation failure.' })
+      h.engine.retryTicket(ticketId)
+    }
+    const replacement = latestAssignment(h.current())!
+    expect(replacement.id).not.toBe(validation.id)
+    expect(replacement).toMatchObject({ executionTarget: 'local', continuation: { reviewId: review.id, instructions } })
+    expect(h.localStarts).toEqual([validation.id, replacement.id])
+    expect(h.proxy.list()).toHaveLength(1)
+  })
+  it('restages the same stopped producer result when a newer input arrives during cleanup', async () => {
+    const entering = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
+    const h = fixture(async request => {
+      if (request.operation === 'stop') { entering.resolve(); await release.promise }
+      return childSnapshot(request, { status: 'completed', ...(request.operation === 'stop' ? { executionStopped: true } : {}) })
+    })
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    const preparing = h.proxy.prepareReview(h.current().id, first.id, review.id)
+    await entering.promise
+    const input = h.append('new-input-during-stop', 'Also retain the existing tested revision in the report.')
+    release.resolve(); await preparing
+    const decision = { kind: 'continue' as const, summary: 'The original validation and new reporting input remain.', instructions: 'Validate the same revision and include the later reporting input.' }
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, decision)).toThrow('stale')
+    expect(h.current().assignments).toHaveLength(1)
+    await h.proxy.tick()
+    const refreshed = latestAssignment(h.current())!.resultReviews!.at(-1)!
+    expect(refreshed.id).not.toBe(review.id)
+    expect(refreshed.evidenceRef).toBe(review.evidenceRef)
+    await h.proxy.prepareReview(h.current().id, first.id, refreshed.id)
+    h.engine.resolveResultReview(h.current().id, first.id, refreshed.id, decision)
+    expect(h.current().assignments).toHaveLength(2)
+    expect(h.current().undelivered).toContain(input.id)
+    expect(h.proxy.list()[0]!.handoff!.stopped!.executionStopped).toBe(true)
+  })
+  it('keeps the parent ticket open for its own goal verification after a child completes', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed',
+      summary: 'Marker A was checked. Marker B has not been verified.' }), {
+      text: 'Read marker A and marker B and verify both results.',
+      scope: 'Both marker A and marker B must be verified.',
+      assignment: 'Verify both marker results before delivering the original request.',
+    })
+
+    await h.proxy.tick()
+
+    expect(h.current().ended).toBeUndefined()
+  })
+
   it('does not enqueue a local Worker when an original executor resumes a pending child-owned assignment', () => {
     const h = fixture(async request => childSnapshot(request)), board = new HealthBoard(), effects = new Effects(h.store, board)
     const denied = () => { throw new Error('A child-owned assignment must never enter a local Session') }
@@ -83,6 +152,121 @@ describe('delegation completion fences', () => {
       expect(h.current().assignments).toHaveLength(1)
       expect(h.proxy.list()).toHaveLength(1)
     } finally { executor.dispose() }
+  })
+
+  it('continues a partial result locally on the same mandate and reviews the validation before completion', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Revision abc is repaired; validation is still required.',
+      ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
+    await h.proxy.tick()
+    const original = h.current(), first = latestAssignment(original)!, review = first.resultReviews!.at(-1)!
+    const decision = { kind: 'continue' as const, summary: 'The repair is present but the original validation condition is not evidenced.',
+      instructions: 'Validate revision abc, retaining the repair evidence and recording the tested revision and result.' }
+    await h.proxy.prepareReview(original.id, first.id, review.id)
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    expect(h.current().decisionId).toBe(original.decisionId)
+    expect(h.current().mandate).toEqual(original.mandate)
+    expect(h.current().assignments).toHaveLength(2)
+    expect(h.localStarts).toHaveLength(1)
+    expect(h.proxy.remote(h.current())).toBe(false)
+    expect(h.proxy.list()[0]?.finished).toBe(true)
+    const second = latestAssignment(h.current())!
+    expect(second).toMatchObject({ executionTarget: 'local', continuation: { reviewId: review.id, instructions: decision.instructions } })
+    expect(h.current().assignments[0]?.resultReviews?.[0]?.summary).toContain('Revision abc is repaired')
+    expect(h.current().ended).toBeUndefined()
+    h.engine.report(original.id, { state: 'ready', summary: 'Validated revision abc: all original checks passed.' })
+    expect(h.current().ended).toBeUndefined()
+    expect(latestAssignment(h.current())!.resultReviews?.at(-1)?.summary).toContain('Validated revision abc')
+    h.accept()
+    expect(h.current().ended?.outcome).toBe('completed')
+    expect(h.current().assignments[0]?.resultReviews?.[0]?.decision?.kind).toBe('continue')
+    expect(latestAssignment(h.current())!.resultReviews?.at(-1)?.decision?.kind).toBe('accept')
+    await h.proxy.tick()
+    expect(h.proxy.list()).toHaveLength(1)
+  })
+
+  it('creates a new fixed child binding for remaining work and preserves all earlier source material', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary: 'Partial repair revision abc.',
+      ...(request.operation === 'stop' ? { executionStopped: true } : {}) }), {
+      text: 'Repair and validate this exact revision.\n  Keep original spacing  ', scope: 'Repair and validation', assignment: 'Original instructions',
+    })
+    await h.proxy.tick()
+    const original = h.current(), first = latestAssignment(original)!, review = first.resultReviews!.at(-1)!, binding = structuredClone(h.proxy.list()[0]!.request)
+    const decision = { kind: 'continue' as const, summary: 'Validation remains.', instructions: 'Validate the repaired revision abc.', targetInstanceId: 'child' }
+    await h.proxy.prepareReview(original.id, first.id, review.id)
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    h.engine.resolveResultReview(original.id, first.id, review.id, decision)
+    const rows = h.proxy.list(), next = rows.find(row => row.request.parentAssignmentId !== first.id)!
+    expect(rows).toHaveLength(2)
+    expect(rows.find(row => row.request.parentAssignmentId === first.id)!.request).toEqual(binding)
+    expect(next.request.delegationId).not.toBe(binding.delegationId)
+    expect(next.request.taskContext!.source).toEqual(binding.taskContext!.source)
+    expect(next.request.taskContext!.assignment).toContain('Validate the repaired revision abc.')
+    expect(next.request.taskContext!.assignment).toContain('Partial repair revision abc.')
+    expect(next.request.tools).toEqual(binding.tools)
+    expect(h.current().ended).toBeUndefined()
+    await h.proxy.tick()
+    h.accept()
+    expect(h.current().ended?.outcome).toBe('completed')
+  })
+
+  it('keeps an abandoned local continuation open for the parent instead of dropping the original goal', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    await h.proxy.prepareReview(h.current().id, first.id, review.id)
+    h.engine.resolveResultReview(h.current().id, first.id, review.id,
+      { kind: 'continue', summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' })
+    h.engine.report(h.current().id, { state: 'dropped', summary: 'Validation was not performed.' })
+    expect(h.current().ended).toBeUndefined()
+    expect(latestAssignment(h.current())?.resultReviews?.at(-1)?.summary).toBe('Validation was not performed.')
+  })
+
+  it('returns a failed validation to the parent for remaining work without an invented human retry', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed',
+      ...(request.operation === 'stop' ? { executionStopped: true } : {}) }))
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    const decision = { kind: 'continue' as const, summary: 'Validation remains.', instructions: 'Validate the exact repaired revision.' }
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, decision)).toThrow('not been verified stopped')
+    await h.proxy.prepareReview(h.current().id, first.id, review.id)
+    h.engine.resolveResultReview(h.current().id, first.id, review.id, decision)
+    h.engine.report(h.current().id, { state: 'failed', summary: 'The repaired revision failed its original acceptance check.' })
+    const second = latestAssignment(h.current())!, failure = second.resultReviews!.at(-1)!
+    expect(second.report?.state).toBe('failed')
+    expect(failure.summary).toContain('failed its original acceptance check')
+    h.engine.resolveResultReview(h.current().id, second.id, failure.id,
+      { kind: 'continue', summary: 'The existing repair needs correction to meet the original check.', instructions: 'Correct the failure and repeat the same acceptance check.' })
+    expect(h.current().ended).toBeUndefined()
+    expect(h.current().assignments).toHaveLength(3)
+    expect(h.current().mandate.basis).toEqual({ via: 'listed' })
+  })
+
+  it('deduplicates review relays and immutable acceptance decisions', async () => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    await h.proxy.tick(); await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    expect(first.resultReviews).toHaveLength(1)
+    expect(h.reviews).toHaveLength(1)
+    h.accept()
+    h.engine.resolveResultReview(h.current().id, first.id, review.id, { kind: 'accept', summary: 'Original goal and current evidence verified.' })
+    expect(h.current().assignments).toHaveLength(1)
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, { kind: 'accept', summary: 'Different judgement' })).toThrow('different decision')
+  })
+
+  it.each(['input', 'stop', 'permissions', 'policy', 'freeze'] as const)('refuses an old review after a concurrent %s change', async change => {
+    const h = fixture(async request => childSnapshot(request, { status: 'completed' }))
+    await h.proxy.tick()
+    const first = latestAssignment(h.current())!, review = first.resultReviews!.at(-1)!
+    if (change === 'input') h.append('during-review', 'Also verify revision abc against the new requirement.')
+    if (change === 'stop') h.engine.stopTicket(h.current().id)
+    if (change === 'permissions') h.config.workerTools = []
+    if (change === 'policy') h.policy.revalidate = () => false
+    if (change === 'freeze') h.freeze(true)
+    expect(() => h.engine.resolveResultReview(h.current().id, first.id, review.id, { kind: 'accept', summary: 'The old result suffices.' })).toThrow()
+    expect(h.current().ended?.outcome).not.toBe('completed')
+    expect(first.resultReviews![0]!.decision).toBeUndefined()
+    expect(h.current().assignments).toHaveLength(1)
   })
 
   it('retains the complete parent source, accepted scope and original assignment through append and owner recovery', async () => {
@@ -156,6 +340,8 @@ describe('delegation completion fences', () => {
     expect(h.current().undelivered).toContain(input.id)
     admit = true
     await h.proxy.tick()
+    expect(h.current().ended).toBeUndefined()
+    h.accept()
     expect(h.current().ended?.outcome).toBe('completed')
     expect(h.current().undelivered).not.toContain(input.id)
   })
@@ -185,6 +371,8 @@ describe('delegation completion fences', () => {
     expect(sent.filter(request => request.operation === 'append').map(request => request.text)).toEqual([
       'read requirement first', 'read requirement during-control',
     ])
+    expect(h.current().ended).toBeUndefined()
+    h.accept()
     expect(h.current().ended?.outcome).toBe('completed')
   })
 
@@ -232,6 +420,75 @@ describe('delegation completion fences', () => {
       expect(sent.map(request => request.operation)).toEqual(['query', 'query', 'query'])
       expect(new Set(sent.map(request => request.delegationId)).size).toBe(1)
       expect(new Set(sent.map(request => request.parentAssignmentId)).size).toBe(1)
+    } finally { now.mockRestore() }
+  })
+
+  it('recovers a completed result with a fresh review after a failed query without reviving the old decision', async () => {
+    let time = Date.UTC(2026, 10, 15), disconnected = false
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => time)
+    const h = fixture(async request => {
+      if (disconnected) throw new Error('Completed child temporarily disconnected')
+      return childSnapshot(request, { status: 'completed' })
+    })
+    try {
+      await h.proxy.tick()
+      const assignment = latestAssignment(h.current())!, review = assignment.resultReviews!.at(-1)!
+      const decide = () => h.engine.resolveResultReview(h.current().id, assignment.id, review.id,
+        { kind: 'accept', summary: 'The original completed evidence satisfies the goal.' })
+      disconnected = true; await h.proxy.tick()
+      expect(latestAssignment(h.current())!.report?.summary).toContain('connection or command outcome is unavailable')
+      expect(decide).toThrow()
+      disconnected = false; time += 1001
+      await h.proxy.tick(); await h.proxy.tick()
+      const recovered = latestAssignment(h.current())!.resultReviews!.at(-1)!
+      expect(h.proxy.list()[0]!.error).toBeUndefined()
+      expect(recovered.evidenceRef).toBe(review.evidenceRef)
+      expect(latestAssignment(h.current())!.report?.summary).toBe(recovered.summary)
+      expect(recovered.id).not.toBe(review.id)
+      expect(h.reviews).toEqual([review.id, recovered.id])
+      expect(decide).toThrow('stale')
+      h.accept()
+      expect(h.current().ended?.outcome).toBe('completed')
+    } finally { now.mockRestore() }
+  })
+
+  it('does not revive an earlier review when previously reviewed evidence returns after a newer result', async () => {
+    let summary = 'Verified result A'
+    const h = fixture(async request => childSnapshot(request, { status: 'completed', summary }))
+    await h.proxy.tick()
+    const assignment = latestAssignment(h.current())!, original = assignment.resultReviews!.at(-1)!
+    summary = 'Verified result B'; await h.proxy.tick()
+    const intermediate = latestAssignment(h.current())!.resultReviews!.at(-1)!
+    summary = 'Verified result A'; await h.proxy.tick(); await h.proxy.tick()
+    const current = latestAssignment(h.current())!.resultReviews!.at(-1)!
+    expect(current.evidenceRef).toBe(original.evidenceRef)
+    expect(current.summary).toBe(original.summary)
+    expect(current.id).not.toBe(original.id)
+    expect(h.reviews).toEqual([original.id, intermediate.id, current.id])
+    expect(() => h.engine.resolveResultReview(h.current().id, assignment.id, original.id,
+      { kind: 'accept', summary: 'A judgement made before the newer result' })).toThrow('stale')
+    h.accept()
+    expect(h.current().ended?.outcome).toBe('completed')
+  })
+
+  it.each(['report', 'input'] as const)('refuses acceptance when a newer %s supersedes the recovered result review', async change => {
+    let disconnected = false, time = Date.UTC(2026, 10, 15)
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => time)
+    const h = fixture(async request => {
+      if (disconnected) throw new Error('Temporary child connection loss')
+      return childSnapshot(request, { status: 'completed' })
+    })
+    try {
+      await h.proxy.tick(); disconnected = true; await h.proxy.tick()
+      disconnected = false; time += 1001; await h.proxy.tick()
+      const assignment = latestAssignment(h.current())!, review = assignment.resultReviews!.at(-1)!
+      if (change === 'report') h.engine.report(h.current().id, { state: 'blocked', summary: 'A newer executor observation requires validation.' })
+      else h.append('after-reconnect', 'Verify the additional original-scope acceptance condition.')
+      expect(() => h.engine.resolveResultReview(h.current().id, assignment.id, review.id,
+        { kind: 'accept', summary: 'The older recovered result is sufficient.' })).toThrow(change === 'report' ? 'superseded' : 'stale')
+      expect(h.current().ended).toBeUndefined()
+      expect(h.current().assignments).toHaveLength(1)
+      expect(latestAssignment(h.current())!.resultReviews!.at(-1)!.decision).toBeUndefined()
     } finally { now.mockRestore() }
   })
 })

@@ -13,13 +13,14 @@ import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import type { Store } from '../store.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { DepartmentRequirementSchema, type DepartmentRequirement } from '../department-requirement.ts'
 
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'resolveResultReview'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
@@ -35,6 +36,11 @@ export interface MainToolsHost {
   selectTarget?(triggerId: string, target?: string): void
   /** Refreshes child availability before the original atomic routing decision. */
   prepareTarget?(triggerId: string, target?: string): Promise<void>
+  prepareReview?(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void>
+  waitForDepartment?(ticketId: string, requirement: DepartmentRequirement, summary: string): unknown
+  holdForDepartment?(ticketId: string, assignmentId: string, reviewId: string, requirement: DepartmentRequirement, summary: string): unknown
+  deferDepartment?(ticketId: string, assignmentId: string, reviewId: string, attemptId: string, reason: string): unknown
+  resumeDepartment?(ticketId: string, assignmentId: string, reviewId: string, target: string, summary: string): Promise<unknown>
 }
 /** Schedules an Engine pass to execute the recorded routing decision and formats the tool response. */
 function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: string; ticketId?: string | undefined }) {
@@ -57,11 +63,12 @@ const RouteItemSchema = z.object({
   acknowledgement: z.string().nullish().describe(`accept: one brief sentence of at most ${IM_WORDS} words naming the concrete change and intended result in the source language. It is posted as a reply to the original source on acceptance, so do not quote the source; quote an earlier proposal briefly only when the trigger merely confirms it and the sentence does not already state it. No generic I will handle it.`),
   note: z.string().nullish().describe(`accept and attach: ${RoutingNoteSchema.description ?? ''}`),
   reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
-  target_instance_id: z.string().nullish().describe('accept only: a direct child instance from this candidate\'s execution_targets; omit for this instance\'s Worker. This never permits another delegation hop.'),
+  target_instance_id: z.string().nullish().describe('accept only: a direct child instance from this candidate\'s execution_targets; omit for this instance\'s Worker. Each child applies its own original task admission and inherited permission limits.'),
+  missing_department: DepartmentRequirementSchema.optional().describe('accept only: a required direct department is absent. Preserve the task and wait for the user to create, configure and start it under this organization; no local Worker executes meanwhile.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
-type Field = Exclude<keyof RouteItem, 'kind' | 'trigger_id'>
+type Field = Exclude<keyof RouteItem, 'kind' | 'trigger_id' | 'missing_department'>
 /** Each field's check, the kinds whose items read it and those that need it; an item of another kind leaves it unread. */
 const FIELDS: Record<Field, { check: z.ZodType; reads: readonly Kind[]; needs: readonly Kind[] }> = {
   ticket_id: { check: z.string(), reads: ['attach', 'stop'], needs: ['attach', 'stop'] },
@@ -99,12 +106,16 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
   if (earlier && item.kind === 'ignore') return { refused: `Decided in this call with ${earlier}, whose Decision took its batch` }
   switch (item.kind) {
     case 'accept': {
+      if (item.missing_department && (item.target_instance_id || !host.waitForDepartment)) return { refused: 'A missing department requires a supported wait without an execution target' }
       const before = host.store.triggers.disposition(item.trigger_id)?.decisionId
       if (item.target_instance_id && !host.selectTarget) return { refused: 'This application has no delegated execution targets' }
       const decision = host.store.atomic(() => {
         host.selectTarget?.(item.trigger_id, item.target_instance_id ?? undefined)
-        return host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
+        const accepted = host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
           acknowledgement: item.acknowledgement!, name: item.worktree_name!, ...note })
+        if (item.missing_department && accepted.kind === 'accept' && accepted.ticketId && accepted.id !== before)
+          host.waitForDepartment!(accepted.ticketId, item.missing_department, `Waiting for required responsibility: ${item.missing_department.responsibility}`)
+        return accepted
       })
       // A Decision that created no ticket is the item's refusal; one that existed before keeps what it was accepted with.
       if (decision.kind !== 'accept' || !decision.ticketId) return { refused: `Ticket was not created: ${reasonText(decision.reason)}` }
@@ -173,11 +184,58 @@ export function mainTools(host: MainToolsHost, agent: Pick<Agent, 'id'>): Tool[]
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),
+    ...host.holdForDepartment ? [tool({
+      name: 'orchestrator_department_wait',
+      description: 'Wait for a missing department with its responsibility, required tools and remaining instructions. A changed catalog is reconsidered automatically.',
+      schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
+        summary: z.string().trim().min(1).max(20000), ...DepartmentRequirementSchema.shape }).strict(),
+      execute: async args => host.store.atomic(() => host.holdForDepartment!(args.ticket_id, args.assignment_id, args.review_id,
+        { responsibility: args.responsibility, required_tools: args.required_tools, instructions: args.instructions }, args.summary)),
+    })] : [],
+    ...host.deferDepartment ? [tool({
+      name: 'orchestrator_department_defer',
+      description: 'Keep waiting after checking a department_ready card whose candidates cannot do the work. Record why for this exact attempt.',
+      schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
+        ready_attempt_id: z.string().min(1), summary: z.string().trim().min(1).max(20000) }).strict(),
+      execute: async args => host.store.atomic(() => host.deferDepartment!(args.ticket_id, args.assignment_id, args.review_id, args.ready_attempt_id, args.summary)),
+    })] : [],
+    ...host.resumeDepartment ? [tool({
+      name: 'orchestrator_department_resume',
+      description: 'After reading the department_ready card, judge the actual ready direct department against the missing responsibility and original task. Explain that semantic match in summary. The owner refreshes readiness and checks every required tool against the task authorization before continuing the original result review. Repeated identical calls do not execute twice.',
+      schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
+        target_instance_id: z.string().min(1).max(80), summary: z.string().trim().min(1).max(20000) }).strict(),
+      execute: async args => host.resumeDepartment!(args.ticket_id, args.assignment_id, args.review_id, args.target_instance_id, args.summary),
+    })] : [],
+    tool({
+      name: 'orchestrator_result_review',
+      description: 'Judge a saved result against the original request, accepted scope, all later inputs and actual evidence. Read the review and linked sources first. Accept only when every completion condition is evidenced for the delivered version; a child saying completed is insufficient. Otherwise continue the remaining authorized work on the same ticket. Omit target_instance_id for this organization\'s Worker, or select a current execution_targets child. This cannot widen the original mandate or tools. Only the latest bound review can change task state.',
+      schema: z.object({ ticket_id: z.string().min(1), assignment_id: z.string().min(1), review_id: z.string().min(1),
+        decision: z.discriminatedUnion('kind', [
+          z.object({ kind: z.literal('accept'), summary: z.string().trim().min(1).max(20000) }).strict(),
+          z.object({ kind: z.literal('continue'), summary: z.string().trim().min(1).max(20000),
+            instructions: z.string().trim().min(1).max(100000), target_instance_id: z.string().min(1).max(80).optional() }).strict(),
+        ]) }).strict(),
+      execute: async (args, signal) => {
+        const committed = host.store.tickets.get(args.ticket_id)?.assignments.find(item => item.id === args.assignment_id)
+          ?.resultReviews?.find(item => item.id === args.review_id)?.decision
+        if (args.decision.kind === 'continue' && !committed) await host.prepareReview?.(args.ticket_id, args.decision.target_instance_id, args.assignment_id, args.review_id)
+        signal.throwIfAborted()
+        const decision = args.decision.kind === 'accept' ? args.decision : { kind: 'continue' as const,
+          summary: args.decision.summary, instructions: args.decision.instructions,
+          ...(args.decision.target_instance_id ? { targetInstanceId: args.decision.target_instance_id } : {}) }
+        const updated = host.engine.resolveResultReview(args.ticket_id, args.assignment_id, args.review_id, decision)
+        return routed(host, { reason: args.decision.kind === 'accept' ? 'Result accepted against the original goal' : 'Remaining work assigned under the original mandate', ticketId: updated.id })
+      },
+    }),
     tool({
       name: 'orchestrator_ticket_retry',
-      description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',
+      description: 'Request a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered. The original producer stays bound until its execution is verified stopped.',
       schema: z.object({ ticket_id: z.string() }).strict(),
-      execute: async args => routed(host, { reason: 'Started a new assignment', ticketId: host.engine.retryTicket(args.ticket_id).id }),
+      execute: async args => {
+        const before = host.store.tickets.get(args.ticket_id)?.assignments.at(-1)?.id, current = host.engine.retryTicket(args.ticket_id)
+        return routed(host, { reason: current.assignments.at(-1)?.id === before
+          ? 'Retry queued; verifying that the original execution has stopped before replacement' : 'Started a new assignment', ticketId: current.id })
+      },
     }),
     tool({
       name: 'orchestrator_ticket_request_status',

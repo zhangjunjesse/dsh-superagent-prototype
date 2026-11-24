@@ -65,6 +65,8 @@ export interface Assessor {
  * commands, so each method only queues work, which reports back through the Engine's callbacks.
  */
 export interface Executor {
+  /** Fence outstanding bound executions and indicate whether their durable cleanup receipt is outstanding. */
+  requestCancellation?(ticket: Ticket): boolean
   /** Queue a pending assignment for launch; reports back through `Engine.assignmentStarted` or a `failed` report. */
   start(ticket: Ticket, assignment: Assignment): void
   /**

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -61,8 +62,20 @@ describe('organization task engine settings', () => {
     expect(calls.find(call => call.policy.role === 'worker')?.policy.prompt).toContain('Original worker rule 41')
     expect(calls.every(call => call.policy.prompt.includes('Original shared communication 19') && call.policy.promptRevision === 1)).toBe(true)
     expect(calls.every(call => !call.policy.prompt.includes('Custom routing rule 73') && !call.policy.prompt.includes('Custom worker rule 41'))).toBe(true)
-    const ticket = (await runtime.state()).tickets[0]!
-    expect(ticket.assignments.at(-1)?.report?.summary).toContain(`/jarvis/api/system/root/artifacts/${ticket.id}/index.html`)
+    const ticket = (await runtime.state()).tickets[0]!, assignment = ticket.assignments.at(-1)!
+    const summary = assignment.report!.summary, html = '<!doctype html><button>play</button>'
+    const open = summary.match(/\[打开\]\(([^)]+)\)/)?.[1]!
+    const prefix = `/jarvis/api/system/root/artifacts/${ticket.id}/@version/${encodeURIComponent(assignment.id)}/`
+    expect(open).toBeDefined(); expect(open.startsWith(prefix)).toBe(true)
+    const bundle = open.slice(prefix.length).split('/')[0]!
+    expect(bundle).toMatch(/^[a-f0-9]{64}$/)
+    expect(open).toBe(`${prefix}${bundle}/index.html`)
+    expect(summary).toContain(`[下载](${open}?download=1)`)
+    const sha256 = createHash('sha256').update(html).digest('hex')
+    expect(summary).toContain(`SHA-256 ${sha256}`)
+    const chunk = runtime.readArtifact({ artifact: { instanceId: 'root', ticketId: ticket.id, assignmentId: assignment.id,
+      version: { path: 'index.html', sha256, size: Buffer.byteLength(html), bundle } } })
+    expect(Buffer.from(chunk.data, 'base64').toString()).toBe(html); expect(chunk.nextOffset).toBeNull()
     expect(readFileSync(join(calls.find(call => call.policy.role === 'worker')!.policy.cwd, 'index.html'), 'utf8')).toContain('play')
     expect(native.errors).toEqual([])
   })
@@ -85,8 +98,16 @@ describe('organization task engine settings', () => {
     let runtime: ProcessRuntime
     const native = controlledNative(async turn => {
       if (turn.policy.role === 'orchestrator') return route(turn)
-      if (!turn.text.startsWith('{') || !JSON.parse(turn.text).ticket_id) return
+      if (!turn.text.startsWith('{')) return
+      const input = JSON.parse(turn.text)
+      if (!input.ticket_id) return
       workspaces.push(turn.policy.cwd)
+      if (workspaces.length === 2) {
+        const [file] = input.execution.handoff
+        expect(file).toMatchObject({ instanceId: 'root', ticketId: input.ticket_id, version: { path: 'index.html',
+          sha256: createHash('sha256').update('version 1').digest('hex') } })
+        expect(readFileSync(join(turn.policy.cwd, file.path), 'utf8')).toBe('version 1')
+      }
       if (workspaces.length > 1) expect(readFileSync(join(turn.policy.cwd, 'index.html'), 'utf8')).toBe(`version ${workspaces.length - 1}`)
       writeFileSync(join(turn.policy.cwd, 'index.html'), `version ${workspaces.length}`)
       await turn.tool('orchestrator_report', { state: 'ready', summary: 'Updated local game', artifacts: [{ path: 'index.html' }] })

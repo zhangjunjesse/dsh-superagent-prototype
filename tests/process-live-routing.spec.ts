@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createProcessRuntime, Store, type ProcessHost, type ProcessRuntime, type ProcessRuntimeConfig } from '../src/process-runtime/runtime.ts'
 import type { Capability, DelegationCatalog, DelegationRequest } from '../src/process-runtime/delegation-contract.ts'
-import { controlledNative, routeOriginal, type NativeTurn } from './fixtures/native-ports.ts'
+import { controlledNative, originalText, routeOriginal, type NativeTurn } from './fixtures/native-ports.ts'
 
 type Id = 'parent' | 'first' | 'added'
 type Card = { trigger_id: string; text: string; execution_targets: Capability[] }
@@ -43,6 +43,7 @@ function harness() {
       },
       async cancel() {},
       async delegationCatalog() {
+        if (id !== 'parent') return { targets: [], readyInstanceIds: [] }
         catalog.reads++
         if (hooks.catalog) return hooks.catalog()
         if (catalog.override) return structuredClone(catalog.override)
@@ -63,6 +64,18 @@ function harness() {
       if (!turn.text.startsWith('{')) return
       const input = JSON.parse(turn.text)
       if (turn.policy.role === 'orchestrator') {
+        if (input.kind === 'result_review') {
+          const binding = sent.find(request => request.parentTicketId === input.ticket_id && request.parentAssignmentId === input.assignment_id && request.operation === 'submit')
+          expect(binding).toBeDefined()
+          expect(await originalText(turn, input.original_request)).toBe(binding!.taskContext!.source.text)
+          const review = JSON.parse(await originalText(turn, input.read))
+          const [summary, evidence] = review.summary.split('\n\n')
+          expect(summary).toBe(`${binding!.targetInstanceId}: original bounded execution completed`)
+          expect(JSON.parse(evidence)).toMatchObject({ producer: { instanceId: binding!.targetInstanceId }, evidence_ref: input.evidence_ref })
+          await turn.tool('orchestrator_result_review', { ticket_id: input.ticket_id, assignment_id: input.assignment_id, review_id: input.review_id,
+            decision: { kind: 'accept', summary } })
+          return
+        }
         if (input.kind !== 'candidate') return
         const card = input as Card; cards.push({ instanceId: id, card })
         if (id === 'parent' && hooks.route) { await hooks.route(turn, card); return }
@@ -207,6 +220,34 @@ describe('live child catalogs on the original Router path', () => {
     await child.capabilitiesHold({ operationId: 'already-admitted', held: true })
     expect(await child.delegation({ sourceInstanceId: 'parent', request: bound })).toMatchObject({ status: 'completed' })
     expect((await child.state()).delegations.incoming).toHaveLength(1)
+    expect(h.native.parent.errors).toEqual([]); expect(h.native.added.errors).toEqual([])
+  })
+
+  it.each(['paused', 'held'] as const)('finishes cancellation after a selected child refuses admission while %s and fences a late submit', async state => {
+    const h = harness(); h.catalog.targets.push(capability('added')); const child = h.open('added'); await child.ready
+    h.hooks.beforeSubmit = async () => {
+      if (state === 'paused') await pause(child, true)
+      else await child.capabilitiesHold({ operationId: 'refused-cancellation', held: true })
+    }
+    const parent = h.open('parent'); await submit(parent, 'refused-cancellation', 'Read through the selected child')
+    await wait(async () => expect((await parent.state()).delegations.outgoing[0]?.error).toContain('not ready to admit new delegations'))
+    const before = await parent.state(), ticket = before.tickets[0]!, binding = before.delegations.outgoing[0]!.request
+    expect((await child.state()).delegations.incoming).toEqual([])
+    expect(await parent.management({ method: 'POST', path: `tickets/${ticket.id}/stop`, body: {} })).toMatchObject({ status: 200 })
+    await vi.waitFor(async () => expect((await parent.state()).tickets[0]?.ended?.outcome).toBe('stopped'), { timeout: 1500, interval: 20 })
+    const settled = await parent.state()
+    expect(settled.delegations.outgoing[0]).toMatchObject({ request: binding, finished: true,
+      snapshot: { status: 'stopped', executionStopped: true } })
+    expect((await child.state()).tickets).toEqual([])
+    expect(h.sent.filter(request => request.operation === 'stop')).toHaveLength(1)
+    if (state === 'paused') await pause(child, false)
+    else await child.capabilitiesHold({ operationId: 'refused-cancellation', held: false })
+    await child.close()
+    const reopened = createProcessRuntime(child.config, { run: async () => { throw new Error('A stopped binding must never prepare again') }, cancel: async () => {} },
+      { native: controlledNative().native }); owners.push(reopened); await reopened.ready
+    expect(await reopened.lifecycleDelegation({ sourceInstanceId: 'parent', request: { ...binding, operation: 'query' } })).toMatchObject({ status: 'stopped' })
+    await expect(reopened.delegation({ sourceInstanceId: 'parent', request: binding })).rejects.toThrow('original submit command')
+    expect((await reopened.state()).tickets).toEqual([])
     expect(h.native.parent.errors).toEqual([]); expect(h.native.added.errors).toEqual([])
   })
 

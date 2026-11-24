@@ -1,0 +1,121 @@
+/** Main-Session result acceptance and remaining work, under the ticket's existing mandate. */
+import { key } from './ids.ts'
+import { UserError } from './errors.ts'
+import { latestAssignment, liveTicket, type Assignment, type ResultReview, type ResultReviewDecision, type Ticket } from './model.ts'
+import { EnginePart, type EngineOptions } from './part.ts'
+import type { Tickets } from './tickets.ts'
+import type { Assignments, WorkerReport } from './assignments.ts'
+
+/** A trusted executor may replace only this exact stale transport projection, never a newer report. */
+export type ResultReportRecovery = { state: 'blocked'; summary: string; at: string }
+
+const transportFields = Symbol('review transport fields')
+const grantOrder = Symbol('recorded grant order')
+export type DepartmentMatchOrder = 'matching' | 'configured' | 'recorded'
+
+/** Only explicit permission lists are sets. Keep their configured order for execution and their old binding for upgrades. */
+export function reviewGrantSet<T extends string>(values: readonly T[], recorded?: readonly T[]) {
+  return Object.assign([...values], { [grantOrder]: recorded ?? values })
+}
+
+/** Both views retain the same authority. Only the execution fence includes transient transport observations. */
+export function withReviewTransport<T extends object, U extends object>(authority: T, transport: U) {
+  return { ...authority, ...transport, [transportFields]: Object.keys(transport) }
+}
+
+function matchingValue(value: unknown, order: DepartmentMatchOrder): unknown {
+  if (Array.isArray(value) && grantOrder in value) {
+    if (order === 'matching') return [...new Set(value)].sort()
+    if (order === 'recorded') {
+      // Restore listing order only. A historical binding must never restore a removed permission.
+      const recorded = value[grantOrder] as readonly string[]
+      return [...new Set([...recorded.filter(name => value.includes(name)), ...value])]
+    }
+  }
+  if (!value || typeof value !== 'object' || !(transportFields in value)) return value
+  const fields = value[transportFields] as string[]
+  return Object.fromEntries(Object.entries(value).filter(([name]) => !fields.includes(name)))
+}
+
+/** Holds executor evidence until the owner judges the original goal; decisions and continuation commit atomically. */
+export class ResultReviews extends EnginePart {
+  constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly assignments: Assignments) { super(options) }
+
+  context(ticket: Ticket, assignment: Assignment, purpose: 'execution' | DepartmentMatchOrder = 'execution'): string {
+    // Delivery/read receipts do not change the request. Text, routing notes, policy and authority do.
+    const inputs = ticket.inputs.map(input => {
+      if (input.kind !== 'trigger') return input
+      const { readAt: _read, deliveredAt: _at, deliveredTo: _to, ...material } = input
+      return { ...material, trigger: this.repo.triggers.get(input.triggerId) }
+    })
+    const material = { inputs, mandate: ticket.mandate,
+      execution: ticket.execution, follows: ticket.follows, policy: this.policy().version,
+      authority: this.options.resultReview?.context?.(ticket, assignment) }
+    // Providers may embed a delegated binding inside other grants. Preserve every unmarked grant in either view.
+    const json = purpose === 'execution' ? JSON.stringify(material) : JSON.stringify(material, (_key, value) => matchingValue(value, purpose))
+    return key('review-context', ticket.decisionId, assignment.id, json)
+  }
+  private current(ticketId: string, assignmentId: string): { ticket: Ticket; assignment: Assignment } {
+    const ticket = this.require(ticketId), assignment = latestAssignment(ticket)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (!assignment || assignment.id !== assignmentId || assignment.state === 'ended') throw new UserError('assignmentEnded')
+    return { ticket, assignment }
+  }
+  /** The trusted executor supplies an evidence identity after checking its actual producer binding. */
+  stage(ticketId: string, assignmentId: string, evidenceRef: string, summary: string, report?: WorkerReport, recovery?: ResultReportRecovery): ResultReview {
+    if (!evidenceRef.trim() || !summary.trim()) throw new Error('Result review requires evidence identity and summary')
+    let { ticket, assignment } = this.current(ticketId, assignmentId)
+    const contextRef = this.context(ticket, assignment), previous = assignment.resultReviews?.at(-1)
+    const recovering = !!recovery && assignment.report?.state === recovery.state && assignment.report.summary === recovery.summary
+      && assignment.report.at === recovery.at
+    if (previous?.evidenceRef === evidenceRef && previous.contextRef === contextRef && previous.summary === summary
+      && (previous.decision || assignment.report?.summary === summary)) {
+      // Recovered transport does not revoke an already committed judgement about this exact evidence and request.
+      if (recovering && previous.decision?.kind === 'accept' && !ticket.delivery && !ticket.attention && !ticket.undelivered.length)
+        this.assignments.report(ticketId, { state: 'ready', summary: previous.decision.summary, question: null })
+      return previous
+    }
+    // The same evidence can return after a newer report or a transport failure. Restore its report and relay atomically
+    // under a fresh CAS; chaining the last review prevents a historical decision from becoming current again.
+    const id = key('result-review', ticketId, assignmentId, evidenceRef, contextRef, ...previous ? [previous.id] : [])
+    if (assignment.state === 'pending') this.assignments.started(ticketId, assignmentId)
+    // Blocked delivery remains visible; the owner can arrange remaining work with the undelivered input intact.
+    const blocked = !!ticket.delivery || !!ticket.attention || report?.state === 'blocked' || report?.state === 'failed'
+      || !recovering && (assignment.report?.state === 'blocked' || assignment.report?.state === 'failed')
+    this.assignments.report(ticketId, { ...report, state: report?.state === 'failed' ? 'failed' : blocked ? 'blocked' : 'waiting', summary,
+      question: report?.question ?? ticket.attention?.question ?? null })
+    ;({ ticket, assignment } = this.current(ticketId, assignmentId))
+    const review: ResultReview = { id, evidenceRef, contextRef, summary, at: this.now() }
+    assignment.resultReviews = [...assignment.resultReviews ?? [], review]
+    this.repo.tickets.save(ticket)
+    this.options.resultReview?.request(ticket, assignment, review)
+    return review
+  }
+  resolve(ticketId: string, assignmentId: string, reviewId: string, decision: ResultReviewDecision): Ticket {
+    // A committed duplicate is a read, even when its continuation has already produced another assignment.
+    const saved = this.require(ticketId), prior = saved.assignments.find(item => item.id === assignmentId)?.resultReviews?.find(item => item.id === reviewId)
+    if (prior?.decision) {
+      const { at: _at, assignmentId: _next, ...committed } = prior.decision
+      const identity = (value: ResultReviewDecision) => key(value.kind, value.summary,
+        ...value.kind === 'continue' ? [value.instructions, value.targetInstanceId ?? 'local'] : [])
+      if (identity(committed) !== identity(decision)) throw new Error('Result review already has a different decision')
+      return saved
+    }
+    const { ticket, assignment } = this.current(ticketId, assignmentId)
+    const review = assignment.resultReviews?.at(-1)
+    if (!review || review.id !== reviewId || review.contextRef !== this.context(ticket, assignment)) throw new Error('Result review is stale; read the current task and evidence')
+    if (assignment.report?.summary !== review.summary) throw new Error('Result review was superseded by a newer executor report')
+    if (this.policy().paused || this.options.admission?.frozen?.() || this.options.admission?.resume(ticket) === false) throw new Error('Result review is held by maintenance or pause')
+    if (!this.dispatch.revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+    if (!decision.summary.trim() || decision.kind === 'continue' && !decision.instructions.trim()) throw new Error('Result review requires its judgement and remaining work')
+    if (decision.kind === 'accept' && ticket.undelivered.length) throw new Error('Unconsumed task inputs prevent completion; arrange the remaining work')
+    this.options.resultReview?.authorize?.(ticket, assignment, decision)
+    review.decision = { ...decision, at: this.now() }
+    this.repo.tickets.save(ticket)
+    if (decision.kind === 'accept') return this.assignments.report(ticketId, { state: 'ready', summary: decision.summary, question: null })
+    const next = this.tickets.continueReviewed(ticket, assignment, review.id, decision.instructions, decision.targetInstanceId)
+    review.decision.assignmentId = next.id
+    this.repo.tickets.save(ticket)
+    return this.require(ticketId)
+  }
+}

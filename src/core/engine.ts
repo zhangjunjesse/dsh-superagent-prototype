@@ -1,8 +1,9 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { Dispatches } from './dispatch.ts'
-import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, CommandReceipt, ConsumptionReceipt, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import { isoTime, latestAssignment, liveTicket } from './model.ts'
+import { key } from './ids.ts'
+import type { Assignment, ChannelRef, CommandReceipt, ConsumptionReceipt, Decision, PolicyEffect, ResultReview, ResultReviewDecision, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -10,6 +11,7 @@ import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest } from './replies.ts'
 import { Tickets } from './tickets.ts'
+import { ResultReviews, type DepartmentMatchOrder, type ResultReportRecovery } from './result-reviews.ts'
 
 export type { EngineOptions } from './part.ts'
 export type { WorkerReport } from './assignments.ts'
@@ -30,12 +32,14 @@ export class Engine {
   private readonly evals: Evals
   private readonly intake: Intake
   private readonly dispatch: Dispatches
+  private readonly reviews: ResultReviews
   constructor(private readonly options: EngineOptions) {
     this.repo = options.repo
     this.dispatch = new Dispatches(options)
     this.replies = new Replies(options)
     this.tickets = new Tickets(options, this.replies)
     this.assignments = new Assignments(options, this.tickets, this.replies)
+    this.reviews = new ResultReviews(options, this.tickets, this.assignments)
     this.evals = new Evals(options, this.tickets)
     this.intake = new Intake(options, this.tickets)
   }
@@ -204,9 +208,12 @@ export class Engine {
    * @throws UserError when the ticket is unknown.
    */
   stopTicket(ticketId: string, reason?: string): Ticket { return this.repo.atomic(() => this.tickets.stop(ticketId, reason)) }
+  /** Invoked by the bound executor after all of this ticket's stop acknowledgements have been persisted. */
+  confirmCancellation(ticketId: string): void { this.repo.atomic(() => this.tickets.confirmCancellation(ticketId)) }
   /**
    * A person retries a ticket whose worker reported failed or blocked (or whose input delivery failed): the stalled
    * Assignment ends and a new one starts under the same Mandate.
+   * An executor owner can retain the request durably and return the current Ticket while its old execution is verified stopped.
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
   retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
@@ -278,11 +285,35 @@ export class Engine {
    * cleared (`null` or a `ready` report), and a replaced attention question whose reply has not been sent yet is withdrawn
    * from the outbox. A `blocked` or `failed` report holds back automated inputs until a human message arrives. A `dropped`
    * report ends the ticket, and a `ready` report ends it: `completed` without followed Threads, else with the `followsDone`
-   * outcome once `followsDone` holds.
+   * outcome once `followsDone` holds. With result-review integration, a reviewed continuation's results, blockers and
+   * failures return to the owning main Session; only its current acceptance can complete the original goal.
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
-  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  report(ticketId: string, report: WorkerReport): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+      // Ordinary local ready reports retain their original semantics. A reviewed task's local continuation returns to its owner.
+      if (this.options.resultReview && assignment?.continuation && ['ready', 'dropped', 'blocked', 'failed'].includes(report.state)) {
+        if (report.state === 'ready' && report.question) throw new UserError('questionWithResult')
+        this.reviews.stage(ticketId, assignment.id, key('local-result', assignment.id, report.state, report.summary, report.question ?? ''), report.summary, report)
+        return this.repo.tickets.get(ticketId)!
+      }
+      return this.assignments.report(ticketId, report)
+    })
+  }
+  /** A verified executor result waits for the owner; recovery can replace only the named stale transport report. */
+  stageResultReview(ticketId: string, assignmentId: string, evidenceRef: string, summary: string, recovery?: ResultReportRecovery): ResultReview {
+    return this.repo.atomic(() => this.reviews.stage(ticketId, assignmentId, evidenceRef, summary, undefined, recovery))
+  }
+  /** Only for remembering a negative match. Acceptance and continuation use the full execution context. */
+  departmentMatchContext(ticket: Ticket, assignment: Assignment, order: DepartmentMatchOrder = 'matching'): string {
+    return this.reviews.context(ticket, assignment, order)
+  }
+  /** Accept evidence or start remaining work under the existing mandate, with stale decisions refused atomically. */
+  resolveResultReview(ticketId: string, assignmentId: string, reviewId: string, decision: ResultReviewDecision): Ticket {
+    return this.repo.atomic(() => this.reviews.resolve(ticketId, assignmentId, reviewId, decision))
+  }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
@@ -306,7 +337,7 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'commandReceipt' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note' | 'resolveResultReview'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

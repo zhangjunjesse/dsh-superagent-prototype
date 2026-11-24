@@ -1,10 +1,10 @@
 /** Composition of the original complete application in an independent organization owner. */
 import { Context } from '@deepseek-ai/cordis'
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import { Runtime } from '../app/runtime.ts'
-import type { Ticket } from '../core/index.ts'
+import { latestAssignment, liveTicket, reviewGrantSet, type Assignment, type Ticket } from '../core/index.ts'
 import type { RuntimeNativePorts } from '../app/runtime-ports.ts'
 import type { Machine } from '../deployment.ts'
 import type { StartupObserver } from '../setup.ts'
@@ -19,13 +19,18 @@ import * as github from '../sources/github.ts'
 import * as feishu from '../sources/feishu.ts'
 import { InboundDelegations, type DelegationLimit } from './delegation-ingress.ts'
 import { DelegationExecutor } from './delegation-executor.ts'
-import { CapabilitySchema, DelegationCatalogSchema, type Capability } from './delegation-contract.ts'
+import { CapabilitySchema, DelegationCatalogSchema, verifiedDepartmentWaits, type Capability } from './delegation-contract.ts'
 import { EngineConfigSchema, normalizeEngineConfig } from './engine-config.ts'
 import { initializeOriginalConfiguration } from './original-config.ts'
-import { TaskFiles, artifactLinks } from './task-files.ts'
+import { TaskFiles } from './task-files.ts'
+import { ArtifactReferenceSchema, artifactIdentity, type ArtifactReference } from './artifact-contract.ts'
 import { effectiveWorkerTools, WorkerSkillsSchema, WorkerToolSchema } from './worker-capabilities.ts'
 import { CapabilityDrain, type CapabilityHold } from './capability-drain.ts'
 import type { ProcessHost, ProcessRunResult, ProcessRuntimeConfig } from './runtime.ts'
+import { executionRoot } from '../app/execution-environment.ts'
+import { DepartmentWaits } from './department-waits.ts'
+import { ExplicitRetries } from './explicit-retries.ts'
+import { fingerprint } from '../jarvis-gateway/contracts.ts'
 
 const absolute = z.string().refine(isAbsolute)
 const machineDefaults = z.object({
@@ -51,12 +56,16 @@ export interface ProcessRuntimeOptions {
   restart?(): void;
   /** Installed from durable host coordination before original Sources or effects can admit work. */
   capabilityHold?: CapabilityHold;
+  /** Rebuild current admission from the host's committed graph after any interrupted move. */
+  delegationLimits?: DelegationLimit[];
   /** Stage-only observation of the original setup and native Session initialization. */
   startup?: StartupObserver;
 }
 type Preparation = { prepare(id: string, text: string): Promise<ProcessRunResult>; cancel(sessionKey: string): Promise<unknown> }
-const WorkerCapabilityBindingSchema = z.object({ version: z.literal(1), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
+const WorkerCapabilityBindingSchema = z.object({ version: z.union([z.literal(1), z.literal(2)]), tools: z.array(WorkerToolSchema), skills: WorkerSkillsSchema }).strict()
 const workerCapabilities = family<z.infer<typeof WorkerCapabilityBindingSchema>, [string]>('process-runtime:worker-capabilities:')
+const localRetryStops = family<{ operationId: string; decisionId: string }, [string]>('process-runtime:local-retry-stop:')
+const localHandoffs = family<{ reviewId: string; evidenceRef: string }, [string]>('process-runtime:local-handoff:')
 
 /** Validate adopted identities against the actual locked Store rather than trusting transport observations. */
 function verifyAdoption(runtime: Runtime, config: ProcessRuntimeConfig, adoption: OriginalAdoption): void {
@@ -86,6 +95,8 @@ export class OriginalProcess {
   readonly delegated: DelegationExecutor
   readonly taskFiles: TaskFiles
   readonly capabilityDrain: CapabilityDrain
+  readonly departments: DepartmentWaits
+  readonly retries: ExplicitRetries
   readonly ready: Promise<void>
   private readonly context = new Context()
   private unregister?: () => void
@@ -95,6 +106,25 @@ export class OriginalProcess {
   private quiescing?: Promise<void>
   private readyTargets = new Set<string>()
   private catalogRefresh?: Promise<void>
+  private readonly localCleanup = new Map<string, { context: string; settled: boolean; work: Promise<boolean> }>()
+
+  /** Settle a catalog read admitted before the host fenced the graph. */
+  async freezeTopology(operationId: string): Promise<void> {
+    this.capabilityDrain.freezeTopology(operationId)
+    await this.catalogRefresh
+  }
+  /** A private host operation changes relationships without replacing task or Session owners. */
+  configureTopology(input: { operationId: string; allowedParents: string[]; delegationTargets: Capability[]; delegationLimits: DelegationLimit[] }): void {
+    this.capabilityDrain.authorizeTopology(input.operationId)
+    if (input.delegationTargets.some(target => target.instanceId === this.config.instanceId || target.tools.some(tool => !this.config.workerTools.includes(tool)))
+      || input.allowedParents.includes(this.config.instanceId)) throw new Error('Organization topology exceeds the current capability or identity')
+    const previous = this.config.allowedParents
+    this.config.allowedParents = [...input.allowedParents]
+    try { this.inbound.configureTopology(input.delegationLimits) }
+    catch (error) { this.config.allowedParents = previous; throw error }
+    this.config.delegationTargets = structuredClone(input.delegationTargets)
+    this.readyTargets = new Set()
+  }
 
   constructor(readonly config: ProcessRuntimeConfig, private readonly host: ProcessHost, readonly options: ProcessRuntimeOptions, preparation: Preparation) {
     if (!options?.native) throw new Error('The original complete task runtime requires its shared DSH native ports')
@@ -127,39 +157,117 @@ export class OriginalProcess {
         workerTools: ticket => effectiveWorkerTools(this.workerCapabilities(ticket).tools).names,
         workerSkills: ticket => this.workerCapabilities(ticket).skills,
         prepareTicket: ticket => {
-          runtime!.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 1, ...this.workerCapabilities(ticket) }))
+          runtime!.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 2, ...this.workerCapabilities(ticket) }))
           return ticket
         },
-        localTicket: ticket => !this.delegated.remote(ticket),
+        localTicket: ticket => !this.delegated.remote(ticket) && !this.departments?.held(ticket) && !this.retries?.pending(ticket),
+        prepareHandoff: async (ticket, assignment) => {
+          this.delegated.assertReplacement(ticket, assignment)
+          return this.taskFiles.materialize(ticket.id, this.handoffArtifacts(ticket, assignment), async input => {
+            // TaskFiles verifies this local task's original registration and digest.
+            if (input.artifact.instanceId === config.instanceId && input.artifact.ticketId === ticket.id) return this.taskFiles.read(input)
+            if (!host.readArtifact) throw new Error('The authenticated artifact transfer is unavailable')
+            return host.readArtifact({ ...input, ticketId: ticket.id, assignmentId: assignment.id })
+          })
+        },
         executionHeld: () => this.draining || (this.capabilityDrain?.frozen ?? false),
         authorizeCapabilityStop: operationId => this.capabilityDrain.authorizeStop(operationId),
         engine: { resumeCompletedCommands: true,
+          retry: { request: (ticket, assignment, eligible) => this.retries.request(ticket, assignment, eligible) },
           admission: { evaluate: trigger => !this.draining && this.capabilityDrain.evaluate(trigger), resume: ticket => !this.draining && this.capabilityDrain.resume(ticket),
             frozen: () => this.draining || this.capabilityDrain.frozen },
-          delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false } },
+          delegation: { authorize: trigger => this.inbound?.authorize(trigger), revalidate: mandate => this.inbound?.revalidate(mandate) ?? false },
+          resultReview: {
+            context: (ticket, assignment) => {
+              const capabilities = this.workerCapabilities(ticket, true)
+              return { delegation: this.delegated.reviewContext(ticket, assignment, capabilities.tools), capabilities }
+            },
+            authorize: (ticket, assignment, decision) => {
+              if (this.retries.pending(ticket)) throw new Error('This result review is held by the explicit retry of its original assignment')
+              this.departments.authorize(ticket, assignment, decision, this.departmentTargets(ticket))
+              if (decision.kind === 'continue' && !this.delegated.remote(ticket, assignment)) {
+                const review = assignment.resultReviews?.at(-1), proof = runtime!.store.get(localHandoffs(assignment.id))
+                if (!review || proof?.reviewId !== review.id || proof.evidenceRef !== review.evidenceRef || this.localCleanup.get(assignment.id)?.settled === false)
+                  throw new Error('The original Worker execution has not been verified stopped for this result')
+              }
+              this.delegated.authorizeReview(ticket, assignment, decision)
+            },
+            request: (ticket, assignment, review) => {
+              // A retained department wait resumes through its original ready/resume path after the new review CAS is staged.
+              if (this.departments?.held(ticket)) return
+              runtime!.sessions.relay(review.id, JSON.stringify({ kind: 'result_review',
+              ticket_id: ticket.id, assignment_id: assignment.id, review_id: review.id, evidence_ref: review.evidenceRef,
+              scope: ticket.mandate.scope, original_request: ticket.mandate.basis.via === 'delegation'
+                ? `delegation/${ticket.origin.triggerId}/source` : `trigger/${ticket.origin.triggerId}`,
+              ...(ticket.attention ? { human_action: ticket.attention.question, attention_id: ticket.attention.id } : {}),
+              original_assignment: `ticket/${ticket.id}/assignment`, inputs: `ticket/${ticket.id}/inputs`,
+              history: `ticket/${ticket.id}/assignments`, read: `ticket/${ticket.id}/review/${review.id}`,
+              summary: review.summary.slice(0, 600), chars: review.summary.length,
+              producer_state: this.delegated.result(ticket.id)?.status ?? assignment.report?.state,
+              execution_targets: (config.delegationTargets ?? []).map(target => ({ ...target,
+                tools: target.tools.filter(tool => this.workerCapabilities(ticket).tools.includes(tool)) }))
+                .filter(target => target.tools.length && this.readyTargets.has(target.instanceId)),
+              instruction: 'Read the original request, complete review, all later inputs and prior results. Judge every original goal and completion condition against actual evidence for the delivered version. A child completion is only a result to review. Use orchestrator_result_review: accept only with sufficient evidence, otherwise continue the remaining work under the same mandate. If the producer cannot execute, choose a direct department with suitable responsibility and tools and retain the reason. Continue from the registered version and remaining work; the business owner queries and confirms the old execution stopped before handoff. Connection loss or an unknown result is not evidence of no changes. If a necessary direct department is missing, use orchestrator_department_wait with the responsibility, all required tools and the remaining instructions. The original review resumes when a suitable department is ready. Ask the user through the original group conversation if the task needs a different goal or more authority. Do not report completion to the user before acceptance.' }))
+            },
+          } },
         scope: { scope: input => input.source === 'delegation'
           ? this.inbound?.listens(input.meta) ? { listened: true, observed: false } : { listened: false, reason: 'delegation_not_allowed' }
           : this.runtime.sources.scope(input) },
         routing: {
           targets: async trigger => {
-            if (trigger.source === 'delegation') return []
             await this.refreshDelegationCatalog()
-            return (config.delegationTargets ?? []).filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
+            const ceiling = this.inbound.toolsForTrigger(trigger)
+            return (config.delegationTargets ?? []).map(target => ({ ...target, tools: target.tools.filter(tool => !ceiling || ceiling.includes(tool)) }))
+              .filter(target => target.tools.length && this.readyTargets.has(target.instanceId))
           },
           prepare: async (id, target) => { if (target && !this.delegated.selected(id)) await this.refreshDelegationCatalog() },
           select: (id, target) => this.delegated.select(id, target),
+          prepareReview: (id, target, assignmentId, reviewId) => this.prepareReview(id, target, assignmentId, reviewId),
         },
         executor: local => ({
-          start: (ticket, assignment) => this.delegated.remote(ticket) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment),
+          requestCancellation: ticket => this.delegated.requestCancellation(ticket.id)
+            || !this.delegated.remote(ticket) && ticket.assignments.some(assignment => assignment.startedAt),
+          start: (ticket, assignment) => {
+            this.delegated.assertReplacement(ticket, assignment)
+            return this.delegated.remote(ticket, assignment) ? this.delegated.start(ticket, assignment) : local.start(ticket, assignment)
+          },
           deliver: (ticket, assignment) => { if (!this.delegated.remote(ticket)) local.deliver(ticket, assignment) },
           stop: (ticket, assignment, reason) => {
-            if (this.delegated.remote(ticket)) this.delegated.stop(ticket, assignment)
+            if (this.delegated.remote(ticket, assignment)) this.delegated.stop(ticket, assignment)
             // A locked management owner has no loaded native execution. Its
             // guarded domain stop is durable; only the live business owner can cancel Sessions.
-            else if (!options.managementOnly) local.stop(ticket, assignment, reason)
+            else if (!options.managementOnly) {
+              const retry = runtime!.store.get(localRetryStops(assignment.id)), review = runtime!.store.get(localHandoffs(assignment.id))
+              const prepared = this.localCleanup.get(assignment.id)?.settled === true && (reason === 'retried' && retry?.decisionId === ticket.decisionId
+                || reason === 'continuedAfterReview' && !!review && review.reviewId === assignment.resultReviews?.at(-1)?.id
+                  && review.evidenceRef === assignment.resultReviews?.at(-1)?.evidenceRef)
+              local.stop(ticket, assignment, reason, prepared)
+              if (prepared) runtime!.store.afterCommit(() => { this.localCleanup.delete(assignment.id) })
+            }
           },
         }),
-        reportArtifacts: (ticketId, artifacts) => artifactLinks(config.instanceId, ticketId, this.taskFiles.register(ticketId, artifacts)),
+        reportArtifacts: (ticketId, artifacts) => {
+          this.taskFiles.register(ticketId, artifacts)
+          return this.taskFiles.links(config.instanceId, ticketId).map(item => `- ${item.title.replace(/[\[\]\\\r\n]/g, ' ')}：[打开](${item.url}) · [下载](${item.downloadUrl})${item.version ? ` · SHA-256 ${item.version.sha256}` : ''}`).join('\n')
+        },
+        waitForDepartment: (ticketId, requirement, summary) => this.departments.stage(ticketId, requirement, summary),
+        reportMissingDepartment: (ticketId, requirement, summary) => this.departments.stage(ticketId, requirement, summary),
+        holdForDepartment: (ticketId, assignmentId, reviewId, requirement, summary) => this.departments.hold(ticketId, assignmentId, reviewId, requirement, summary),
+        deferDepartment: (ticketId, assignmentId, reviewId, attemptId, reason) => this.departments.defer(ticketId, assignmentId, reviewId, attemptId, reason),
+        resumeDepartment: async (ticketId, assignmentId, reviewId, target, summary) => {
+          const committed = runtime!.store.tickets.get(ticketId)?.assignments.find(item => item.id === assignmentId)?.resultReviews?.find(item => item.id === reviewId)?.decision
+          if (committed) return this.departments.resume(ticketId, assignmentId, reviewId, target, summary)
+          try {
+            await this.refreshDelegationCatalog()
+            const ticket = runtime!.store.tickets.get(ticketId)
+            this.departments.validateResume(ticketId, assignmentId, reviewId, target, ticket ? this.departmentTargets(ticket) : [])
+            await this.prepareReview(ticketId, target, assignmentId, reviewId)
+            return this.departments.resume(ticketId, assignmentId, reviewId, target, summary)
+          } catch (error) {
+            this.departments.failedResume(ticketId, assignmentId, reviewId, target)
+            throw error
+          }
+        },
         initialize: original => {
           if (adoption) verifyAdoption(original, config, adoption)
           const before = original.store.settings().sources.jarvis?.config
@@ -174,15 +282,33 @@ export class OriginalProcess {
                 maxWorkers: config.maxWorkers, directory: workspace } }) })
         },
       })
-      this.taskFiles = new TaskFiles(directory, workspace, { executionDirectory: id => runtime!.store.tickets.get(id)?.execution?.directory })
+      this.taskFiles = new TaskFiles(directory, workspace, { executionDirectory: id => runtime!.store.tickets.get(id)?.execution?.directory,
+        assignmentId: id => runtime!.store.tickets.get(id)?.assignments.at(-1)?.id,
+        assignmentExists: (id, assignmentId) => runtime!.store.tickets.get(id)?.assignments.some(item => item.id === assignmentId) ?? false })
       const kind = jarvisKind(ledger, identity)
       this.unregister = runtime.sources.register(kind)
       this.inbound = new InboundDelegations(config, runtime.store, runtime.engine,
         { ...preparation, admitted: id => this.capabilityDrain.prepare(id), acceptNew: () => this.delegationReady() })
+      if (options.delegationLimits) this.inbound.configureTopology(options.delegationLimits)
       this.delegated = new DelegationExecutor(config, runtime.store, runtime.engine, host.delegate?.bind(host),
-        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools)
+        () => this.capabilityDrain?.frozen ?? false, id => this.readyTargets.has(id), ticket => this.workerCapabilities(ticket).tools, this.inbound,
+        ticket => this.handoffArtifacts(ticket), () => this.refreshDelegationCatalog())
+      this.departments = new DepartmentWaits(config, runtime.store, runtime.engine, runtime.sessions,
+        id => !runtime!.effects.pending('relay', id) && options.native.sessions.current(runtime!.masterId)?.status !== 'running')
       this.capabilityDrain = new CapabilityDrain(runtime, this.inbound,
         () => options.native.sessions.current(runtime!.masterId)?.status === 'running', !options.managementOnly, options.capabilityHold)
+      this.retries = new ExplicitRetries({ store: runtime.store, effects: runtime.effects, engine: runtime.engine,
+        paused: () => this.draining || !this.delegationReady(),
+        accepted: (ticket, assignment, operationId) => this.delegated.requestRetry(ticket, assignment, operationId),
+        prepare: async (ticket, assignment, operationId) => {
+          if (this.delegated.remote(ticket, assignment)) return this.delegated.prepareRetry(ticket.id, assignment.id, operationId)
+          const current = await this.stopLocalExecution(ticket.id, assignment.id)
+          if (current) runtime!.store.set(localRetryStops(assignment.id), { operationId, decisionId: ticket.decisionId })
+          return current
+        },
+        ready: (ticket, assignment, operationId) => this.delegated.remote(ticket, assignment)
+          ? this.delegated.retryReady(ticket, assignment, operationId)
+          : runtime!.store.get(localRetryStops(assignment.id))?.operationId === operationId && this.localCleanup.get(assignment.id)?.settled === true })
       const backend = new SourceBackend(runtime.context(kind), identity)
       this.gateway = new GatewayService(ledger, backend, identity, Date.now, { resumeCompletedCommands: true, canResumeCompleted: ticket => !this.delegated.remote(ticket) })
       this.pump = new GatewayPump(ledger, backend)
@@ -196,15 +322,72 @@ export class OriginalProcess {
     }
   }
   /** Existing task grants can only narrow; changing instance settings never grants an old task new tools or skills. */
-  private workerCapabilities(ticket: Ticket) {
+  private workerCapabilities(ticket: Ticket, forReview = false) {
     const stored = this.runtime.store.get(workerCapabilities(ticket.id)), saved = stored && WorkerCapabilityBindingSchema.parse(stored)
-    const selected = this.delegated?.selected(ticket.origin.triggerId)
-    const childTools = selected && selected !== 'local' ? this.config.delegationTargets?.find(target => target.instanceId === selected)?.tools ?? [] : undefined
-    return {
-      tools: (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
-        .filter(tool => (!childTools || childTools.some(name => name === tool)) && (!saved || saved.tools.some(name => name === tool))),
-      skills: (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill)),
+    const tools = (this.inbound?.toolsFor(ticket) ?? this.config.workerTools)
+      .filter(tool => this.config.workerTools.includes(tool) && (!saved || saved.tools.some(name => name === tool)))
+    const skills = (this.config.workerSkills ?? []).filter(skill => !saved || saved.skills.includes(skill))
+    return { tools: forReview ? reviewGrantSet(tools, saved?.tools) : tools, skills }
+  }
+  /** Legacy files may stay in their original local workspace, but are never evidence for a transfer. */
+  handoffArtifacts(ticket: Ticket, localAssignment?: Assignment): ArtifactReference[] {
+    if (localAssignment) {
+      const current = this.runtime.store.tickets.get(ticket.id), assignment = current && latestAssignment(current)
+      if (!current || !liveTicket(current) || assignment?.id !== localAssignment.id || this.delegated.remote(current, assignment)
+        || !ticket.execution?.directory || relative(this.taskFiles.directory(ticket.id), realpathSync.native(ticket.execution.directory)) !== '')
+        throw new Error('Local artifact reuse requires the current assignment in its original execution directory')
     }
+    const own = this.taskFiles.links(this.config.instanceId, ticket.id)
+      // An old index has neither version nor assignment. The local Worker is
+      // already in that verified directory; it needs no copy or invented hash.
+      .filter(item => !localAssignment || item.version || item.assignmentId)
+      .map(item => ({ ...item, instanceId: this.config.instanceId, ticketId: ticket.id }))
+    const input = [...this.inbound.handoff(ticket), ...[...own, ...this.delegated.artifacts(ticket.id)].map(item => {
+      if (!item.version || !item.assignmentId) throw new Error('Historical result has no verified version for handoff')
+      return { instanceId: item.instanceId, ticketId: item.ticketId, assignmentId: item.assignmentId, version: item.version }
+    })]
+    const references = input.map(item => ArtifactReferenceSchema.parse(item))
+    return [...new Map(references.map(item => [artifactIdentity(item), item])).values()]
+  }
+  /** Shared by normal reviews and missing-department resumes; no second execution starts before the old one is known quiet. */
+  async prepareReview(ticketId: string, target?: string, assignmentId?: string, reviewId?: string): Promise<void> {
+    if (target) await this.refreshDelegationCatalog()
+    if (target && (!this.config.delegationTargets?.some(item => item.instanceId === target) || !this.readyTargets.has(target))) throw new Error('The selected child is not ready for remaining work')
+    const ticket = this.runtime.store.tickets.get(ticketId), assignment = ticket && latestAssignment(ticket)
+    const review = assignment?.resultReviews?.at(-1)
+    if (!ticket || !liveTicket(ticket) || !assignment || assignmentId && assignment.id !== assignmentId || !review || reviewId && review.id !== reviewId) throw new Error('Result review is no longer current')
+    if (this.delegated.remote(ticket, assignment)) return this.delegated.prepareReview(ticketId, assignment.id, review.id)
+    if (!await this.stopLocalExecution(ticketId, assignment.id)) throw new Error('The original Worker assignment changed while stopping execution')
+    this.runtime.store.set(localHandoffs(assignment.id), { reviewId: review.id, evidenceRef: review.evidenceRef })
+  }
+  /** Review and retry share every cleanup invocation so no old stop can arrive after a replacement reuses the Worker Session. */
+  private stopLocalExecution(ticketId: string, assignmentId: string): Promise<boolean> {
+    const current = () => {
+      const ticket = this.runtime.store.tickets.get(ticketId)
+      return ticket && liveTicket(ticket) && latestAssignment(ticket)?.id === assignmentId ? ticket : undefined
+    }
+    const ticket = current()
+    if (!ticket) return Promise.resolve(false)
+    const context = fingerprint(ticket.inputs), prior = this.localCleanup.get(assignmentId)
+    const native = this.options.native.executor, sessionId = `worker-${ticketId}`
+    if (prior && (!prior.settled || prior.context === context && native.current(sessionId)?.status !== 'running')) return prior.work
+    const entry = { context, settled: false, work: Promise.resolve(false) }
+    entry.work = (async () => {
+      if (native.current(sessionId)) await native.cancel(sessionId, false)
+      if (!current()) return false
+      await native.stopBackground(sessionId, 'The owning organization is arranging replacement work', false)
+      if (!current()) return false
+      if (native.current(sessionId)) {
+        await native.whenIdle(sessionId)
+        if (!current()) return false
+        if (!await native.untilQuiet(sessionId, AbortSignal.timeout(1000)) || (await native.runningJobs(sessionId)).length || native.current(sessionId)?.status !== 'idle')
+          throw new Error('The original Worker execution cleanup has not completed')
+      }
+      await this.options.native.sessions.flush()
+      return !!current()
+    })().then(result => { entry.settled = true; return result }, error => { if (this.localCleanup.get(assignmentId) === entry) this.localCleanup.delete(assignmentId); throw error })
+    this.localCleanup.set(assignmentId, entry)
+    return entry.work
   }
   /** Catch up a catalog addition already committed by the host before validating the unchanged relationships. */
   async prepareCapabilityConfiguration(targets: readonly Capability[]): Promise<void> {
@@ -230,17 +413,18 @@ export class OriginalProcess {
       for (const ticket of this.runtime.store.tickets.list()) {
         const current = this.workerCapabilities(ticket)
         const basis = ticket.mandate.basis, parentTools = basis.via === 'delegation' ? limits.get(basis.delegation.parentInstanceId) ?? [] : undefined
-        this.runtime.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 1,
+        this.runtime.store.set(workerCapabilities(ticket.id), WorkerCapabilityBindingSchema.parse({ version: 2,
           tools: current.tools.filter(tool => input.workerTools.includes(tool) && (!parentTools || parentTools.includes(tool))),
           skills: current.skills.filter(skill => input.workerSkills.includes(skill)) }))
       }
+      this.delegated.narrowCapabilities(input.workerTools, input.delegationTargets)
       this.inbound.configureCapabilityLimits(input.delegationLimits, input.workerTools)
     })
     this.config.workerTools = [...input.workerTools]
     this.config.workerSkills = [...input.workerSkills]
     this.config.delegationTargets = structuredClone(input.delegationTargets)
   }
-  /** Only additive catalog changes can enter a running owner; bound descriptors remain immutable. */
+  /** Additions and unused-target initialization preserve every existing task's bound descriptor. */
   private refreshDelegationCatalog(): Promise<void> {
     return this.catalogRefresh ??= this.readDelegationCatalog().catch(error => {
       this.readyTargets = new Set(); throw error
@@ -253,7 +437,12 @@ export class OriginalProcess {
     const identity = (target: Capability) => JSON.stringify(CapabilitySchema.parse(target))
     for (const target of this.config.delegationTargets ?? []) {
       const current = byId.get(target.instanceId)
-      if (!current || identity(current) !== identity(target)) throw new Error('A running delegation catalog may only add targets')
+      if (!current) throw new Error('A running delegation catalog may only add targets')
+      if (identity(current) === identity(target)) continue
+      const bound = this.delegated.list().some(row => row.request.targetInstanceId === target.instanceId)
+        || this.runtime.store.tickets.list().some(ticket => ticket.assignments.some(assignment => assignment.executionTarget === target.instanceId)
+          || this.delegated.selected(ticket.origin.triggerId) === target.instanceId)
+      if (bound || identity({ ...current, tools: target.tools }) !== identity(target)) throw new Error('A running delegation catalog may only add targets or initialize an unbound target capability')
     }
     for (const target of catalog.targets) {
       if (target.instanceId === this.config.instanceId || target.tools.some(tool => !this.config.workerTools.includes(tool)))
@@ -264,8 +453,40 @@ export class OriginalProcess {
   }
   /** The original admission owner is available without consuming or disturbing current work. */
   delegationReady(): boolean {
-    return !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
-      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId
+    const available = !this.options.managementOnly && !this.draining && !this.closing && !this.runtime.lifetime.aborted
+      && this.runtime.configured() && !this.runtime.store.settings().paused && !this.capabilityDrain.operationId && !this.capabilityDrain.frozen
+    if (!available) return false
+    try { return [this.config.stateDir, this.config.workspace, executionRoot(this.runtime.store.settings(), this.runtime.machine.stateDir)]
+      .every(directory => statSync(directory).isDirectory()) }
+    catch { return false }
+  }
+  /** The existing Gateway ledger owns original-conversation delivery and durable semantic deduplication. */
+  reconcileDepartmentNotices(): void {
+    for (let offset = 0;; offset += 20) {
+      const works = this.ledger.works('', offset, 20)
+      for (const work of works) if (work.ticketId) for (const wait of this.departmentWaitsForTicket(work.ticketId)) {
+        const identity = `${work.workRef}:department:${wait.id}`
+        this.ledger.receiveEvent(`department:${wait.id}`, wait, { id: identity, semanticKey: identity, workRef: work.workRef,
+          conversationId: work.conversationId, kind: 'message', at: wait.at, actionable: true,
+          text: `缺少所需职责：${wait.responsibility}。请在“${wait.ownerOrganizationName}”（${wait.ownerInstanceId}）下创建直属部门，配置职责及必要工具权限（${wait.requiredTools.join('、')}）并启动。原工单保留，核对就绪和授权后将自动继续，无需再发消息。` })
+      }
+      if (works.length < 20) break
+    }
+  }
+  departmentWaitsForTicket(ticketId: string) {
+    const snapshot = this.delegated.result(ticketId)
+    return [...this.departments.forTicket(ticketId), ...(snapshot ? verifiedDepartmentWaits(snapshot) : [])]
+  }
+  private departmentTargets(ticket: Ticket): Capability[] {
+    const tools = this.workerCapabilities(ticket).tools
+    return (this.config.delegationTargets ?? []).filter(target => this.readyTargets.has(target.instanceId))
+      .map(target => ({ ...target, tools: target.tools.filter(tool => tools.includes(tool)) }))
+  }
+  /** Called by the existing process reconciliation owner; there is no additional background task or service. */
+  async reconcileDepartments(): Promise<void> {
+    if (!this.departments.active().length || !this.delegationReady()) return
+    await this.refreshDelegationCatalog()
+    this.departments.reconcile(ticket => this.departmentTargets(ticket))
   }
   close(): Promise<void> { return this.closing ??= this.shutdown() }
   /** Fence original admission and drain the original pass/source owners without closing their Store. */

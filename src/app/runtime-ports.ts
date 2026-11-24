@@ -90,7 +90,7 @@ export interface ExecutorNativePort {
   removePending(sessionId: string, messageIds: string[]): Promise<void>;
   events(sessionId: string): Promise<readonly SessionEvent[]>;
   runPrepare(command: string, cwd: string, environment: Record<string, string | undefined>, signal: AbortSignal): Promise<void>;
-  verifyDirectory(directory: string, signal: AbortSignal): Promise<void>;
+  verifyDirectory(directory: string, signal: AbortSignal, environment?: Record<string, string | undefined>): Promise<void>;
   stopBackground(sessionId: string, reason: string, keepInbox: boolean): Promise<void>;
   stopSubagents(sessionId: string, keepInbox: boolean): Promise<void>;
   runningJobs(sessionId: string, except?: ReadonlySet<string>): Promise<{ id: string; name: string }[]>;

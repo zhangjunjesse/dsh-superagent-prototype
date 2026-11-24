@@ -192,16 +192,18 @@ describe('original Runtime capability admission and drain', () => {
   it('observes original background settling and stops the actual Worker background path', async () => {
     const settling = Promise.withResolvers<void>(), background = Promise.withResolvers<boolean>()
     const stops: string[] = []
+    let stopped = false, verifiedStopped = false
     const native = controlledNative(async turn => {
       if (!turn.text.startsWith('{')) return
       if (turn.policy.role === 'orchestrator') { await routeOriginal(turn); return }
       await turn.tool('orchestrator_report', { state: 'progress', summary: 'Original job still running after this turn' })
     })
     native.native.executor.untilQuiet = async (_id, signal) => {
+      if (stopped) { verifiedStopped = true; return true }
       settling.resolve(); signal.addEventListener('abort', () => background.resolve(false), { once: true })
       return background.promise
     }
-    native.native.executor.stopBackground = async id => { stops.push(id); background.resolve(false) }
+    native.native.executor.stopBackground = async id => { stops.push(id); stopped = true; background.resolve(false) }
     const runtime = createProcessRuntime(config(), host, { native: native.native }); runtimes.push(runtime)
     try {
       await submit(runtime, 'background'); await settling.promise
@@ -211,6 +213,7 @@ describe('original Runtime capability admission and drain', () => {
       await runtime.capabilitiesStop({ operationId: 'background-change', fingerprint: activity.fingerprint })
       await wait(async () => expect((await runtime.capabilitiesActivity()).busy).toBe(false))
       expect(stops).toContain(`worker-${(await runtime.state()).tickets[0]!.id}`)
+      expect(verifiedStopped).toBe(true)
       expect((await runtime.state()).tickets[0]?.ended?.outcome).toBe('stopped')
       expect(native.errors).toEqual([])
     } finally { background.resolve(false); await native.idle() }

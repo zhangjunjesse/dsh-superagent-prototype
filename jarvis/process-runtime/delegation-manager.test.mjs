@@ -30,6 +30,8 @@ const peer = new ProcessPeer(process, {
   },
   async 'lifecycle.delegation'(envelope) { return peer.handlers.delegation(envelope); },
   'lifecycle.drain'() { return { stopped: true }; },
+  'artifact.authorize'(input) { return { authorized: input.ticketId === 'receive-ticket' }; },
+  'artifact.read'() { return { pid: process.pid }; },
   state() { return { config, received }; },
   close() { release?.(); return { stopped: true }; },
 });
@@ -44,6 +46,30 @@ function config() {
     ...(instanceId === 'alpha' ? { children: ['beta'] } : instanceId === 'beta' ? { parents: ['alpha'], organizationName: 'Beta org', description: 'Read beta workspace', workerTools: ['read', 'grep'] } : {}) })) };
 }
 const idleBridge = () => ({ run: async () => ({ text: 'OK', status: 'complete' }), cancel: async () => {}, close: async () => {} });
+test('an artifact read queued during producer startup uses the new live owner without stopping it', async t => {
+  const manager = new ProcessManager({}, config(), { bridgeFactory: idleBridge, nativeFactory: () => null, entry });
+  t.after(() => manager.close());
+  await manager.start('alpha');
+  const source = manager.instance('alpha'), producer = manager.instance('beta');
+  const starting = Promise.withResolvers(), release = Promise.withResolvers(), queued = Promise.withResolvers();
+  const start = manager.startInstance.bind(manager), exclusive = manager.exclusive.bind(manager);
+  manager.startInstance = async (...args) => { starting.resolve(); await release.promise; return start(...args); };
+  manager.exclusive = (item, work, options) => {
+    const operation = exclusive(item, work, options);
+    if (item === producer && options?.kind === 'management') queued.resolve();
+    return operation;
+  };
+  const ready = manager.start('beta');
+  await starting.promise;
+  const read = manager.readArtifact(source, source.generation, { ticketId: 'receive-ticket', assignmentId: 'receiver',
+    artifact: { instanceId: 'beta', ticketId: 'original-ticket', assignmentId: 'original',
+      version: { path: 'page.html', sha256: '2'.repeat(64), size: 1 } } });
+  try { await queued.promise; } finally { release.resolve(); }
+  const live = (await ready).instances.find(item => item.instanceId === 'beta');
+  assert.equal((await read).pid, live.pid);
+  assert.equal(producer.phase, 'running');
+  assert.equal(producer.child.pid, live.pid);
+});
 const request = (changes = {}) => ({ targetInstanceId: 'beta', delegationId: 'delegation-1', parentTicketId: 'ticket-1',
   parentAssignmentId: 'assignment-1', parentDecisionId: 'decision-1', operation: 'submit', commandId: 'command-1', text: 'Read the requested file', tools: ['read'], path: ['alpha'], ...changes });
 async function received(manager, id) {
@@ -87,7 +113,7 @@ test('unknown references, self references and cycles fail before an instance can
   return manager.close();
 });
 
-test('two actual child processes authenticate the source and enforce one hop, mutual relation and tools', async () => {
+test('two actual child processes authenticate the source and enforce immutable lineage, mutual relation and tools', async () => {
   const manager = new ProcessManager({}, config(), { bridgeFactory: idleBridge, nativeFactory: () => null, entry });
   try {
     await manager.start('alpha');
@@ -97,7 +123,7 @@ test('two actual child processes authenticate the source and enforce one hop, mu
     assert.notEqual(manager.status().instances[0].pid, manager.status().instances[1].pid);
     await assert.rejects(manager.chat('alpha', request({ sourceInstanceId: 'gamma' })), /Unrecognized key/);
     await assert.rejects(manager.chat('alpha', request({ path: ['gamma'] })), /authenticated source/);
-    await assert.rejects(manager.chat('alpha', request({ path: ['alpha', 'beta'] })), /Too big/);
+    await assert.rejects(manager.chat('alpha', request({ path: ['alpha', 'beta'] })), /immutable task lineage/);
     await assert.rejects(manager.chat('alpha', request({ targetInstanceId: 'gamma' })), /not mutually allowed/);
     await assert.rejects(manager.chat('gamma', request({ path: ['gamma'] })), /not mutually allowed/);
     await assert.rejects(manager.chat('alpha', request({ tools: ['glob'] })), /intersection/);

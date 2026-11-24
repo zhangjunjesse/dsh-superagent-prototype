@@ -2,6 +2,8 @@ const stableRefs=refs=>Object.fromEntries(Object.entries(refs).filter(([key])=>!
 const payloadOf=data=>{try{return JSON.parse((data.content??[]).filter(block=>block.type==='text').map(block=>block.text).join('\n'));}catch{return null;}};
 /** Correlation is based on persisted task identities; a Session is never one task trace. */
 export class Correlations {
+  incoming = new Map();
+  outgoing = new Map();
   constructor(store) { this.store=store; this.links=new Map(); this.turns=new Map(); this.requests=new Map();this.turnStarts=new Map();this.worksByMessage=new Map();this.routerTurns=new Map(); }
   key(org,kind,id) { return `${org}\0${kind}\0${id}`; }
   find(org,refs={}) {
@@ -11,7 +13,7 @@ export class Correlations {
     if(refs.workRef)return {traceId:`work:${org}:${refs.workRef}`,refs};
     return {traceId:refs.ticketId?`ticket:${org}:${refs.ticketId}`:null,refs};
   }
-  remember(org,refs,traceId) {
+  remember(org,refs,traceId,visited=new Set()) {
     if(!traceId)return;
     for(const kind of ['ticketId','commandId','triggerId','delegationId']) if(refs[kind]) {
       const key=this.key(org,kind,refs[kind]),old=this.links.get(key);
@@ -19,6 +21,38 @@ export class Correlations {
       this.store.relink(kind,refs[kind],traceId,org);
     }
     this.relateRouter(org);
+    if(!refs.ticketId || !traceId.startsWith('work:'))return;
+    const parentKey=this.key(org,'ticketId',refs.ticketId);
+    if(visited.has(parentKey))return;
+    visited.add(parentKey);
+    for(const edge of this.outgoing.get(parentKey)?.values()??[])this.linkDelegation(edge,traceId,visited);
+  }
+  linkDelegation(edge,traceId,visited) {
+    const {parent,request,snapshot}=edge;
+    const child=this.incoming.get(this.key(request.targetInstanceId,'delegationId',request.delegationId));
+    if(!child || child.id!==snapshot.ticketId || child.authority.parentInstanceId!==parent
+      || child.authority.parentTicketId!==request.parentTicketId || child.authority.parentAssignmentId!==request.parentAssignmentId
+      || child.authority.parentDecisionId!==request.parentDecisionId)return;
+    this.remember(request.targetInstanceId,{ticketId:child.id,delegationId:request.delegationId},traceId,visited);
+  }
+  delegationOut(parent,request,snapshot) {
+    if(!request?.targetInstanceId || !snapshot?.ticketId || snapshot.childInstanceId!==request.targetInstanceId
+      || snapshot.delegationId!==request.delegationId || snapshot.parentTicketId!==request.parentTicketId
+      || snapshot.parentAssignmentId!==request.parentAssignmentId)return;
+    const key=this.key(parent,'ticketId',request.parentTicketId);
+    if(!this.outgoing.has(key))this.outgoing.set(key,new Map());
+    this.outgoing.get(key).set(request.delegationId,{parent,request,snapshot});
+    const trace=this.find(parent,{ticketId:request.parentTicketId}).traceId;
+    if(trace?.startsWith('work:'))this.linkDelegation({parent,request,snapshot},trace,new Set([key]));
+  }
+  delegationIn(org,ticket) {
+    const authority=ticket.mandate?.basis?.via==='delegation' && ticket.mandate.basis.delegation;
+    if(!authority?.delegationId)return;
+    this.incoming.set(this.key(org,'delegationId',authority.delegationId),{id:ticket.id,authority});
+    const parent=authority.parentInstanceId, key=this.key(parent,'ticketId',authority.parentTicketId);
+    const edge=this.outgoing.get(key)?.get(authority.delegationId);
+    const trace=this.find(parent,{ticketId:authority.parentTicketId}).traceId;
+    if(edge && trace?.startsWith('work:'))this.linkDelegation(edge,trace,new Set([key]));
   }
   relateRouter(org) {
     for(const turn of this.routerTurns.values())if(turn.organizationId===org){

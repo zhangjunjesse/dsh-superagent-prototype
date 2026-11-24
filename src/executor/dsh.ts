@@ -82,6 +82,7 @@ export interface ExecutorHost {
   workspaceContext?(ticket: Ticket): { kind: 'local' | 'github'; directory: string; repository?: string }
   /** False for an assignment owned by a configured child Executor, including during recovery. */
   localTicket?(ticket: Ticket): boolean
+  prepareHandoff?(ticket: Ticket, assignment: Assignment): Promise<unknown[]>
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
@@ -271,7 +272,7 @@ export class DshExecutor implements Executor {
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
       })
     await mkdir(directory, { recursive: true })
-    await this.native.verifyDirectory(directory, this.host.lifetime)
+    await this.native.verifyDirectory(directory, this.host.lifetime, env)
   }
   /** Enqueues a `launch` effect for an accepted or resumed assignment; launches start in queue order as worker slots free up. */
   start(ticket: Ticket, assignment: Assignment): void {
@@ -367,8 +368,9 @@ export class DshExecutor implements Executor {
    * After the ending transaction commits (so a rollback leaves the worker working, and a launch the same transaction queued
    * starts after it): ends the look at its background work, cancels its turn unless its last word was a `ready` or `dropped`
    * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
+   * A trusted owner that already verified scoped cleanup can retire bookkeeping without issuing a second stop to the reused Session.
    */
-  stop(ticket: Ticket, assignment: Assignment, reason: string): void {
+  stop(ticket: Ticket, assignment: Assignment, reason: string, executionStopped = false): void {
     this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
@@ -376,9 +378,9 @@ export class DshExecutor implements Executor {
     const sessionId = workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
       this.settling.get(ticket.id)?.abort()
-      if (!ownTurn) void this.background(this.native.cancel(sessionId, false))
+      if (!executionStopped && !ownTurn) void this.background(this.native.cancel(sessionId, false))
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
-      this.stopWork(ticket.id, reason)
+      if (!executionStopped) this.stopWork(ticket.id, reason)
       this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
     })
   }
@@ -473,6 +475,8 @@ export class DshExecutor implements Executor {
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
     await this.stopped(ticket.id)
     if (!current()) return
+    const handoff = await this.host.prepareHandoff?.(ticket, assignment)
+    if (!current()) return
     // A message put back for this Assignment may still wait in the Session, kept by a restart's cancel or persisted across a
     // crash, where this launch's message would take it into a step beside the copy delivered next: that copy is the only one.
     await this.native.removePending(agent.id, (this.host.store.tickets.get(ticket.id)?.undelivered ?? []).map(id => this.host.sessions.promptedId(id)))
@@ -490,11 +494,14 @@ export class DshExecutor implements Executor {
     if (!current()) return
     const batch = told ? [] : batchOf(this.host, ticket).map(batchLine)
     const execution = this.host.workspaceContext?.(ticket)
-    const context = execution ? { execution } : {}
-    const text = told ? JSON.stringify({ ticket_id: ticket.id, assignment: ticket.assignments.length, ...context, ...retried })
+    const context = execution ? { execution: { ...execution, ...(handoff?.length ? { handoff } : {}) } } : {}
+    const continuation = assignment.continuation ? { remaining_work: capped(assignment.continuation.instructions, ASSIGNMENT_CHARS,
+      `ticket/${ticket.id}/continuation/${assignment.id}`), review_id: assignment.continuation.reviewId,
+      evidence: `ticket/${ticket.id}/assignments` } : {}
+    const text = told ? JSON.stringify({ ticket_id: ticket.id, assignment: ticket.assignments.length, ...context, ...retried, ...continuation })
       : JSON.stringify({ ticket_id: ticket.id, title: ticket.title, ...(brief ? { assignment: brief } : {}),
         ...(read ? { assignment_chars: chars, assignment_read: read } : {}), ...(card ? { trigger: card } : {}),
-        ...(batch.length ? { batch } : {}), ...context, ...retried })
+        ...(batch.length ? { batch } : {}), ...context, ...retried, ...continuation })
     const requestId = later ? `assignment:${ticket.id}:${assignment.id}` : first
     await this.host.sessions.prompt(sessionId, requestId, text, 'queue',
       () => { if (!current()) throw new Error('Launch authorization changed before worker delivery') },

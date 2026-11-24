@@ -191,7 +191,12 @@ describe('complete original application in an organization process', () => {
       if (turn.policy.role === 'orchestrator') { if (input.kind === 'candidate') await originalRoute(turn, input); return }
       if (!input.ticket_id) return
       directoriesUsed.push(turn.policy.cwd)
-      if (directoriesUsed.length > 1) expect(readFileSync(join(turn.policy.cwd, 'index.html'), 'utf8')).toBe('version 1')
+      if (directoriesUsed.length > 1) {
+        expect(readFileSync(join(turn.policy.cwd, 'index.html'), 'utf8')).toBe('version 1')
+        const [file] = input.execution.handoff
+        expect(file).toMatchObject({ instanceId: config.instanceId, ticketId: input.ticket_id, version: { path: 'index.html' } })
+        expect(readFileSync(join(turn.policy.cwd, file.path), 'utf8')).toBe('version 1')
+      }
       writeFileSync(join(turn.policy.cwd, 'index.html'), `version ${directoriesUsed.length}`)
       await turn.tool('orchestrator_report', { state: 'ready', summary: 'Original task updated', artifacts: [{ path: 'index.html' }] })
     })

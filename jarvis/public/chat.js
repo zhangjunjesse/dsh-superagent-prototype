@@ -288,6 +288,23 @@
     }
     return taskPart('execution', '执行记录', fields);
   }
+  function taskDelegations(hops) {
+    const list = taskNode('ol', 'chat-task-route');
+    for (const hop of hops) {
+      const step = taskNode('li', '');
+      step.append(taskNode('strong', '', `${hop.from.name} → ${hop.to.name}`));
+      const fields = taskNode('dl', 'chat-task-detail-meta');
+      fields.append(...taskFields([['发起工单', hop.ticketId], ['派工编号', hop.assignmentId], ['委派编号', hop.delegationId],
+        ['接收工单', hop.childTicketId], ['接收方派工', hop.childAssignmentId], ['状态', hop.statusLabel]].filter(([, value]) => value)));
+      step.append(fields);
+      if (hop.report?.summary) step.append(taskNode('p', '', hop.report.summary));
+      const context = { instanceId: hop.to.instanceId, ticketId: hop.childTicketId };
+      const files = (hop.artifacts ?? []).map(file => registeredTaskFile(file, context)).filter(Boolean);
+      if (files.length) step.append(taskReportFiles(files));
+      list.append(step);
+    }
+    return taskPart('delegations', '部门派工记录', list);
+  }
   function taskDetailContent(item, ref, record) {
     const content = document.createDocumentFragment();
     const archived = !!record?.summary;
@@ -300,10 +317,15 @@
     heading.append(icon, taskNode('h4', '', label));
     if (report) {
       const via = taskProgressSource(report.source);
-      const state = report.state ? ' · ' + reportStateText(report.state) : '';
+      const completed = !archived && item?.status === 'completed' && report.state === 'ready';
+      const state = completed ? ' · ' + (item.acceptance ? '结果已验收' : '执行已完成')
+        : report.state ? ' · ' + reportStateText(report.state) : '';
       heading.append(taskNode('span', 'chat-task-result-source', via + state));
     }
     result.append(heading);
+    if (!archived && item?.acceptance?.summary) {
+      result.append(taskNode('p', 'chat-task-progress', '交办方验收意见：' + item.acceptance.summary));
+    }
     content.append(result);
     if (report?.summary) {
       const context = archived ? { instanceId: record.organizationId, workerId: record.workerId, ticketId: record.ticketId }
@@ -327,6 +349,7 @@
       result.append(taskNode('p', 'chat-task-progress', item ? '暂无可读取的进展记录。' : '提交回执仅确认入队，尚未确认接单或分派。'));
     }
     content.append(taskRequirements(item, record), taskExecutionRecord(item, ref, record));
+    if (item?.delegations?.length) content.append(taskDelegations(item.delegations));
     return content;
   }
   function taskControlKey(control) {
@@ -432,9 +455,12 @@
   function saveTaskItems(items, observedAt) {
     for (const item of items) {
       const old = taskItems.get(item.workRef);
-      if (!old || !old.observedAt || !observedAt || new Date(observedAt).getTime() >= new Date(old.observedAt).getTime()) taskItems.set(item.workRef, {
-        item: item.originalRequest == null && old?.item.originalRequest ? { ...item, originalRequest: old.item.originalRequest } : item, observedAt,
-      });
+      if (!old || !old.observedAt || !observedAt || new Date(observedAt).getTime() >= new Date(old.observedAt).getTime()) {
+        const saved = { ...item, originalRequest: item.originalRequest ?? old?.item.originalRequest ?? null };
+        if (!item.delegations && old?.item.delegations && old.item.updatedAt === item.updatedAt) saved.delegations = old.item.delegations;
+        taskItems.set(item.workRef, { item: saved, observedAt });
+        if (!saved.delegations && old?.item.delegations && [...taskCards.get(item.workRef) ?? []].some(card => card.element.querySelector('details')?.open)) refreshTask(item.workRef);
+      }
       taskErrors.delete(item.workRef);
     }
   }

@@ -245,7 +245,8 @@ export class Store implements Repositories {
     /** Newest first. */
     list: (): Ticket[] => this.values('SELECT value FROM ticket ORDER BY rowid DESC'),
     /** Newest first. */
-    open: (): Ticket[] => this.values('SELECT value FROM ticket WHERE open = 1 ORDER BY rowid DESC'),
+    open: (): Ticket[] => this.values("SELECT value FROM ticket WHERE open = 1 AND json_extract(value,'$.cancellation') IS NULL ORDER BY rowid DESC"),
+    cancelling: (): Ticket[] => this.values("SELECT value FROM ticket WHERE open = 1 AND json_extract(value,'$.cancellation') IS NOT NULL ORDER BY rowid"),
     /** Newest first. */
     active: (): Ticket[] => this.values('SELECT value FROM ticket WHERE active = 1 ORDER BY rowid DESC'),
   }

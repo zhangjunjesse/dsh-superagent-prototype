@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { GatewayLedger, commandId } from '../../lib/jarvis-gateway.js';
 import { ProcessManager } from '../process-runtime/manager.mjs';
 import { OrganizationGateway } from './organization-gateway.mjs';
-import { controlledNativeFactory } from '../process-runtime/controlled-native-fixture.mjs';
+import { controlledNativeFactory, reviewDelegatedResult } from '../process-runtime/controlled-native-fixture.mjs';
 
 const origin = (id = 'daily-user-1', text = 'Read marker.txt only.', selection = {}) => ({ conversationId: 'daily-conversation',
   userMessageId: id, text, at: '2026-11-16T10:00:00.000Z', source: 'user', ...selection });
@@ -327,6 +327,17 @@ test('real parent and child processes return verified child deliverables without
     if (!text.startsWith('{')) return;
     const input = JSON.parse(text);
     if (policy.role === 'orchestrator') {
+      if (input.kind === 'result_review') {
+        assert.equal(config.instanceId, 'root');
+        await reviewDelegatedResult(tool, input, ({ original, summary, producer, artifacts }) => {
+          assert.equal(original, 'Create the requested HTML page in the configured child organization.');
+          assert.equal(summary, 'Child generated a page.');
+          assert.equal(producer.instanceId, 'studio');
+          assert.equal(artifacts[0].ticketId, producer.ticketId);
+          assert.equal(readFileSync(join(paths.get('studio'), 'child.html'), 'utf8'), '<h1>Actual child output</h1>');
+        });
+        return;
+      }
       if (input.kind !== 'candidate') return;
       executions.push({ instanceId: config.instanceId, role: 'router', text });
       const result = await tool('orchestrator_route', { decisions: [{ kind: 'accept', trigger_id: input.trigger_id, title: 'Delegated page',

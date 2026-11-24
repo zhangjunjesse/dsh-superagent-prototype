@@ -108,6 +108,9 @@ test('retry after partially releasing applied organizations preserves new work w
 
 test('an unrelated organization save preserves pending intent and advances the same global CAS before cancellation', async t => {
   const control = await runtimeFixture(t); await control.action('root', 'start', control.revision);
+  // Preserve this test's pending-change scenario for a previously used target;
+  // never-started, unbound children now initialize without holding old parent work.
+  await control.action('research', 'start', control.revision); await control.action('research', 'stop', control.revision);
   await peer(control).call('test.add', task('active'));
   const waiting = (await control.management('research', { method: 'PUT', path: 'worker-capabilities',
     body: { revision: control.revision, tools: ['read', 'glob'], skills: [] } })).body;
@@ -127,6 +130,7 @@ test('an unrelated organization save preserves pending intent and advances the s
 
 test('scoped metadata preserves pending Worker intent, fences affected descriptors and shares the global CAS', async t => {
   const control = await runtimeFixture(t); await control.action('root', 'start', control.revision);
+  await control.action('research', 'start', control.revision); await control.action('research', 'stop', control.revision);
   await peer(control).call('test.add', task('active'));
   const waiting = (await control.management('research', { method: 'PUT', path: 'worker-capabilities',
     body: { revision: control.revision, tools: ['read', 'glob'], skills: [] } })).body;

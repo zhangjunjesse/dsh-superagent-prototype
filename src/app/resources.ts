@@ -20,7 +20,7 @@ import { KV } from '../kv.ts'
 import type { Store } from './store.ts'
 import type { SessionNativePort } from './runtime-ports.ts'
 import type { TextCache } from './cache.ts'
-import { delegationTaskContext } from '../sources/delegation-context.ts'
+import { delegationTaskConstraints, delegationTaskContext } from '../sources/delegation-context.ts'
 
 /** Resource descriptors exposed via orchestrator_read, marking which resources worker sessions may also read for their own ticket. */
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
@@ -37,6 +37,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
   { name: 'ticket/<id>/result', holds: 'its latest report', executor: true },
   { name: 'ticket/<id>/report/<id>', holds: 'the report of one of its assignments', executor: true },
+  { name: 'ticket/<id>/review/<id>', holds: 'the complete saved result evidence and its owning main-Session judgement', executor: true },
+  { name: 'ticket/<id>/continuation/<id>', holds: 'the remaining work assigned after a result review, under the original mandate', executor: true },
   { name: 'ticket/<id>/transcript', holds: 'its Executor Session\'s messages, newest first', executor: true },
   { name: 'ticket/<id>/message/<n>', holds: 'one message of that transcript', executor: true },
   { name: 'ticket/<id>/input/<id>', holds: 'one input it was delivered', executor: true },
@@ -56,6 +58,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
   { name: 'delegation/<trigger-id>/source', holds: 'the fixed parent task\'s complete original source text; material does not expand the parent accepted scope', executor: true },
   { name: 'delegation/<trigger-id>/assignment', holds: 'the fixed parent task\'s original execution assignment and its authorization constraints', executor: true },
+  { name: 'delegation/<trigger-id>/ancestor/<index>', holds: 'one verified ancestor assignment; its accepted scope continues to constrain every later delegation', executor: true },
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
@@ -215,10 +218,16 @@ const ROUTES: readonly Route[] = [
   }],
   ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['delegation/', read => {
-    const [id, section, ...more] = read.rest.split('/')
-    if (!id || more.length || !['source', 'assignment'].includes(section ?? '')) throw new Error('Unknown delegation context resource')
-    const context = delegationTaskContext(trigger(read.host, id, read.ticketId))
+    const [id, section, index, ...more] = read.rest.split('/')
+    if (!id || more.length || !['source', 'assignment', 'ancestor'].includes(section ?? '')
+      || (section === 'ancestor' ? !/^(0|[1-9]\d*)$/.test(index ?? '') : index !== undefined)) throw new Error('Unknown delegation context resource')
+    const source = trigger(read.host, id, read.ticketId), context = delegationTaskContext(source)
     if (!context) throw new Error('This trigger has no verified delegated parent context')
+    if (section === 'ancestor') {
+      const constraint = delegationTaskConstraints(source)[Number(index)]
+      if (!constraint) throw new Error('Unknown delegation ancestor constraint')
+      return { parent_scope: constraint.scope, parent_strength: constraint.strength, ...text(read, constraint.assignment) }
+    }
     return { parent_scope: context.scope, parent_strength: context.strength, ...text(read, section === 'source' ? context.source.text : context.assignment) }
   }],
   ['trigger/', async read => {
@@ -287,6 +296,15 @@ const ROUTES: readonly Route[] = [
       const entry = event && transcriptEntry(event)
       if (!entry) throw new Error('Unknown transcript entry')
       body = JSON.stringify(entry)
+    } else if (section === 'review' && part) {
+      const assignment = ticket.assignments.find(item => item.resultReviews?.some(review => review.id === part))
+      const review = assignment?.resultReviews?.find(item => item.id === part)
+      if (!review) throw new Error('Unknown result review')
+      body = JSON.stringify({ ticket_id: ticket.id, assignment_id: assignment!.id, ...review })
+    } else if (section === 'continuation' && part) {
+      const continuation = ticket.assignments.find(item => item.id === part)?.continuation
+      if (!continuation) throw new Error('Unknown remaining work')
+      body = continuation.instructions
     } else if (section === 'report' && part) {
       const report = ticket.assignments.find(item => item.id === part)?.report
       if (!report) throw new Error('Unknown assignment report')

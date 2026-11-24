@@ -9,6 +9,8 @@ import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { Store } from './store.ts'
 
 export interface EffectPayloads {
+  /** Confirm an explicitly retried task's original execution stopped before the Core replaces its assignment. */
+  retry: { operationId: string }
   /** Build an Eval's candidate card and relay it to the main Session; the key is the Eval ID. */
   assessment: { triggerId: string }
   /** Launch a pending Assignment; the key is the Assignment ID. */

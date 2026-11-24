@@ -1,6 +1,6 @@
 /** Formats background notices and steering relays delivered to the main Session via the effect queue. */
 import { randomUUID } from 'node:crypto'
-import { followupOwners, key, liveTicket, type DomainEvent, type Ticket, type WorkerReport } from '../core/index.ts'
+import { followupOwners, key, latestAssignment, liveTicket, type DomainEvent, type Ticket, type WorkerReport } from '../core/index.ts'
 import { triggerMessage } from '../executor/dsh.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { repliedTo } from './links.ts'
@@ -119,6 +119,9 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
  * @returns The steering `Relay`, or `undefined` when the report is not relayed to the main Session.
  */
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
+  // The result-review relay carries the original goal and evidence. A ready-looking duplicate must not suggest delivery.
+  const review = latestAssignment(ticket)?.resultReviews?.at(-1)
+  if (['ready', 'dropped', 'blocked', 'failed'].includes(report.state) && review && !review.decision && review.summary === report.summary) return undefined
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     return { id: `attention:${ticket.id}:${asked.id}`,

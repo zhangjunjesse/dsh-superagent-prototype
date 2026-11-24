@@ -2,7 +2,7 @@
 import { UserError } from './errors.ts'
 import { Dispatches } from './dispatch.ts'
 import { followupOwners, reached, threadKey } from './model.ts'
-import type { Thread, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Assignment, ResultReview, ResultReviewDecision, Thread, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Assessor, AssessmentOutcome, DelegationAdmission, DomainEvent, DomainEvents, Executor, Outbox, Policy, Repositories, SourceScope } from './ports.ts'
 
 export interface EngineOptions {
@@ -20,6 +20,14 @@ export interface EngineOptions {
   /** Maintenance admission keeps queued source inputs durable while already admitted work drains. */
   admission?: { evaluate(trigger: Trigger): boolean; resume(ticket: Ticket): boolean; frozen?(): boolean }
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /** An executor owner may durably defer explicit replacement until scoped cleanup has been verified. */
+  retry?: { request(ticket: Ticket, assignment: Assignment, eligible: boolean): 'pending' | 'ready' }
+  /** The original main Session judges evidence; the runtime supplies only authenticated bindings and authority. */
+  resultReview?: {
+    request(ticket: Ticket, assignment: Assignment, review: ResultReview): void
+    context?(ticket: Ticket, assignment: Assignment): unknown
+    authorize?(ticket: Ticket, assignment: Assignment, decision: ResultReviewDecision): void
+  }
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

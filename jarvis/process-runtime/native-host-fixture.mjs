@@ -12,7 +12,7 @@ const installedRequire = createRequire(join(installed, 'package.json'));
 const load = name => import(pathToFileURL(installedRequire.resolve(name)));
 export const available = existsSync(join(installed, 'package.json'));
 
-export async function nativeFixture(t, { managementOnly = false, role = 'worker', allowedTools = ['read', 'todo_write', 'subagent', 'send_message', 'list_agents', 'interrupt_agent'], local = ['subagent'], inherited = ['read', 'write', 'todo_write', 'send_message', 'list_agents', 'interrupt_agent'], nativeTools, realCapabilities = false } = {}) {
+export async function nativeFixture(t, { managementOnly = false, role = 'worker', allowedTools = ['read', 'todo_write', 'subagent', 'send_message', 'list_agents', 'interrupt_agent'], local = ['subagent'], inherited = ['read', 'write', 'todo_write', 'send_message', 'list_agents', 'interrupt_agent'], nativeTools, realCapabilities = false, searchCapabilities = false, pwshTimeoutMs = 5000 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'original-native-host-'));
   let rootContext, cleanup;
   t.after(async () => {
@@ -31,7 +31,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
   symlinkSync(fileURLToPath(new URL('../../skills/', import.meta.url)), join(modules, 'skills'), 'junction');
   mkdirSync(join(modules, 'jarvis/process-runtime'), { recursive: true });
   for (const name of ['native-host.mjs', 'native-wire.mjs', 'native-transport.mjs', 'native-journal.mjs', 'native-environment.mjs', 'worker-execution.mjs', 'ipc.mjs',
-    'manager.mjs', 'control.mjs', 'capability-applications.mjs', 'child.mjs', 'dsh-bridge.mjs', 'reply-progress.mjs', 'original-adoption.mjs']) copyFileSync(new URL(name, import.meta.url), join(modules, 'jarvis/process-runtime', name));
+    'manager.mjs', 'control.mjs', 'capability-applications.mjs', 'child.mjs', 'dsh-bridge.mjs', 'reply-progress.mjs', 'original-adoption.mjs', 'startup-progress.mjs']) copyFileSync(new URL(name, import.meta.url), join(modules, 'jarvis/process-runtime', name));
   const [cordis, scopeModule, promptModule, toolsModule, agentsModule, sessionModule, projectionModule, loopModule, llmModule, persistence, skillsModule, transportModule, hostModule, coreModule] = await Promise.all([
     load('@deepseek-ai/cordis'), load('@deepseek-ai/dsh-scope'), load('@deepseek-ai/dsh-system-prompt'), load('@deepseek-ai/dsh-tools'),
     load('@deepseek-ai/dsh-agent'), load('@deepseek-ai/dsh-session'), load('@deepseek-ai/dsh-session-projection'), load('@deepseek-ai/dsh-agent-loop'),
@@ -92,13 +92,27 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
     }
     async create(request) {
       controllerCalls.push({ type: 'create', ...request });
-      assert.equal(request.cwd, undefined);
-      const workspace = [...workspaceAccounts.values()].find(value => value.id === request.workspaceId);
+      assert.ok(!request.cwd || !request.workspaceId, 'A controller request addresses one workspace source');
+      const workspace = request.cwd ? await ctx.workspaceRegistry.create(request.cwd)
+        : [...workspaceAccounts.values()].find(value => value.id === request.workspaceId);
       assert.ok(workspace);
       const handle = await ctx.agents.create({ sessionId: request.sessionId, meta: { cwd: workspace.path, agentPreset: request.agentPreset },
         agentOptions: { provider: 'fixture', model: 'fixture' }, setup: scope => ctx.agentPresets.mount(scope, request.agentPreset) });
       controllerHandles.push(handle); await workspace.attachSession(handle.agent.id);
       return { sessionId: handle.agent.id, agentPreset: request.agentPreset };
+    }
+    async prompt(request, signal) {
+      signal.throwIfAborted();
+      const resolved = await this.resolveAgent(request.sessionId);
+      assert.ok(resolved.agent, 'A daily prompt needs its actual registered Agent');
+      const agent = resolved.agent;
+      if (agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.source?.rpcId === request.requestId)) return { accepted: true };
+      // Match installed SessionController's text-only admission boundary. The
+      // actual registry, AgentLoop, tools and JSONL persistence own execution.
+      const message = llmModule.createUserMessage({ content: request.content,
+        source: { kind: 'user', rpcId: request.requestId, ...(request.clientTimeZone ? { clientTimeZone: request.clientTimeZone } : {}) } });
+      request.mode === 'steer' ? agent.steer(message) : agent.followup(message);
+      return { accepted: true };
     }
     async rename(request) { controllerCalls.push({ type: 'rename', ...request }); }
     async modelCatalog() { return { groups: [], default: { provider: 'fixture', model: 'fixture' } }; }
@@ -113,7 +127,8 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
   if (realCapabilities) {
     const names = ['dsh-subprocess-local', 'dsh-working-directory', 'dsh-session-query-sqlite', 'dsh-subagent', 'dsh-subagent-spawn-in-process',
       'dsh-tool-subagent', 'dsh-tool-subagent-control', 'dsh-tool-todo', 'dsh-jobs-local', 'dsh-tool-jobs', 'dsh-pwsh-sandbox', 'dsh-tool-pwsh',
-      'dsh-sandbox-local', 'dsh-sandbox-policy', 'dsh-user-approval', 'dsh-permission-presets', 'dsh-fs-local', 'dsh-tool-fs', 'dsh-shell-env'];
+      'dsh-sandbox-local', 'dsh-sandbox-policy', 'dsh-user-approval', 'dsh-permission-presets', 'dsh-fs-local', 'dsh-tool-fs', 'dsh-shell-env',
+      ...(searchCapabilities ? ['dsh-tool-fs-search'] : [])];
     nativePlugins = Object.fromEntries(await Promise.all(names.map(async name => [name, await load('@deepseek-ai/' + name)])));
     // Installed DSH publishes services from sibling plugin fibers. Constructing
     // them on the root Context would accidentally permit undeclared reads in a
@@ -128,7 +143,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
     const live = value => ({ get: () => value });
     const { SandboxPwshExecutor } = nativePlugins['dsh-pwsh-sandbox'];
     await ctx.plugin({ name: 'fixture-pwsh-provider', inject: SandboxPwshExecutor.inject, apply(scope) {
-      new SandboxPwshExecutor(scope, { cwd: live(undefined), timeoutMs: live(5000), maxTimeoutMs: live(5000),
+      new SandboxPwshExecutor(scope, { cwd: live(undefined), timeoutMs: live(pwshTimeoutMs), maxTimeoutMs: live(pwshTimeoutMs),
         maxOutputBytes: live(200000), maxSpillBytes: live(1000000), graceMs: live(1000), pwshPath: live(undefined) });
     } });
     new nativePlugins['dsh-user-approval'].ApprovalService(ctx, { policy: 'never' });
@@ -161,6 +176,7 @@ export async function nativeFixture(t, { managementOnly = false, role = 'worker'
         const install = (name, config) => preset.ctx.plugin({ name: `fixture-${name}`, inject: nativePlugins[name].inject,
           apply: child => nativePlugins[name].apply(child, config) });
         await install('dsh-tool-fs', cordis.resolveConfig(nativePlugins['dsh-tool-fs'], { readImage: false }));
+        if (searchCapabilities) await install('dsh-tool-fs-search', cordis.resolveConfig(nativePlugins['dsh-tool-fs-search'], { sampleOverCapGlobResults: false }));
         await install('dsh-tool-pwsh', {});
         await install('dsh-tool-jobs', { waitTimeoutMs: 1000, maxWaitTimeoutMs: 5000 });
         await install('dsh-tool-subagent-control');
