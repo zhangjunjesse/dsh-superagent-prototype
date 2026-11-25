@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
@@ -20,7 +20,7 @@ async function claimStartup() {
     const shell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     helper = spawn(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(new URL('./start.ps1', import.meta.url)),
       '-HomePath', home, '-NodePath', process.execPath, '-Desktop', '-BootProcessId', String(process.pid), '-BootNonce', nonce],
-    { windowsHide: true, stdio: 'ignore' });
+    { windowsHide: true, cwd: dirname(shell), stdio: 'ignore' });
     helper.once('exit', code => { result = code ?? 1; });
     helper.once('error', error => { helperError = error; });
     helper.unref();
@@ -60,7 +60,9 @@ async function ownsListener() {
   const shell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const { stdout } = await runFile(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
     fileURLToPath(new URL('./listener-identity.ps1', import.meta.url)), '-QueryPort', String(config.port)],
-  { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 });
+  // PowerShell's compiler inspects its working directory. A selected package
+  // can live in a directory that the helper may read but cannot enumerate.
+  { windowsHide: true, cwd: dirname(shell), timeout: 5000, maxBuffer: 1024 * 1024 });
   const owners = JSON.parse(stdout.replace(/^\uFEFF/, ''));
   return Array.isArray(owners) && owners.length > 0 && owners.every(pid => pid === process.pid);
 }
