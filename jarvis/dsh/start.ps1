@@ -181,45 +181,7 @@ try {
   $origin = "http://127.0.0.1:$($launchConfig.port)/"
   $runtimeFile = Join-Path $jarvisHome 'runtime.json'
   $pendingFile = Join-Path $jarvisHome 'launcher-state.json'
-  if (!('JarvisLauncherTcp' -as [type])) {
-    # GetExtendedTcpTable is read-only and does not require privileged WMI/CIM access.
-    Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public static class JarvisLauncherTcp {
-  [DllImport("iphlpapi.dll", SetLastError = true)]
-  private static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool sorted, int family, int tableClass, int reserved);
-  public static int[] ListenerPids(int port) {
-    var result = new List<int>();
-    foreach (int family in new int[] { 2, 23 }) {
-      int size = 0;
-      uint status = GetExtendedTcpTable(IntPtr.Zero, ref size, false, family, 3, 0);
-      if (status != 0 && status != 122) throw new InvalidOperationException("Cannot inspect local TCP listeners.");
-      while (size > 0) {
-        IntPtr table = Marshal.AllocHGlobal(size);
-        try {
-          status = GetExtendedTcpTable(table, ref size, false, family, 3, 0);
-          if (status == 122) continue;
-          if (status != 0) throw new InvalidOperationException("Cannot inspect local TCP listeners.");
-          int rows = Marshal.ReadInt32(table), stride = family == 2 ? 24 : 56;
-          int portOffset = family == 2 ? 8 : 20, pidOffset = family == 2 ? 20 : 52;
-          for (int row = 0; row < rows; row++) {
-            int offset = 4 + row * stride;
-            int localPort = (Marshal.ReadByte(table, offset + portOffset) << 8) | Marshal.ReadByte(table, offset + portOffset + 1);
-            if (localPort != port) continue;
-            int pid = Marshal.ReadInt32(table, offset + pidOffset);
-            if (!result.Contains(pid)) result.Add(pid);
-          }
-          break;
-        } finally { Marshal.FreeHGlobal(table); }
-      }
-    }
-    return result.ToArray();
-  }
-}
-'@
-  }
+  . (Join-Path $PSScriptRoot 'listener-identity.ps1')
   $result = Invoke-JarvisLaunch
 } catch {
   if ($jarvisHome) {

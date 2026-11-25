@@ -57,11 +57,12 @@ const registration = {
 const runFile = promisify(execFile);
 async function ownsListener() {
   if (process.platform !== 'win32') return true;
-  const { stdout } = await runFile('netstat.exe', ['-ano', '-p', 'tcp'], { windowsHide: true, timeout: 2000, maxBuffer: 8 * 1024 * 1024 });
-  const owners = stdout.split(/\r?\n/).map(line => line.trim().split(/\s+/))
-    .filter(row => row[0] === 'TCP' && row[3] === 'LISTENING' && row[1].endsWith(':' + config.port))
-    .map(row => Number(row[4]));
-  return owners.length > 0 && owners.every(pid => pid === process.pid);
+  const shell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const { stdout } = await runFile(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+    fileURLToPath(new URL('./listener-identity.ps1', import.meta.url)), '-QueryPort', String(config.port)],
+  { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 });
+  const owners = JSON.parse(stdout.replace(/^\uFEFF/, ''));
+  return Array.isArray(owners) && owners.length > 0 && owners.every(pid => pid === process.pid);
 }
 
 async function publishRuntime() {

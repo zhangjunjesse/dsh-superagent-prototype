@@ -14,7 +14,7 @@ const launcher = fileURLToPath(new URL('./start.ps1', import.meta.url));
 const shell = process.env.JARVIS_TEST_POWERSHELL ?? 'powershell.exe';
 const windows = { skip: process.platform !== 'win32' && 'Windows launcher', timeout: 20000 };
 const fixtureBin = [
-  "import { readFileSync, appendFileSync } from 'node:fs';",
+  "import { readFileSync, appendFileSync, existsSync } from 'node:fs';",
   "import { createServer } from 'node:http';",
   "import { join } from 'node:path';",
   'export async function runCli() {',
@@ -25,7 +25,15 @@ const fixtureBin = [
   '  await new Promise(resolve => setTimeout(resolve, config.delay ?? 0));',
   "  const server = createServer((req, res) => { res.setHeader('content-type', 'application/json');",
   "    res.end(JSON.stringify({ ready: true, app: config.app ?? 'jarvis', runtime: 'dsh', pid: process.pid })); });",
-  "  server.listen(port, '127.0.0.1', () => console.log('dsh web: http://127.0.0.1:' + port + '/?token=' + 'A'.repeat(43)));",
+  "  server.listen(port, config.listenHost ?? '127.0.0.1', () => {",
+  "    appendFileSync(join(home, 'listening.jsonl'), JSON.stringify({ pid: process.pid, port }) + '\\n');",
+  '    if (config.pauseOnListen) {',
+  '      const gate = new Int32Array(new SharedArrayBuffer(4)), deadline = Date.now() + 5000;',
+  "      while (!existsSync(join(home, 'continue-listening')) && Date.now() < deadline) Atomics.wait(gate, 0, 0, 10);",
+  "      if (!existsSync(join(home, 'continue-listening'))) throw new Error('Test listener barrier timed out');",
+  '    }',
+  "    console.log('dsh web: http://127.0.0.1:' + port + '/?token=' + 'A'.repeat(43));",
+  '  });',
   '}',
 ].join('\n');
 
@@ -36,6 +44,10 @@ async function fixture(t, config = {}) {
   await writeFile(join(dshPackage, 'package.json'), JSON.stringify({ type: 'module' }));
   await writeFile(join(dshPackage, 'lib/bin.js'), fixtureBin);
   await writeFile(join(home, 'fixture.json'), JSON.stringify(config));
+  const env = { ...process.env };
+  if (config.localizedNetstat) {
+    env.NODE_OPTIONS = (env.NODE_OPTIONS ?? '') + ' --import=' + new URL('./localized-netstat.fixture.mjs', import.meta.url).href;
+  }
   const pids = new Set(), homes = new Set([home]);
   t.after(async () => {
     for (const trackedHome of homes) {
@@ -46,10 +58,10 @@ async function fixture(t, config = {}) {
     assert.ok(resolve(home).startsWith(resolve(tmpdir()) + sep));
     await rm(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
-  return { home, dshPackage, pids, homes,
+  return { home, dshPackage, pids, homes, env,
     async port(port, profile = 'isolated') { await writeFile(join(home, 'launch.json'), JSON.stringify({ profile, port, dshPackage })); },
     async run(args = [], script = launcher, includeHome = true) {
-      const child = spawn(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...(includeHome ? ['-HomePath', home] : []), '-NodePath', process.execPath, ...args], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...(includeHome ? ['-HomePath', home] : []), '-NodePath', process.execPath, ...args], { windowsHide: true, env, stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '', stderr = '';
       child.stdout.on('data', data => { stdout += data; });
       child.stderr.on('data', data => { stderr += data; });
@@ -68,14 +80,115 @@ async function fixture(t, config = {}) {
   };
 }
 
-async function listener(t, handler) {
+async function listener(t, handler, host = '127.0.0.1', ipv6Only = false, bindPort = 0) {
   const server = createServer(handler);
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ port: bindPort, host, ipv6Only }, resolve); });
   const port = server.address().port;
   assert.notEqual(port, 4318);
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   return port;
 }
+
+test('Desktop starts and publishes beside an unrelated 127.0.0.2 listener on the same port', windows, async t => {
+  const port = await listener(t, (_req, res) => res.end('untouched alternate loopback'), '127.0.0.2');
+  const control = createServer();
+  await new Promise((resolve, reject) => { control.once('error', reject); control.listen(port, '127.0.0.1', resolve); });
+  await new Promise(resolve => control.close(resolve));
+  const f = await fixture(t); await f.port(port);
+  const result = await f.run(['-Desktop', '-WaitSeconds', '8']);
+  assert.equal(result.code, 0, JSON.stringify(result)); noToken(result);
+  assert.equal((await f.starts()).length, 1);
+  assert.equal(JSON.parse(await readFile(join(f.home, 'runtime.json'), 'utf8')).pid, (await f.starts())[0]);
+  assert.equal(await (await fetch('http://127.0.0.2:' + port)).text(), 'untouched alternate loopback');
+  const before = await readFile(join(f.home, 'runtime.json'), 'utf8');
+  const reused = await f.run(['-Desktop', '-WaitSeconds', '8']);
+  assert.equal(reused.code, 0, JSON.stringify(reused)); noToken(reused);
+  assert.equal(await readFile(join(f.home, 'runtime.json'), 'utf8'), before);
+  assert.equal((await f.starts()).length, 1);
+});
+
+test('Desktop publishes readiness when netstat uses a localized listener state', windows, async t => {
+  const f = await fixture(t, { localizedNetstat: true }); await f.port(await unusedPort());
+  const result = await f.run(['-Desktop', '-WaitSeconds', '6']);
+  assert.equal(result.code, 0, JSON.stringify(result)); noToken(result);
+  assert.equal((await f.starts()).length, 1);
+  assert.equal(JSON.parse(await readFile(join(f.home, 'runtime.json'), 'utf8')).pid, (await f.starts())[0]);
+});
+
+for (const [host, ipv6Only, conflict] of [
+  ['0.0.0.0', false, true], ['::', false, true], ['::', true, false],
+  ['::1', true, false], ['::ffff:127.0.0.1', false, true], ['::ffff:127.0.0.2', false, false],
+]) {
+  test(`Desktop scopes ${host} ipv6Only=${ipv6Only} to the actual IPv4 endpoint`, windows, async t => {
+    const port = await listener(t, (_req, res) => res.end('untouched address fixture'), host, ipv6Only);
+    const f = await fixture(t); await f.port(port);
+    const original = JSON.stringify({ pid: 2147483647, startedAt: '2001-01-01T00:00:00.000Z', marker: 'preserve-conflict' });
+    await writeFile(join(f.home, 'runtime.json'), original);
+    const result = await f.run(['-Desktop', '-WaitSeconds', '8']);
+    assert.equal(result.code, conflict ? 2 : 0, JSON.stringify(result)); noToken(result);
+    assert.equal((await f.starts()).length, conflict ? 0 : 1);
+    if (conflict) assert.equal(await readFile(join(f.home, 'runtime.json'), 'utf8'), original);
+    else assert.equal(JSON.parse(await readFile(join(f.home, 'runtime.json'), 'utf8')).pid, (await f.starts())[0]);
+    const address = host.includes(':') ? '[' + host + ']' : '127.0.0.1';
+    assert.equal(await (await fetch('http://' + address + ':' + port)).text(), 'untouched address fixture');
+  });
+}
+
+test('a direct boot publishes beside unrelated listeners with localized netstat output', windows, async t => {
+  const port = await listener(t, (_req, res) => res.end('unrelated direct-boot listener'), '127.0.0.2');
+  const f = await fixture(t, { localizedNetstat: true }); await f.port(port);
+  const boot = spawn(process.execPath, [fileURLToPath(new URL('./launch-local.mjs', import.meta.url)), f.home], { windowsHide: true, env: f.env, stdio: 'ignore' });
+  f.pids.add(boot.pid);
+  for (let i = 0; i < 200 && !existsSync(join(f.home, 'runtime.json')); i++) await delay(30);
+  assert.equal(existsSync(join(f.home, 'runtime.json')), true, 'the actual listening host publishes its own identity');
+  assert.equal(JSON.parse(await readFile(join(f.home, 'runtime.json'), 'utf8')).pid, boot.pid);
+  const result = await f.run(['-Desktop', '-WaitSeconds', '8']);
+  assert.equal(result.code, 0, JSON.stringify(result)); noToken(result);
+  assert.equal((await f.starts()).length, 1);
+  assert.equal(await (await fetch('http://127.0.0.2:' + port)).text(), 'unrelated direct-boot listener');
+});
+
+for (const host of ['0.0.0.0', '::']) {
+  test(`an exact host publishes and is reused beside a co-bound ${host} wildcard`, windows, async t => {
+    const f = await fixture(t, { pauseOnListen: true }), port = await unusedPort(); await f.port(port);
+    const running = f.run(['-Desktop', '-WaitSeconds', '10']);
+    for (let i = 0; i < 250 && !existsSync(join(f.home, 'listening.jsonl')); i++) await delay(20);
+    assert.equal(existsSync(join(f.home, 'listening.jsonl')), true, 'the exact endpoint must be bound before adding the wildcard');
+    await listener(t, (_req, res) => res.end('untouched co-bound wildcard'), host, false, port);
+    await writeFile(join(f.home, 'continue-listening'), 'continue');
+    const result = await running;
+    assert.equal(result.code, 0, JSON.stringify(result)); noToken(result);
+    const before = await readFile(join(f.home, 'runtime.json'), 'utf8');
+    assert.equal(JSON.parse(before).pid, (await f.starts())[0]);
+    assert.equal((await (await fetch('http://127.0.0.1:' + port + '/jarvis/api/health')).json()).pid, (await f.starts())[0]);
+    assert.equal(await (await fetch('http://127.0.0.2:' + port)).text(), 'untouched co-bound wildcard');
+    const reused = await f.run(['-Desktop', '-WaitSeconds', '8']);
+    assert.equal(reused.code, 0, JSON.stringify(reused)); noToken(reused);
+    assert.equal(await readFile(join(f.home, 'runtime.json'), 'utf8'), before);
+    assert.equal((await f.starts()).length, 1);
+  });
+}
+
+test('a foreign exact listener overrides a registered wildcard even when health forges the host PID', windows, async t => {
+  const f = await fixture(t, { listenHost: '0.0.0.0', pauseOnListen: true }), port = await unusedPort(); await f.port(port);
+  const original = JSON.stringify({ marker: 'preserve-foreign-exact' });
+  await writeFile(join(f.home, 'runtime.json'), original);
+  const running = f.run(['-Desktop', '-WaitSeconds', '10']);
+  for (let i = 0; i < 250 && !existsSync(join(f.home, 'listening.jsonl')); i++) await delay(20);
+  assert.equal(existsSync(join(f.home, 'listening.jsonl')), true);
+  const hostPid = (await f.starts())[0];
+  await listener(t, (_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ ready: true, app: 'jarvis', runtime: 'dsh', pid: hostPid }));
+  }, '127.0.0.1', false, port);
+  await writeFile(join(f.home, 'continue-listening'), 'continue');
+  const result = await running;
+  assert.equal(result.code, 2, JSON.stringify(result)); noToken(result);
+  await delay(2000);
+  assert.equal(await readFile(join(f.home, 'runtime.json'), 'utf8'), original, 'forged health cannot publish the foreign exact endpoint as this host');
+  assert.equal((await (await fetch('http://127.0.0.1:' + port + '/jarvis/api/health')).json()).pid, hostPid);
+  assert.doesNotThrow(() => process.kill(hostPid, 0), 'the conflict never kills either service');
+});
 
 async function unusedPort() {
   const server = createServer();
@@ -94,7 +207,7 @@ function noToken(result) {
 async function copyLauncher(packageRoot) {
   const installed = join(packageRoot, 'jarvis', 'dsh');
   await mkdir(installed, { recursive: true });
-  for (const name of ['start.ps1', 'launch-local.mjs', 'profile.mjs']) await copyFile(new URL('./' + name, import.meta.url), join(installed, name));
+  for (const name of ['start.ps1', 'launch-local.mjs', 'listener-identity.ps1', 'profile.mjs']) await copyFile(new URL('./' + name, import.meta.url), join(installed, name));
   await copyFile(new URL('../vault.mjs', import.meta.url), join(installed, '..', 'vault.mjs'));
   return join(installed, 'start.ps1');
 }
