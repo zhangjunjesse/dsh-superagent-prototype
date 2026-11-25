@@ -792,7 +792,7 @@
     byId('instance-status-label').textContent = label + (reason ? ' ' + reason : '');
     instanceStart.hidden = !['stopped', 'failed'].includes(instance.phase) && !startingInstance;
     instanceStart.disabled = startingInstance || stateSyncError || !!instance.cleanupPending || !!instance.capabilityHold;
-    instanceStart.textContent = startingInstance ? '正在启动…' : '启动实例';
+    instanceStart.textContent = startingInstance ? '正在启动…' : '启动集团';
     instanceStartError.textContent = startError;
     instanceStartError.hidden = !startError;
   }

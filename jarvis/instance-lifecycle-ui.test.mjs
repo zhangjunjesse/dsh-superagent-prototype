@@ -106,6 +106,9 @@ test('idle lifecycle polling and visibility refresh disable retained retry contr
 
 test('start reads a fresh revision, stays blocked until state is running, and restores the original draft', async t => {
   const ui = await open(t, { lifecycle: instance('stopped') });
+  assert.equal(ui.byId('instance-start').hidden, false);
+  assert.equal(ui.byId('instance-start').textContent, '启动集团');
+  assert.equal(ui.backend.starts, 0, 'opening stopped history preserves the choice to stay stopped');
   ui.input('启动后要发送的草稿'); ui.backend.revision = 29;
   ui.byId('instance-start').click();
   await until(() => ui.backend.starts === 1 && ui.byId('instance-status').textContent.includes('正在启动'), 'start accepted');

@@ -261,7 +261,7 @@ test('first read is an editable server default without applying or starting brow
   } finally { await control.close(); }
 });
 
-test('saved real configuration and instance state survive reopening without autostart', { timeout: 10000 }, async () => {
+test('saved configuration and state survive reopening with only the confirmed root resumed', { timeout: 10000 }, async () => {
   const config = options(); let control = new SystemControl({}, config);
   try {
     const saved = await setup(control);
@@ -269,9 +269,11 @@ test('saved real configuration and instance state survive reopening without auto
     await control.action('root', 'start', saved.revision);
     await control.manager.chat('root', { id: 'durable', text: 'saved state' });
     await control.close(); control = new SystemControl({}, config);
+    await control.initialization;
     const reopened = await control.get();
     assert.deepEqual(reopened.nodes, saved.nodes); assert.equal(reopened.revision, saved.revision);
-    assert.ok(reopened.runtime.instances.every(instance => instance.phase === 'stopped' && instance.pid === null));
+    assert.equal(status(reopened, 'root').phase, 'running');
+    assert.ok(reopened.runtime.instances.filter(instance => instance.instanceId !== 'root').every(instance => instance.phase === 'stopped' && instance.pid === null));
     await control.action('root', 'start', reopened.revision);
     assert.equal((await control.manager.state('root')).value.text, 'saved state');
     const disk = JSON.parse(readFileSync(control.file, 'utf8'));

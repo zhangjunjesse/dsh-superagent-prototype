@@ -14,7 +14,7 @@
 
 ## 桌面入口与模型目录（2026-11-20）
 
-日常 DSH 桌面通过 `jarvis/dsh/desktop-entry/` 打开已有的 4318 服务。桌面入口的 `shareModels: true` 与 4318 Jarvis 的 `desktopModels: true` 配合使用。可选模型读取桌面官方 `sessionController.modelCatalog()`。4318 保存独立的桌面来源键，推理交回该桌面的 DSH 模型服务；历史 4318 模型继续由原服务处理。配置方法见 [DSH 接入记录](jarvis/DSH-INTEGRATION.md)。
+Windows 日常 DSH 桌面的 `jarvis/dsh/desktop-entry/` 在点击时复用或启动已有 profile 的 4318 服务。集团上次已确认运行时自动恢复，手动停止或意图未知时提供「启动集团」。桌面入口的 `shareModels: true` 与 4318 Jarvis 的 `desktopModels: true` 配合使用。可选模型读取桌面官方 `sessionController.modelCatalog()`。4318 保存独立的桌面来源键，推理交回该桌面的 DSH 模型服务；历史 4318 模型继续由原服务处理。配置方法见 [DSH 接入记录](jarvis/DSH-INTEGRATION.md)。
 
 组织图可通过只读的 `GET /jarvis/api/system?view=topology` 先读取组织及进程状态，完整设置沿用原管理接口。相关专项为 `node --test jarvis/organization-loading.test.mjs jarvis/model-catalog.test.mjs jarvis/dsh/desktop-model-client.test.mjs`。具体部署版本以两个宿主的实际回执为准。
 
