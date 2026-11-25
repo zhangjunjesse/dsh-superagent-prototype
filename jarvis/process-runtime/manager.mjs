@@ -180,10 +180,11 @@ export class ProcessManager {
   constructor(ctx, config, { conversationModel, modelCatalog, preset,
     bridgeFactory = (instance, tool) => new DshBridge(ctx, instance, tool,
       { preset, ...(instance.instanceId === 'root' ? { conversationModel } : {}) }),
-    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, { ...options, modelCatalog }), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {}, canRecoverInstance = () => true } = {}) {
+    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, { ...options, modelCatalog }), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {}, canRecoverInstance = () => true, onInstanceStarted = () => {} } = {}) {
     this.ctx = ctx; this.rootDir = directory(config.rootDir); this.bridgeFactory = bridgeFactory; this.nativeFactory = nativeFactory; this.entry = entry;
     this.instances = configuration(config.instances ?? [], this.rootDir); this.closing = false; this.reconfiguring = false;
     this.canRecoverInstance = canRecoverInstance;
+    this.onInstanceStarted = onInstanceStarted;
     this.capabilityHolds = new Map(); this.foregroundRequests = new Map(); this.capabilitySnapshots = new Map(); this.capabilityOwnerId = randomUUID(); this.capabilityStopsStarted = new Set();
     this.capabilityTransitions = new Set();
     this.topologyTransitions = new Set();
@@ -846,6 +847,9 @@ export class ProcessManager {
       }
       this.finishStartup(item, result.ready === false ? 'blocked' : 'ready');
       if (result.ready !== false) this.event(item, 'ready');
+      // The owner must persist a confirmed run before its last restart/Worker
+      // recovery promise can be consumed, including retries after initialization.
+      this.onInstanceStarted(item.config.instanceId);
       this.completeRestart(item);
       return this.status();
     } catch (error) {

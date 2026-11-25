@@ -158,7 +158,8 @@ export class SystemControl {
     try { this.capabilities = new CapabilityApplications(this, capabilityApplications); }
     catch (cause) { throw new SystemControlError(500, '已保存的 Worker 设置应用记录无效，原文件已保留，请检查服务日志', { cause }); }
     this.manager = new ProcessManager(ctx, { rootDir: this.rootDir, instances: this.nodes ? this.runtimeConfig(this.nodes) : [] },
-      { ...managerOptions, initialCapabilityHolds: this.capabilities.initialHolds(), canRecoverInstance: id => this.canRecoverInstance(id) });
+      { ...managerOptions, initialCapabilityHolds: this.capabilities.initialHolds(), canRecoverInstance: id => this.canRecoverInstance(id),
+        onInstanceStarted: id => this.confirmRecoveredRoot(id) });
     // Read under the manager's ownership lock, before its asynchronous recovery begins.
     this.rootIntent = rootRuntimeIntent(this.rootIntentFile);
     this.initialization = this.restoreRuntime().catch(error => {
@@ -181,12 +182,17 @@ export class SystemControl {
     this.rootIntent = intent;
     return intent;
   }
+  confirmRecoveredRoot(id) {
+    const root = this.manager.instances.get('root');
+    // Only approved legacy recovery can start root without a new intent. Never
+    // replace a newer stop decision or evidence of a damaged/unknown record.
+    if (id === 'root' && this.rootIntent === undefined && !this.closing && !this.manager.closing
+      && root?.phase === 'running' && !root.cleanupPending) this.saveRootIntent(true, true);
+  }
   async restoreRuntime() {
     await this.capabilities.recover();
     const root = this.manager.instances.get('root');
     if (this.closing || this.manager.closing) return;
-    // Only already-approved legacy recovery can have started root before this initialization finishes.
-    if (this.rootIntent === undefined && root?.phase === 'running' && !root.cleanupPending) this.saveRootIntent(true, true);
     const intent = this.rootIntent, node = this.nodes?.find(item => item.id === 'root');
     if (this.closing || !node || !intent?.desiredRunning || !intent.confirmed || this.capabilities.affected('root')) return;
     if (root.phase === 'running' && !root.cleanupPending) return;

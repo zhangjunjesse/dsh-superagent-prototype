@@ -23,8 +23,9 @@ async function configure(control) {
 const runtime = (snapshot, id = 'root') => snapshot.runtime.instances.find(item => item.instanceId === id);
 const intentFile = config => join(config.rootDir, 'root-runtime-intent.json');
 const readIntent = config => JSON.parse(readFileSync(intentFile(config), 'utf8'));
-async function until(check) {
-  for (let attempt = 0; attempt < 100; attempt++) { if (check()) return; await delay(10); }
+async function until(check, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) { if (await check()) return; await delay(10); }
   assert.fail('Expected lifecycle condition did not settle');
 }
 
@@ -195,6 +196,39 @@ test('a legacy pending restart without the new intent record retains its approve
   assert.equal(readIntent(config).confirmed, true, 'Successful approved legacy recovery migrates its confirmed intent');
 });
 
+test('legacy restart completion keeps its recovery promise if durable root confirmation cannot be written', { timeout: 10000 }, async t => {
+  const config = options(); let control = new SystemControl({}, config);
+  let blockWrite = false, intentDirectory = false;
+  config.managerOptions.lifecycleParticipants = { root: { bindLifecycle() {}, suspendInstance: async () => {},
+    resumeInstance: async () => {
+      if (blockWrite) { mkdirSync(intentFile(config)); intentDirectory = true; }
+    } } };
+  t.after(async () => {
+    blockWrite = false;
+    if (intentDirectory) rmdirSync(intentFile(config));
+    await control.close();
+  });
+  const saved = await configure(control);
+  await control.action('root', 'start', saved.revision, { view: 'topology' });
+  await control.management('root', { method: 'POST', path: 'restart' });
+  const restartFile = join(control.stateDirectory('root'), 'restart-intent.json');
+  const pending = JSON.parse(readFileSync(restartFile, 'utf8'));
+  await control.close(); unlinkSync(intentFile(config));
+  writeFileSync(restartFile, JSON.stringify({ ...pending, phase: 'requested' }));
+  blockWrite = true;
+
+  control = new SystemControl({}, config); await control.initialization;
+  assert.notEqual(runtime(await control.get({ view: 'topology' })).phase, 'running');
+  assert.equal(JSON.parse(readFileSync(restartFile, 'utf8')).phase, 'restarting',
+    'The restart promise must survive when confirmation fails at the successful-start checkpoint');
+  rmdirSync(intentFile(config)); intentDirectory = false; blockWrite = false;
+  await control.close();
+  control = new SystemControl({}, config); await control.initialization;
+  assert.equal(runtime(await control.get({ view: 'topology' })).phase, 'running');
+  assert.equal(readIntent(config).confirmed, true);
+  assert.equal(JSON.parse(readFileSync(restartFile, 'utf8')).phase, 'complete');
+});
+
 test('a stop during process recovery cannot be overwritten by a late lifecycle resume', { timeout: 10000 }, async t => {
   const entered = Promise.withResolvers(), release = Promise.withResolvers();
   let block = false;
@@ -231,6 +265,10 @@ async function pendingCapabilities(control) {
   assert.equal(saved.body.application.state, 'waiting');
   return saved.body;
 }
+async function applicationApplied(control, id = 'root') {
+  try { return (await control.management(id, { method: 'GET', path: 'worker-capabilities' })).body.application.state === 'applied'; }
+  catch (error) { if (error.status !== 503) throw error; return false; }
+}
 
 test('legacy Worker recovery without the new intent preserves its admitted work and running root', { timeout: 10000 }, async t => {
   const config = capabilityOptions(); let control = new SystemControl({}, config); t.after(() => control.close());
@@ -252,6 +290,118 @@ test('legacy Worker recovery without the new intent preserves its admitted work 
   assert.equal(readIntent(config).confirmed, true);
 });
 
+test('a successful retry of failed legacy Worker recovery confirms root for the next host', { timeout: 10000 }, async t => {
+  const config = capabilityOptions(), createBridge = config.managerOptions.bridgeFactory;
+  let fail = false;
+  config.managerOptions.bridgeFactory = (...args) => {
+    if (fail) throw new Error('Transient legacy Worker bridge failure');
+    return createBridge(...args);
+  };
+  let control = new SystemControl({}, config); t.after(() => control.close());
+  const saved = await configure(control);
+  await control.action('root', 'start', saved.revision, { view: 'topology' });
+  const waiting = await pendingCapabilities(control);
+  await control.close(); unlinkSync(intentFile(config)); fail = true;
+
+  control = new SystemControl({}, config); await control.initialization;
+  const failed = (await control.management('root', { method: 'GET', path: 'worker-capabilities' })).body;
+  assert.equal(failed.application.state, 'failed');
+  assert.equal(failed.application.canRetry, true);
+  assert.equal(existsSync(intentFile(config)), false, 'A failed legacy start is not a confirmed run');
+  fail = false;
+  const retried = (await control.management('root', { method: 'POST', path: 'worker-capabilities/application',
+    body: { revision: failed.revision, applicationId: waiting.application.id, action: 'retry' } })).body;
+  assert.equal(retried.application.state, 'waiting');
+  assert.equal(runtime(await control.get({ view: 'topology' })).phase, 'running');
+  const retained = await control.manager.instance('root').peer.call('test.inspect');
+  assert.deepEqual(retained.tasks.map(item => item.id), ['pending-work']);
+  assert.equal(retained.hold.operationId, waiting.application.id);
+  await control.manager.instance('root').peer.call('test.finish');
+  await until(() => applicationApplied(control), 4000);
+  const applied = (await control.management('root', { method: 'GET', path: 'worker-capabilities' })).body;
+  assert.equal(applied.application.state, 'applied');
+  await control.close();
+
+  control = new SystemControl({}, config); await control.initialization;
+  assert.equal(runtime(await control.get({ view: 'topology' })).phase, 'running', 'Confirmed retry must outlive its completed legacy Worker record');
+  assert.equal(readIntent(config).desiredRunning, true);
+  assert.equal(readIntent(config).confirmed, true);
+});
+
+test('scheduled legacy Worker recovery after initial action contention confirms root before its application completes', { timeout: 10000 }, async t => {
+  const config = capabilityOptions(); let control = new SystemControl({}, config); t.after(() => control.close());
+  const saved = await configure(control);
+  await control.action('root', 'start', saved.revision, { view: 'topology' });
+  const waiting = await pendingCapabilities(control);
+  await control.close(); unlinkSync(intentFile(config));
+
+  control = new SystemControl({}, config);
+  // Hold the automatic tick's action admission boundary while preserving the
+  // legacy run decision; the real early-root-stop race is exercised separately.
+  control.actions.set('research', { action: 'stop' });
+  await control.initialization;
+  assert.equal(control.initializationError, undefined);
+  assert.equal(runtime(await control.get({ view: 'topology' })).phase, 'stopped');
+  assert.equal(existsSync(intentFile(config)), false);
+  control.actions.delete('research');
+  await until(() => control.manager.status().instances.find(item => item.instanceId === 'root').phase === 'running', 4000);
+  assert.equal(readIntent(config).confirmed, true, 'The scheduled startup confirms while its Worker promise remains active');
+  const retained = await control.manager.instance('root').peer.call('test.inspect');
+  assert.deepEqual(retained.tasks.map(item => item.id), ['pending-work']);
+  assert.equal(retained.hold.operationId, waiting.application.id);
+  await control.manager.instance('root').peer.call('test.finish');
+  await until(() => applicationApplied(control), 4000);
+  await control.close();
+  control = new SystemControl({}, config); await control.initialization;
+  assert.equal(runtime(await control.get({ view: 'topology' })).phase, 'running');
+  assert.equal(readIntent(config).desiredRunning, true);
+});
+
+test('an immediate root stop preserves scheduled recovery of an unrelated child Worker application', { timeout: 10000 }, async t => {
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let block = false;
+  const config = capabilityOptions();
+  config.capabilityCatalog = async () => ({ tools: ['read', 'glob', 'grep'].map(name => ({ name, available: true })),
+    skills: [{ name: 'skill-a' }], complete: true });
+  config.managerOptions.lifecycleParticipants = { root: { bindLifecycle() {}, resumeInstance: async () => {},
+    suspendInstance: async () => { if (block) { entered.resolve(); await release.promise; } } } };
+  let control = new SystemControl({}, config);
+  t.after(async () => { block = false; release.resolve(); await control.close(); });
+  const saved = await configure(control);
+  await control.action('root', 'start', saved.revision, { view: 'topology' });
+  await control.action('research', 'start', saved.revision, { view: 'topology' });
+  await control.manager.instance('research').peer.call('test.add', { id: 'child-work', kind: 'ticket', status: 'working' });
+  const waiting = (await control.management('research', { method: 'PUT', path: 'worker-capabilities',
+    body: { revision: control.revision, tools: ['read', 'glob', 'grep'], skills: ['skill-a'] } })).body;
+  assert.equal(waiting.application.state, 'waiting');
+  assert.deepEqual(waiting.application.affected.map(item => item.instanceId), ['research']);
+  await control.close(); block = true;
+
+  control = new SystemControl({}, config);
+  const stopping = control.action('root', 'stop', waiting.revision, { view: 'topology' });
+  await entered.promise;
+  await control.initialization;
+  assert.equal(control.initializationError, undefined, 'Temporary action contention is deferred without failing host initialization');
+  assert.equal(readIntent(config).desiredRunning, false, 'Root stop is durable even while its drain is held');
+  block = false; release.resolve(); await stopping;
+  await until(() => control.manager.status().instances.find(item => item.instanceId === 'research').phase === 'running', 4000);
+  const recovered = await control.get({ view: 'topology' });
+  assert.equal(runtime(recovered).phase, 'stopped');
+  assert.equal(runtime(recovered, 'research').phase, 'running', 'Temporary root action contention must not discard child recovery');
+  const retained = await control.manager.instance('research').peer.call('test.inspect');
+  assert.deepEqual(retained.tasks.map(item => item.id), ['child-work']);
+  assert.equal(retained.hold.operationId, waiting.application.id);
+  await control.manager.instance('research').peer.call('test.finish');
+  await until(() => applicationApplied(control, 'research'), 4000);
+  const applied = (await control.management('research', { method: 'GET', path: 'worker-capabilities' })).body;
+  assert.equal(applied.application.id, waiting.application.id);
+  assert.equal(applied.application.state, 'applied');
+  assert.deepEqual(applied.applied.skills, ['skill-a']);
+  assert.equal((await control.manager.instance('research').peer.call('test.inspect')).hold, undefined);
+  assert.equal(runtime(await control.get({ view: 'topology' })).phase, 'stopped');
+  assert.equal(readIntent(config).desiredRunning, false);
+});
+
 test('explicit stop outranks an older Worker desiredRunning recovery hint', { timeout: 10000 }, async t => {
   const config = capabilityOptions(); let control = new SystemControl({}, config); t.after(() => control.close());
   const saved = await configure(control);
@@ -269,6 +419,25 @@ test('explicit stop outranks an older Worker desiredRunning recovery hint', { ti
   assert.equal(runtime(snapshot).phase, 'stopped');
   assert.equal(runtime(snapshot).generation, 0, 'A stale Worker promise cannot start a manually stopped root');
   assert.equal(readIntent(config).desiredRunning, false);
+});
+
+test('legacy Worker promises cannot override damaged, unknown or unconfirmed root intent', { timeout: 10000 }, async t => {
+  let control; t.after(() => control?.close());
+  for (const value of ['{damaged',
+    JSON.stringify({ version: 99, instanceId: 'root', desiredRunning: true, confirmed: true, at: new Date().toISOString() }),
+    JSON.stringify({ version: 1, instanceId: 'root', desiredRunning: true, confirmed: false, at: new Date().toISOString() })]) {
+    const config = capabilityOptions(); control = new SystemControl({}, config);
+    const saved = await configure(control);
+    await control.action('root', 'start', saved.revision, { view: 'topology' });
+    await pendingCapabilities(control);
+    await control.close(); writeFileSync(intentFile(config), value);
+    control = new SystemControl({}, config); await control.initialization;
+    const current = runtime(await control.get({ view: 'topology' }));
+    assert.equal(current.phase, 'stopped');
+    assert.equal(current.generation, 0, 'Untrusted intent cannot admit a root owner through Worker recovery');
+    assert.equal(readFileSync(intentFile(config), 'utf8'), value);
+    await control.close();
+  }
 });
 
 test('a rejected stop never changes intent and a failed durable stop write never stops the live root', { timeout: 10000 }, async t => {

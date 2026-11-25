@@ -78,6 +78,9 @@ export class CapabilityApplications {
   }
   async tick() {
     if (this.closed) return;
+    // Automatic recovery waits for a temporary action/save to finish. Manual
+    // operations still use exclusive()'s conflict response at the same boundary.
+    if (this.busy || this.control.saving || this.control.actions.size) { this.schedule(); return; }
     return this.exclusive(async () => {
       for (const record of this.records.filter(item => active(item) && item.state !== 'failed')) await this.advance(record.id);
     });
