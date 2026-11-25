@@ -16,7 +16,10 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
     if (error?.code === 'unsupported-host') return '当前桌面版本不支持内嵌页面，请更新桌面，或在浏览器打开。';
     if (error?.code === 'authentication-failed') return 'SuperJarvis 登录未完成，请重试连接。';
     if (error?.code === 'guest-failed') return 'SuperJarvis 页面已中断，请重新连接，或在浏览器打开。';
-    return '暂时无法连接 SuperJarvis，请确认服务已启动，然后重试。';
+    if (error?.code === 'port-conflict') return '4318 端口被其他程序占用，请关闭占用程序后重试连接。';
+    if (error?.code === 'start-timeout') return 'SuperJarvis 启动尚未完成，请稍后重试连接。';
+    if (error?.code === 'start-failed') return 'SuperJarvis 未能启动，请重试连接；若仍失败，请检查服务运行日志。';
+    return '暂时无法连接 SuperJarvis，请重试连接；若仍失败，请检查服务运行日志。';
   }
 
   function validateEntry(value) {
@@ -35,7 +38,7 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
   }
 
   /** Cancel and time-bound native operations without retaining their URL in UI state. */
-  function observeOperation(operation, signal, milliseconds = 20000) {
+  function observeOperation(operation, signal, milliseconds = 20000, timeoutCode = 'guest-failed') {
     return new Promise((resolve, reject) => {
       if (signal.aborted) { reject(cancelled()); return; }
       let settled = false;
@@ -47,9 +50,18 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
         complete(value);
       };
       const stop = () => finish(reject, cancelled());
-      const timeout = setTimeout(() => finish(reject, failure('guest-failed')), milliseconds);
+      const timeout = setTimeout(() => finish(reject, failure(timeoutCode)), milliseconds);
       signal.addEventListener('abort', stop, { once: true });
       Promise.resolve(operation).then(value => finish(resolve, value), error => finish(reject, error));
+    });
+  }
+
+  function waitBeforeRecheck(signal, milliseconds) {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) { reject(cancelled()); return; }
+      const stop = () => { clearTimeout(timer); signal.removeEventListener('abort', stop); reject(cancelled()); };
+      const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, milliseconds);
+      signal.addEventListener('abort', stop, { once: true });
     });
   }
 
@@ -68,8 +80,33 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
       // /api owns the authenticated Fetch carrier. Plugin channels outside its
       // injection domain cannot register the host-side generic RPC service.
       const response = await this.ctx.connection.rpc.call(CHANNEL, ENDPOINT + method, {}, signal);
-      if (response?.ok !== true) throw failure(response?.error?.code || 'service-unavailable');
+      if (response?.ok !== true) {
+        const code = response?.error?.code;
+        throw failure(typeof code === 'string' ? code.replace(/^superjarvis-desktop\//, '') : 'service-unavailable');
+      }
       return response.value;
+    }
+
+    async ensureReady(signal, onStarting) {
+      const deadline = Date.now() + 90000;
+      let state;
+      try { state = await observeOperation(this.call('state', signal), signal, 5000, 'unavailable'); }
+      catch (error) { if (error?.code !== 'unavailable') throw error; }
+      if (state?.ready !== true) {
+        onStarting();
+        try { state = await observeOperation(this.call('ensure', signal), signal, 45000, 'start-timeout'); }
+        catch (error) { if (error?.code !== 'start-timeout') throw error; }
+        while (state?.ready !== true) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw failure('start-timeout');
+          await waitBeforeRecheck(signal, Math.min(1000, remaining));
+          if (Date.now() >= deadline) throw failure('start-timeout');
+          try {
+            state = await observeOperation(this.call('state', signal), signal, Math.min(5000, deadline - Date.now()), 'unavailable');
+          } catch (error) { if (error?.code !== 'unavailable') throw error; }
+        }
+      }
+      if (state?.ready !== true || state.jarvisUrl !== JARVIS) throw failure('service-unavailable');
     }
 
     mount(host) {
@@ -136,7 +173,8 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
       this.description.setAttribute('role', this.status === 'error' ? 'alert' : 'status');
       this.cover.style.display = this.status === 'ready' ? 'none' : 'flex';
       this.retryButton.hidden = this.status !== 'error';
-      this.notice.textContent = this.status === 'ready' ? '已连接' : this.status === 'connecting' ? '连接中…' : '';
+      this.notice.textContent = this.status === 'ready' ? '已连接'
+        : this.status === 'starting' ? '正在启动 SuperJarvis…' : this.status === 'connecting' ? '连接中…' : '';
       this.browserButton.disabled = typeof this.ctx.connection?.rpc?.call !== 'function' || !!this.openingBrowser;
     }
 
@@ -169,9 +207,12 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
       const carrier = globalThis.dshDesktop;
       const bridge = carrier?.protocolVersion === 1 ? carrier.browser : undefined;
       if (typeof bridge?.acquire !== 'function' || typeof bridge?.release !== 'function') throw failure('unsupported-host');
-      const state = await this.call('state', attempt.abort.signal);
+      await this.ensureReady(attempt.abort.signal, () => {
+        this.current(attempt);
+        this.setState('starting', '正在启动 SuperJarvis，启动完成后会自动打开…');
+      });
       this.current(attempt);
-      if (state?.ready !== true || state.jarvisUrl !== JARVIS) throw failure('service-unavailable');
+      this.setState('connecting', '正在连接 SuperJarvis…');
       await this.dropGuest();
       this.current(attempt);
       const reservation = await bridge.acquire(WORKSPACE);
@@ -247,13 +288,21 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
     async openBrowser() {
       if (this.disposed || this.openingBrowser) return;
       this.openingBrowser = true;
+      const abort = new AbortController();
+      this.browserAbort = abort;
       this.paint();
+      if (this.notice) this.notice.textContent = '正在检查服务…';
       try {
-        const result = await this.call('openBrowser');
+        await this.ensureReady(abort.signal, () => {
+          if (!this.disposed && this.notice) this.notice.textContent = '正在启动 SuperJarvis，启动完成后会自动打开浏览器…';
+        });
+        if (this.disposed || abort.signal.aborted) return;
+        const result = await this.call('openBrowser', abort.signal);
         if (!this.disposed && this.notice) this.notice.textContent = result?.opened === true ? '已在浏览器打开' : '浏览器未能打开，请重试。';
-      } catch {
-        if (!this.disposed && this.notice) this.notice.textContent = '浏览器未能打开，请确认服务已启动，然后重试。';
+      } catch (error) {
+        if (!this.disposed && this.notice) this.notice.textContent = messageFor(error).replaceAll('重试连接', '再次点击「在浏览器打开」');
       } finally {
+        if (this.browserAbort === abort) this.browserAbort = undefined;
         this.openingBrowser = false;
         if (!this.disposed && this.browserButton) this.browserButton.disabled = typeof this.ctx.connection?.rpc?.call !== 'function';
       }
@@ -285,6 +334,7 @@ window.__ModuleLoader__.load({ id: 'dsh-superjarvis-desktop-entry', factory: req
       if (this.disposed) return;
       this.disposed = true;
       this.attempt?.abort.abort();
+      this.browserAbort?.abort();
       await this.dropGuest();
       await Promise.all(this.releases);
       this.host?.replaceChildren();

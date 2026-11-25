@@ -89,6 +89,16 @@ function atomicConfig(file, value) {
   }
 }
 
+function rootRuntimeIntent(file) {
+  try {
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    if (value?.version === 1 && value.instanceId === 'root' && typeof value.desiredRunning === 'boolean'
+      && typeof value.confirmed === 'boolean' && typeof value.at === 'string' && Number.isFinite(Date.parse(value.at))) return value;
+  } catch (error) { if (error.code === 'ENOENT') return undefined; }
+  // A damaged new record cannot be treated as a legacy profile with no record.
+  return null;
+}
+
 function lifecycle(file, instanceId) {
   if (!existsSync(file)) return [];
   const size = statSync(file).size, length = Math.min(size, 65536), buffer = Buffer.alloc(length), fd = openSync(file, 'r');
@@ -120,6 +130,7 @@ export class SystemControl {
     if (typeof rootDir !== 'string' || !isAbsolute(rootDir)) throw new SystemControlError(400, '运行服务的数据根目录必须是绝对路径');
     mkdirSync(rootDir, { recursive: true });
     this.rootDir = realpathSync(rootDir); this.file = join(this.rootDir, 'system-config.json');
+    this.rootIntentFile = join(this.rootDir, 'root-runtime-intent.json');
     this.defaultModel = defaultModel; this.validateModel = validateModel;
     this.capabilityCatalog = capabilityCatalog; this.catalogCache = new Map(); this.catalogRequests = new Map();
     this.revision = 0; this.nodes = null; this.identities = {}; this.retiredParents = {}; this.saving = false; this.actions = new Map(); this.closing = false;
@@ -147,8 +158,42 @@ export class SystemControl {
     try { this.capabilities = new CapabilityApplications(this, capabilityApplications); }
     catch (cause) { throw new SystemControlError(500, '已保存的 Worker 设置应用记录无效，原文件已保留，请检查服务日志', { cause }); }
     this.manager = new ProcessManager(ctx, { rootDir: this.rootDir, instances: this.nodes ? this.runtimeConfig(this.nodes) : [] },
-      { ...managerOptions, initialCapabilityHolds: this.capabilities.initialHolds() });
-    this.initialization = this.capabilities.recover().catch(error => { this.initializationError = error; });
+      { ...managerOptions, initialCapabilityHolds: this.capabilities.initialHolds(), canRecoverInstance: id => this.canRecoverInstance(id) });
+    // Read under the manager's ownership lock, before its asynchronous recovery begins.
+    this.rootIntent = rootRuntimeIntent(this.rootIntentFile);
+    this.initialization = this.restoreRuntime().catch(error => {
+      this.initializationError = error;
+      if (this.closing || this.manager.closing || this.rootIntent?.desiredRunning === false) return;
+      const root = this.manager.instances.get('root');
+      if (root) { root.error = `集团自动恢复失败：${error.message}`; this.manager.record(); }
+    });
+  }
+  canRecoverInstance(id) {
+    if (id !== 'root') return true;
+    // Existing restart/Worker records are already validated recovery promises.
+    // Profiles predating this file must retain those promises, never infer one from a PID snapshot.
+    if (this.rootIntent === undefined) return true;
+    return this.rootIntent?.desiredRunning === true && this.rootIntent.confirmed === true;
+  }
+  saveRootIntent(desiredRunning, confirmed) {
+    const intent = { version: 1, instanceId: 'root', desiredRunning, confirmed, at: new Date().toISOString() };
+    atomicConfig(this.rootIntentFile, intent);
+    this.rootIntent = intent;
+    return intent;
+  }
+  async restoreRuntime() {
+    await this.capabilities.recover();
+    const root = this.manager.instances.get('root');
+    if (this.closing || this.manager.closing) return;
+    // Only already-approved legacy recovery can have started root before this initialization finishes.
+    if (this.rootIntent === undefined && root?.phase === 'running' && !root.cleanupPending) this.saveRootIntent(true, true);
+    const intent = this.rootIntent, node = this.nodes?.find(item => item.id === 'root');
+    if (this.closing || !node || !intent?.desiredRunning || !intent.confirmed || this.capabilities.affected('root')) return;
+    if (root.phase === 'running' && !root.cleanupPending) return;
+    await this.checkExecution(node);
+    // A stop accepted during model/catalog checks owns the newer durable intent.
+    if (this.closing || this.manager.closing || this.rootIntent !== intent) return;
+    await this.manager.start('root');
   }
   commitConfiguration({ revision, nodes, identities, capabilityApplications = this.capabilities.records }) {
     const retiredParents = { ...this.retiredParents }, present = new Set(nodes.map(node => node.id));
@@ -173,7 +218,7 @@ export class SystemControl {
   }
   workspace(value, id) {
     const workspace = managedPath(this.rootDir, value === undefined || value === '' ? join(this.rootDir, 'workspaces', id) : value);
-    const reserved = ['instances', 'system-config.json', 'processes.json'].map(name => join(this.rootDir, name));
+    const reserved = ['instances', 'system-config.json', 'processes.json', 'root-runtime-intent.json'].map(name => join(this.rootDir, name));
     if (samePath(workspace, this.rootDir) || reserved.some(path => within(path, workspace) || within(workspace, path))) throw new SystemControlError(400, '工作目录必须与服务托管的配置和实例状态分开');
     return workspace;
   }
@@ -509,25 +554,41 @@ export class SystemControl {
     } finally { this.saving = false; }
   }
   async action(id, action, revision, { view } = {}) {
-    await this.initialization;
+    const rootStop = id === 'root' && action === 'stop';
+    if (!rootStop) await this.initialization;
+    if (this.closing) throw new SystemControlError(503, '组织管理服务正在关闭');
     this.assertRevision(revision);
     if (!this.nodes?.some(node => node.id === id)) throw new SystemControlError(404, '未找到已保存的 SuperJarvis 实例');
     if (!['start', 'stop', 'restart'].includes(action)) throw new SystemControlError(400, '不支持此实例运行操作');
     await this.capabilityOperation(() => this.capabilities.assertUnrelated([id]));
-    if (this.saving || this.actions.has(id)) throw new SystemControlError(409, '实例启停或系统配置保存正在进行，请稍后重试');
-    this.actions.set(id, action);
+    this.assertRevision(revision);
+    const previous = this.actions.get(id);
+    if (this.saving || previous && (!rootStop || previous.action === 'stop')) throw new SystemControlError(409, '实例启停或系统配置保存正在进行，请稍后重试');
+    const operation = { action };
+    this.actions.set(id, operation);
     try {
-      if (action !== 'stop') await this.checkExecution(this.nodes.find(node => node.id === id));
+      let intent;
+      // Acknowledged stop intent must survive power loss while native cleanup is still running.
+      if (rootStop) intent = this.saveRootIntent(false, true);
+      if (action !== 'stop') {
+        await this.checkExecution(this.nodes.find(node => node.id === id));
+        if (this.closing || this.actions.get(id) !== operation) throw new SystemControlError(409, '实例启动已被停止请求取代');
+        if (id === 'root') intent = this.saveRootIntent(true, this.rootIntent?.desiredRunning === true && this.rootIntent.confirmed === true);
+      }
       await this.manager[action](id);
       const runtime = this.manager.status().instances.find(instance => instance.instanceId === id);
       if (runtime.phase !== (action === 'stop' ? 'stopped' : 'running') || runtime.cleanupPending || action === 'stop' && runtime.pid !== null) {
         throw new SystemControlError(503, '实例运行操作尚未完成，请查看运行状态和会话清理结果');
       }
+      if (id === 'root' && action !== 'stop') {
+        if (this.closing || this.rootIntent !== intent) throw new SystemControlError(409, '实例启动已被停止请求取代');
+        this.saveRootIntent(true, true);
+      }
       return this.get({ view });
     } catch (error) {
       if (error instanceof SystemControlError) throw error;
       throw new SystemControlError(503, '实例运行操作失败，请查看运行状态和服务日志', { cause: error });
-    } finally { this.actions.delete(id); }
+    } finally { if (this.actions.get(id) === operation) this.actions.delete(id); }
   }
   async detail(id) {
     const node = this.nodes?.find(node => node.id === id);

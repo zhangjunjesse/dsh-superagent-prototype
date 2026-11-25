@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { open, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, resolve, win32 } from 'node:path';
 import { spawn } from 'node:child_process';
 import { registerDesktopModelHost } from './model-host.mjs';
 
@@ -13,6 +13,7 @@ export const JARVIS_ORIGIN = 'http://127.0.0.1:4318';
 export const JARVIS_URL = `${JARVIS_ORIGIN}/jarvis/`;
 const LAUNCH_TTL_MS = 30_000;
 const MAX_PENDING_LAUNCHES = 8;
+const START_WAIT_MS = 40_000;
 const MESSAGES = {
   forbidden: '此入口仅供当前已认证的桌面窗口使用。',
   'bad-request': '桌面入口请求无效。',
@@ -21,6 +22,9 @@ const MESSAGES = {
   busy: '已有待打开的贾维斯入口，请稍后重试。',
   cancelled: '桌面入口操作已取消。',
   'open-failed': '系统浏览器未能打开，请重试。',
+  'port-conflict': '4318 端口被其他程序占用，请关闭占用程序后重试连接。',
+  'start-timeout': 'SuperJarvis 启动尚未完成，请稍后点击重试连接。',
+  'start-failed': 'SuperJarvis 未能启动，请重试连接；若仍失败，请检查服务运行日志。',
 };
 
 class EntryError extends Error {
@@ -68,14 +72,56 @@ function openSystemBrowser(url) {
   });
 }
 
-/** Owns short-lived front-door redirects, never the Jarvis service or its authentication. */
+/** The installed launcher owns the service lifetime; its caller never terminates it. */
+export function launchInstalledService(homePath, { spawnProcess = spawn, platform = process.platform,
+  systemRoot = process.env.SystemRoot ?? 'C:\\Windows', timeoutMs = START_WAIT_MS } = {}) {
+  if (platform !== 'win32') return Promise.resolve(1);
+  const executable = win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const launcher = join(homePath, 'profiles', 'jarvis', 'node_modules', 'dsh-superagent', 'jarvis', 'dsh', 'start.ps1');
+  return new Promise(resolveExit => {
+    let timer, settled = false;
+    const finish = code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveExit([0, 2, 3].includes(code) ? code : 1);
+    };
+    try {
+      // PowerShell 5.1 can exit 0 without running -File under DETACHED_PROCESS.
+      // start.ps1 independently creates the service and owns its durable
+      // logs/registration; this hidden caller only waits for the exit status.
+      const child = spawnProcess(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', launcher, '-HomePath', homePath, '-Desktop'], { windowsHide: true, stdio: 'ignore' });
+      child.once('error', () => finish(1));
+      child.once('exit', code => finish(code));
+      child.unref();
+      timer = setTimeout(() => finish(3), timeoutMs);
+    } catch { finish(1); }
+  });
+}
+
+/** Cancelling a window stops its wait, while shared startup continues independently. */
+function waitForStartup(operation, signal) {
+  cancelled(signal);
+  if (!signal) return operation;
+  return new Promise((resolveWait, rejectWait) => {
+    const finish = (complete, value) => { signal.removeEventListener('abort', stop); complete(value); };
+    const stop = () => finish(rejectWait, new EntryError('cancelled'));
+    signal.addEventListener('abort', stop, { once: true });
+    operation.then(value => finish(resolveWait, value), error => finish(rejectWait, error));
+  });
+}
+
+/** Owns click-to-open readiness and short-lived redirects, retaining DSH authentication. */
 export class DesktopEntryHost {
-  constructor(config, { fetch: fetchRequest = globalThis.fetch, now = Date.now, openExternal = openSystemBrowser } = {}) {
+  constructor(config, { fetch: fetchRequest = globalThis.fetch, now = Date.now, openExternal = openSystemBrowser,
+    startService = launchInstalledService } = {}) {
     if (!config || !isAbsolute(config.homePath ?? '') || Object.keys(config).some(key => key !== 'homePath')) fail('bad-request');
     this.homePath = resolve(config.homePath);
     this.fetchRequest = fetchRequest;
     this.now = now;
     this.openExternal = openExternal;
+    this.startService = startService;
     this.pending = new Set();
     this.creating = 0;
     this.closed = false;
@@ -119,8 +165,41 @@ export class DesktopEntryHost {
     return { ready: true, pid: generation.pid, jarvisUrl: JARVIS_URL };
   }
 
+  async ensureGeneration(signal) {
+    cancelled(signal);
+    try { return await this.generation(signal); }
+    catch (error) {
+      cancelled(signal);
+      if (this.closed || !(error instanceof EntryError) || error.code !== 'unavailable') throw error;
+    }
+    if (!this.starting) {
+      const startup = Promise.resolve().then(async () => {
+        if (this.closed) fail('unavailable');
+        let code;
+        try { code = await this.startService(this.homePath); } catch { fail('start-failed'); }
+        if (this.closed) fail('unavailable');
+        if (code === 2) fail('port-conflict');
+        if (code === 3) fail('start-timeout');
+        if (code !== 0) fail('start-failed');
+        return this.generation();
+      });
+      this.starting = startup;
+      const clear = () => { if (this.starting === startup) this.starting = undefined; };
+      startup.then(clear, clear);
+    }
+    const generation = await waitForStartup(this.starting, signal);
+    cancelled(signal);
+    if (this.closed) fail('unavailable');
+    return generation;
+  }
+
+  async ensure(signal) {
+    const generation = await this.ensureGeneration(signal);
+    return { ready: true, pid: generation.pid, jarvisUrl: JARVIS_URL };
+  }
+
   async issue(signal) {
-    const generation = await this.generation(signal);
+    const generation = await this.ensureGeneration(signal);
     let authenticatedUrl;
     try {
       authenticatedUrl = await latestLaunchUrl(this.homePath);
@@ -214,7 +293,7 @@ export function createDesktopEntryRpc(connection, service) {
     try {
       if (!peer || peer !== connection.browserPeer || peer.principal?.kind !== 'owner' || peer.signal?.aborted) fail('forbidden');
       if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length
-        || !['state', 'entry', 'openBrowser'].includes(method)) fail('bad-request');
+        || !['state', 'ensure', 'entry', 'openBrowser'].includes(method)) fail('bad-request');
       const lifetime = signal && peer.signal ? AbortSignal.any([signal, peer.signal]) : signal ?? peer.signal;
       cancelled(lifetime);
       return { ok: true, value: await service[method](lifetime) };
@@ -264,7 +343,7 @@ function createDesktopEntryFetch(connection, service, method) {
 /** Public Fetch registration avoids the custom-channel getter's definition-context shadow. */
 export function registerDesktopEntryRoutes(ctx, service) {
   const connection = ctx.connection;
-  for (const method of ['state', 'entry', 'openBrowser']) {
+  for (const method of ['state', 'ensure', 'entry', 'openBrowser']) {
     connection.fetch.register({ path: `${RPC_CHANNEL}/${RPC_NAMESPACE}/${method}`, methods: ['POST'], requestBody: 'streaming',
       fetch: createDesktopEntryFetch(connection, service, method) });
   }

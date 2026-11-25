@@ -180,9 +180,10 @@ export class ProcessManager {
   constructor(ctx, config, { conversationModel, modelCatalog, preset,
     bridgeFactory = (instance, tool) => new DshBridge(ctx, instance, tool,
       { preset, ...(instance.instanceId === 'root' ? { conversationModel } : {}) }),
-    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, { ...options, modelCatalog }), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {} } = {}) {
+    nativeFactory = (instance, peer, options) => new NativeHost(ctx, instance, peer, { ...options, modelCatalog }), entry = childEntry, initialCapabilityHolds = [], lifecycleParticipants = {}, canRecoverInstance = () => true } = {}) {
     this.ctx = ctx; this.rootDir = directory(config.rootDir); this.bridgeFactory = bridgeFactory; this.nativeFactory = nativeFactory; this.entry = entry;
     this.instances = configuration(config.instances ?? [], this.rootDir); this.closing = false; this.reconfiguring = false;
+    this.canRecoverInstance = canRecoverInstance;
     this.capabilityHolds = new Map(); this.foregroundRequests = new Map(); this.capabilitySnapshots = new Map(); this.capabilityOwnerId = randomUUID(); this.capabilityStopsStarted = new Set();
     this.capabilityTransitions = new Set();
     this.topologyTransitions = new Set();
@@ -1172,6 +1173,7 @@ export class ProcessManager {
       try {
         const intent = this.restartIntent(item);
         if (!intent || !['requested', 'restarting'].includes(intent.phase)) continue;
+        if (!this.canRecoverInstance(item.config.instanceId)) continue;
         this.saveRestart(item, { ...intent, phase: 'restarting' });
         await this.restart(item.config.instanceId, { capabilityOperationId: this.capabilityHolds.get(item.config.instanceId)?.operationId });
       } catch (error) { item.error = `Pending restart could not recover: ${error.message}`; this.record(); }

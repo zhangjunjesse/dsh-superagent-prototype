@@ -139,6 +139,7 @@ export class CapabilityApplications {
   async restoreRunning(record) {
     for (const id of record.desiredRunning) {
       const current = this.control.manager.status().instances.find(item => item.instanceId === id);
+      if (this.control.canRecoverInstance?.(id) === false) continue;
       if (current?.phase !== 'running') await this.control.manager.start(id, { capabilityOperationId: record.id });
     }
   }

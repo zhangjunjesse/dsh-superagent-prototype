@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createServer, request as httpRequest } from 'node:http';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { EventEmitter, once } from 'node:events';
+import { spawn } from 'node:child_process';
 import { apply, inject, RPC_CHANNEL, RPC_NAMESPACE, JARVIS_ORIGIN, JARVIS_URL, DesktopEntryHost,
-  createDesktopEntryRpc, registerDesktopEntryRoutes, validLaunchUrl } from './index.mjs';
+  createDesktopEntryRpc, launchInstalledService, registerDesktopEntryRoutes, validLaunchUrl } from './index.mjs';
 
 const TOKEN = 'A'.repeat(43);
 const ROOT_URL = `${JARVIS_ORIGIN}/?token=${TOKEN}`;
@@ -19,7 +21,7 @@ async function fixture(t, overrides = {}) {
   const logPath = join(homePath, 'server.log'), runtimePath = join(homePath, 'runtime.json');
   writeFileSync(runtimePath, JSON.stringify(runtime()));
   writeFileSync(logPath, `dsh web: ${ROOT_URL}\n`);
-  const network = [], opened = [];
+  const network = [], opened = [], starts = [];
   const facts = { now: Date.now(), health: { ready: true, app: 'jarvis', runtime: 'dsh', pid: 12345 }, launchStatus: 303, launchLocation: './' };
   const service = new DesktopEntryHost({ homePath }, {
     now: () => facts.now,
@@ -33,6 +35,7 @@ async function fixture(t, overrides = {}) {
     },
     openExternal: async url => { opened.push(url); },
     ...overrides,
+    startService: async home => { starts.push(home); return overrides.startService ? overrides.startService(home) : 1; },
   });
   const ownerLifetime = new AbortController();
   const peer = { principal: { kind: 'owner' }, signal: ownerLifetime.signal };
@@ -44,7 +47,7 @@ async function fixture(t, overrides = {}) {
     assert.ok(resolve(homePath).startsWith(resolve(tmpdir()) + sep));
     rmSync(homePath, { recursive: true, force: true });
   });
-  return { service, rpc, peer, connection, ownerLifetime, facts, network, opened, logPath, runtimePath, homePath };
+  return { service, rpc, peer, connection, ownerLifetime, facts, network, opened, starts, logPath, runtimePath, homePath };
 }
 
 async function request(url, { method = 'GET', headers = {}, path, input } = {}) {
@@ -75,12 +78,199 @@ test('launch URLs accept only the canonical fixed root and one official token', 
     ROOT_URL.replace(TOKEN, 'short'), ROOT_URL + '/', 'file:///server.log']) assert.equal(validLaunchUrl(value), false);
 });
 
+test('the launcher uses only the installed script and literal Unicode arguments in a hidden independent process', async () => {
+  const homePath = join(tmpdir(), 'Jarvis 中文 $() ; home');
+  const child = new EventEmitter();
+  let unrefCount = 0, command;
+  child.unref = () => { unrefCount++; };
+  child.kill = () => { assert.fail('desktop entry must never terminate the independent launcher'); };
+  const result = launchInstalledService(homePath, { platform: 'win32', systemRoot: 'C:\\Windows',
+    spawnProcess: (file, args, options) => {
+      command = { file, args, options };
+      queueMicrotask(() => child.emit('exit', 0));
+      return child;
+    } });
+  assert.equal(await result, 0);
+  assert.equal(command.file, 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+  assert.deepEqual(command.args, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+    join(homePath, 'profiles', 'jarvis', 'node_modules', 'dsh-superagent', 'jarvis', 'dsh', 'start.ps1'), '-HomePath', homePath, '-Desktop']);
+  assert.deepEqual(command.options, { windowsHide: true, stdio: 'ignore' });
+  assert.equal(unrefCount, 1);
+});
+
+test('a launcher watchdog returns still-starting without killing its independent process', async () => {
+  const child = new EventEmitter();
+  child.unref = () => {};
+  child.kill = () => { assert.fail('a slow service must survive the desktop watchdog'); };
+  const result = await launchInstalledService(tmpdir(), { platform: 'win32', timeoutMs: 5, spawnProcess: () => child });
+  assert.equal(result, 3);
+  child.emit('exit', 0);
+});
+
+test('launcher errors never expose a native command, path or exception', async () => {
+  for (const synchronous of [true, false]) {
+    const result = await launchInstalledService(tmpdir(), { platform: 'win32', spawnProcess: () => {
+      if (synchronous) throw new Error('SECRET native command');
+      const child = new EventEmitter(); child.unref = () => {};
+      queueMicrotask(() => child.emit('error', new Error('SECRET native command')));
+      return child;
+    } });
+    assert.equal(result, 1);
+  }
+});
+
+test('the service started by the real hidden Windows launcher survives its desktop caller exiting', {
+  skip: process.platform === 'win32' ? false : 'Windows PowerShell process isolation is specific to Windows.',
+}, async t => {
+  const f = await fixture(t);
+  const homePath = join(f.homePath, '中文 服务 $()');
+  const directory = join(homePath, 'profiles', 'jarvis', 'node_modules', 'dsh-superagent', 'jarvis', 'dsh');
+  mkdirSync(directory, { recursive: true });
+  const serviceFile = join(homePath, 'fixture-service.mjs');
+  writeFileSync(serviceFile, "import { existsSync, writeFileSync } from 'node:fs'; import { join } from 'node:path';\n"
+    + "const home = process.argv[2]; writeFileSync(join(home, 'service-running'), 'ready');\n"
+    + "const deadline = Date.now() + 5000; const check = () => { if (existsSync(join(home, 'caller-exited'))) {\n"
+    + "writeFileSync(join(home, 'survived.txt'), 'independent'); process.exit(0); }\n"
+    + "if (Date.now() >= deadline) process.exit(1); setTimeout(check, 20); }; check();\n");
+  const psLiteral = value => "'" + value.replaceAll("'", "''") + "'";
+  writeFileSync(join(directory, 'start.ps1'), '\ufeffparam([string]$HomePath, [switch]$Desktop)\n'
+    + "$ErrorActionPreference='Stop'\nif (!$Desktop) { exit 1 }\n"
+    + `$service=Start-Process -FilePath ${psLiteral(process.execPath)} -WindowStyle Hidden -ArgumentList @(${psLiteral('"' + serviceFile + '"')}, ('"'+$HomePath+'"')) -PassThru\n`
+    + '$service.WaitForExit()\nexit $service.ExitCode\n');
+  const script = `import { existsSync } from 'node:fs'; import { launchInstalledService } from ${JSON.stringify(new URL('./index.mjs', import.meta.url).href)};`
+    + `launchInstalledService(${JSON.stringify(homePath)});`
+    + `setInterval(() => { if (existsSync(${JSON.stringify(join(homePath, 'service-running'))})) process.exit(0); }, 20);`
+    + 'setTimeout(() => process.exit(1), 5000);';
+  const caller = spawn(process.execPath, ['--input-type=module', '-e', script], { windowsHide: true, stdio: 'ignore' });
+  const [code] = await once(caller, 'exit');
+  assert.equal(code, 0);
+  writeFileSync(join(homePath, 'caller-exited'), 'released after caller exit');
+  const marker = join(homePath, 'survived.txt');
+  for (let attempt = 0; attempt < 150 && !existsSync(marker); attempt++) await new Promise(resolveTurn => setTimeout(resolveTurn, 20));
+  assert.equal(existsSync(marker), true, 'the service completes work released only after its original desktop caller exited');
+  assert.equal(readFileSync(marker, 'utf8'), 'independent');
+});
+
 test('state checks the existing runtime PID and health without reading a launch secret or opening anything', async t => {
   const f = await fixture(t);
   writeFileSync(f.logPath, 'no authentication URL available\n');
   assert.deepEqual(await f.rpc('state'), { ok: true, value: { ready: true, pid: 12345, jarvisUrl: JARVIS_URL } });
   assert.deepEqual(f.network, [`${JARVIS_URL}api/health`]);
   assert.equal(f.opened.length, 0);
+  assert.equal(f.service.pending.size, 0);
+  assert.deepEqual(f.starts, []);
+});
+
+test('clicking entry starts an offline installed service and continues the same authenticated opening', async t => {
+  const f = await fixture(t, { startService: async home => {
+    assert.equal(home, f.homePath);
+    f.facts.health.ready = true;
+    return 0;
+  } });
+  f.facts.health.ready = false;
+  const result = await f.rpc('entry');
+  assert.equal(result.ok, true, 'the same click reaches the original authenticated relay after starting');
+  assert.deepEqual(f.starts, [f.homePath]);
+  noSecret(result);
+  assert.equal((await request(result.value.launchUrl)).headers.location, ROOT_URL);
+});
+
+test('passive offline state never launches; ensure is ready only after fixed startup and an identity check', async t => {
+  const f = await fixture(t, { startService: async () => {
+    f.facts.health.ready = true;
+    return 0;
+  } });
+  f.facts.health.ready = false;
+  assert.equal((await f.rpc('state')).error.code, 'superjarvis-desktop/unavailable');
+  assert.deepEqual(f.starts, []);
+  assert.deepEqual(await f.rpc('ensure'), { ok: true, value: { ready: true, pid: 12345, jarvisUrl: JARVIS_URL } });
+  assert.deepEqual(f.starts, [f.homePath]);
+  assert.deepEqual(f.opened, []);
+  assert.equal(f.service.pending.size, 0, 'ensure does not issue authentication material');
+});
+
+test('ready service reuses its current runtime without launching for ensure, entry or browser opening', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.rpc('ensure')).ok, true);
+  assert.equal((await f.rpc('entry')).ok, true);
+  assert.deepEqual(await f.rpc('openBrowser'), { ok: true, value: { opened: true } });
+  assert.deepEqual(f.starts, []);
+});
+
+test('browser opening starts the offline service before issuing its existing one-time front door', async t => {
+  const f = await fixture(t, { startService: async () => { f.facts.health.ready = true; return 0; } });
+  f.facts.health.ready = false;
+  assert.deepEqual(await f.rpc('openBrowser'), { ok: true, value: { opened: true } });
+  assert.deepEqual(f.starts, [f.homePath]);
+  noSecret(f.opened);
+  assert.equal((await request(f.opened[0])).headers.location, ROOT_URL);
+});
+
+test('startup conflict, still-starting and failed exits stay distinct and cannot issue authentication', async t => {
+  for (const [exitCode, code] of [[2, 'port-conflict'], [3, 'start-timeout'], [1, 'start-failed'], [null, 'start-failed']]) {
+    await t.test('launcher exit ' + exitCode, async child => {
+      const f = await fixture(child, { startService: async () => exitCode });
+      f.facts.health.ready = false;
+      const result = await f.rpc('entry');
+      assert.equal(result.error?.code, 'superjarvis-desktop/' + code);
+      noSecret(result);
+      assert.equal(f.service.pending.size, 0);
+      assert.deepEqual(f.opened, []);
+    });
+  }
+});
+
+test('startup success cannot bypass missing or mismatched runtime identity', async t => {
+  const f = await fixture(t, { startService: async () => 0 });
+  for (const invalid of ['missing-runtime', 'different-process', 'unready-service']) {
+    writeFileSync(f.runtimePath, JSON.stringify(runtime()));
+    f.facts.health = { ready: true, app: 'jarvis', runtime: 'dsh', pid: 12345 };
+    if (invalid === 'missing-runtime') rmSync(f.runtimePath);
+    if (invalid === 'different-process') f.facts.health.pid = 99;
+    if (invalid === 'unready-service') f.facts.health.ready = false;
+    assert.equal((await f.rpc('entry')).error.code, 'superjarvis-desktop/unavailable', invalid);
+    assert.equal(f.service.pending.size, 0);
+  }
+  assert.equal(f.starts.length, 3);
+});
+
+test('concurrent clicks share startup, and cancelling one caller does not cancel another opening', async t => {
+  let finishStartup, enteredStartup;
+  const entered = new Promise(resolveEntered => { enteredStartup = resolveEntered; });
+  const f = await fixture(t, { startService: () => {
+    enteredStartup();
+    return new Promise(resolveStartup => { finishStartup = resolveStartup; });
+  } });
+  f.facts.health.ready = false;
+  const cancellation = new AbortController();
+  const entry = f.rpc('entry', {}, cancellation.signal);
+  const browser = f.rpc('openBrowser');
+  await entered;
+  cancellation.abort();
+  assert.equal((await entry).error.code, 'superjarvis-desktop/cancelled');
+  f.facts.health.ready = true;
+  finishStartup(0);
+  assert.deepEqual(await browser, { ok: true, value: { opened: true } });
+  assert.deepEqual(f.starts, [f.homePath]);
+});
+
+test('an owner that disappears during startup cannot open a late browser or receive a ticket', async t => {
+  let finishStartup, enteredStartup;
+  const entered = new Promise(resolveEntered => { enteredStartup = resolveEntered; });
+  const f = await fixture(t, { startService: () => {
+    enteredStartup();
+    return new Promise(resolveStartup => { finishStartup = resolveStartup; });
+  } });
+  f.facts.health.ready = false;
+  const opening = f.rpc('openBrowser');
+  await entered;
+  f.ownerLifetime.abort();
+  await f.service.close();
+  assert.equal((await opening).error.code, 'superjarvis-desktop/cancelled');
+  f.facts.health.ready = true;
+  finishStartup(0);
+  await new Promise(resolveTurn => setImmediate(resolveTurn));
+  assert.deepEqual(f.opened, []);
   assert.equal(f.service.pending.size, 0);
 });
 
@@ -89,7 +279,7 @@ test('health mismatch, unready state and changed runtime ownership fail closed',
   for (const patch of [{ pid: 99 }, { ready: false }, { app: 'other' }, { runtime: 'other' }]) {
     f.facts.health = { ready: true, app: 'jarvis', runtime: 'dsh', pid: 12345, ...patch };
     const result = await f.rpc('entry');
-    assert.equal(result.error.code, 'superjarvis-desktop/unavailable'); noSecret(result);
+    assert.equal(result.error.code, 'superjarvis-desktop/start-failed'); noSecret(result);
   }
   f.facts.health = { ready: true, app: 'jarvis', runtime: 'dsh', pid: 12345 };
   for (const patch of [{ url: 'http://127.0.0.1:4319/' }, { jarvisUrl: 'http://evil.example/' }, { startedAt: 'invalid' }, { pid: -1 }]) {
@@ -101,24 +291,30 @@ test('health mismatch, unready state and changed runtime ownership fail closed',
 
 test('only the exact live shell owner actor can call the official RPC handler', async t => {
   const f = await fixture(t);
-  for (const caller of [undefined, null, {}, { principal: { kind: 'owner' } }, { principal: { kind: 'api' } }]) {
-    const result = await createDesktopEntryRpc(f.connection, f.service)('entry', {}, undefined, caller);
-    assert.equal(result.error.code, 'superjarvis-desktop/forbidden'); noSecret(result);
+  for (const method of ['ensure', 'entry', 'openBrowser']) {
+    for (const caller of [undefined, null, {}, { principal: { kind: 'owner' } }, { principal: { kind: 'api' } }]) {
+      const result = await createDesktopEntryRpc(f.connection, f.service)(method, {}, undefined, caller);
+      assert.equal(result.error.code, 'superjarvis-desktop/forbidden'); noSecret(result);
+    }
   }
   assert.equal(f.network.length, 0);
+  assert.deepEqual(f.starts, []);
   f.ownerLifetime.abort();
   assert.equal((await f.rpc('entry')).error.code, 'superjarvis-desktop/forbidden');
 });
 
 test('RPC rejects arbitrary paths, settings and method names before any I/O', async t => {
   const f = await fixture(t);
-  for (const payload of [null, [], 'input', { url: ROOT_URL }, { homePath: f.homePath }, { port: 4319 }]) {
-    assert.equal((await f.rpc('entry', payload)).error.code, 'superjarvis-desktop/bad-request');
+  for (const method of ['ensure', 'entry', 'openBrowser']) {
+    for (const payload of [null, [], 'input', { url: ROOT_URL }, { homePath: f.homePath }, { port: 4319 }, { command: 'powershell.exe' }]) {
+      assert.equal((await f.rpc(method, payload)).error.code, 'superjarvis-desktop/bad-request');
+    }
   }
   for (const method of ['start', 'restart', 'constructor', 'toString', '']) {
     assert.equal((await f.rpc(method)).error.code, 'superjarvis-desktop/bad-request');
   }
   assert.equal(f.network.length, 0);
+  assert.deepEqual(f.starts, []);
 });
 
 test('entry returns a short-lived capability, while the long-lived launch token stays out of RPC', async t => {
@@ -262,7 +458,7 @@ test('plugin uses the official Connection RPC registration and only the fixed ho
   assert.deepEqual(inject, ['connection', 'webServer']);
   apply(ctx, { homePath: f.homePath });
   assert.deepEqual(registrations.map(route => ({ path: route.path, methods: route.methods, body: route.requestBody })),
-    ['state', 'entry', 'openBrowser'].map(method => ({ path: `${RPC_CHANNEL}/${RPC_NAMESPACE}/${method}`, methods: ['POST'], body: 'streaming' })));
+    ['state', 'ensure', 'entry', 'openBrowser'].map(method => ({ path: `${RPC_CHANNEL}/${RPC_NAMESPACE}/${method}`, methods: ['POST'], body: 'streaming' })));
   await Promise.all(disposals.map(dispose => dispose()));
   for (const homePath of ['', 'relative/path']) assert.throws(() => new DesktopEntryHost({ homePath }));
   assert.throws(() => new DesktopEntryHost({ homePath: f.homePath, port: 4319 }));

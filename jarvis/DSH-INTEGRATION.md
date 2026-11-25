@@ -8,11 +8,13 @@
 
 日常聊天、会话状态及消息分页均通过宿主的 DSH 登录校验，写操作还会校验 CSRF。桌面入口沿用 DSH 浏览器会话。独立运行 `integration.test.mjs` 或 `gateway-flow.integration.test.mjs` 时，通过 `JARVIS_DSH_TEST_COOKIE` 向测试进程传入该测试 profile 的有效会话 Cookie。
 
-## 日常桌面入口（2026-11-20）
+## 日常桌面入口
 
 桌面导航插件源码位于 `jarvis/dsh/desktop-entry/`。入口面向带原生浏览器服务的官方 DeepSeek Harness Desktop，在主工作区显示「贾维斯」。点击入口时，桌面宿主检查既有 4318 服务及进程身份，通过短时、一次性的本机跳转完成 DSH 登录。桌面切换面板时保留页面和草稿。需要新窗口或下载时，点击「在浏览器打开」，在网页侧栏选择「贾维斯」。
 
-模型、会话、集团和下级工单继续使用 4318 的原有数据。服务离线时先启动原有 Jarvis 服务，再点入口中的「重试连接」。
+Windows 上点击「贾维斯」会打开原来的工作区。服务离线时，桌面调用已有 `jarvis` profile 的启动器，待服务就绪后继续登录。连续点击共享同一次启动。4318 被其他程序占用时，页面会提示端口冲突，释放端口后可重试。
+
+集团上次已确认运行时，宿主启动后会恢复集团，等集团就绪即可聊天。用户主动停止过集团，或旧版本没有留下可确认的运行意图时，工作区仍可查看历史。需要继续聊天时，点击输入框旁的「启动集团」。下级组织沿用各自的启停方式。
 
 在其他电脑安装入口时，先在日常 `desktop` profile 下建 `local-plugins/superjarvis-desktop-entry/`，把源码目录里的 `package.json`、`index.mjs`、`client.js`、`model-host.mjs` 和 `model-protocol.mjs` 复制进去。将下面这项追加到该 profile 的 `cordis.patch.yml`，把 `homePath` 换成那台电脑现有 Jarvis 服务的 DSH_HOME 绝对路径。下次打开桌面时会加载插件。
 

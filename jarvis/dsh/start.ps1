@@ -1,43 +1,245 @@
 param(
   [string]$HomePath = '',
-  [string]$NodePath = ''
+  [string]$NodePath = '',
+  [switch]$Desktop,
+  [ValidateRange(1, 35)][int]$WaitSeconds = 25,
+  [int]$BootProcessId = 0,
+  [string]$BootNonce = ''
 )
 $ErrorActionPreference = 'Stop'
-$repoPath = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
-if (!$HomePath) { $HomePath = Join-Path $repoPath '.artifacts/jarvis-dsh/home' }
-$jarvisHome = (Resolve-Path -LiteralPath $HomePath).Path
-$launchFile = Join-Path $jarvisHome 'launch.json'
-if (!(Test-Path -LiteralPath $launchFile)) { throw 'Create a new isolated profile with setup-local.mjs first.' }
-$launchConfig = Get-Content -Raw -LiteralPath $launchFile | ConvertFrom-Json
-if (!$NodePath) {
-  $bundledNode = Join-Path $env:USERPROFILE '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe'
-  $NodePath = if (Test-Path -LiteralPath $bundledNode) { $bundledNode } else { (Get-Command node -ErrorAction Stop).Source }
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$lock = $null
+
+function Read-Registration([string]$Path) {
+  if (!(Test-Path -LiteralPath $Path)) { return $null }
+  try { return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json } catch { return $null }
 }
-$version = & $NodePath -p 'process.versions.node'
-if ($LASTEXITCODE -ne 0 -or [version]$version -lt [version]'22.19.0') { throw 'Node 22.19+ is required.' }
-$url = "http://127.0.0.1:$($launchConfig.port)/jarvis/"
+
+function Valid-Registration($Record) {
+  try {
+    return ($Record -and [long]$Record.pid -gt 0 -and [long]$Record.pid -le [int]::MaxValue -and
+      ([DateTimeOffset]$Record.startedAt).UtcTicks -gt 0 -and
+      $Record.url -eq $origin -and $Record.jarvisUrl -eq ($origin + 'jarvis/'))
+  } catch { return $false }
+}
+
+function Registered-Process($Record) {
+  if (!(Valid-Registration $Record)) { return $null }
+  $service = Get-Process -Id $Record.pid -ErrorAction SilentlyContinue
+  if (!$service) { return $null }
+  try {
+    $started = $service.StartTime.ToUniversalTime()
+    if ($Record.processStartedAt) {
+      if ($started.Ticks -ne ([DateTimeOffset]$Record.processStartedAt).UtcTicks) { return $null }
+    } elseif ($started -gt ([DateTimeOffset]$Record.startedAt).UtcDateTime.AddSeconds(1)) {
+      # Old registrations lack the OS birth time. A newer process is PID reuse.
+      return $null
+    }
+    return $service
+  } catch {
+    $service.Refresh()
+    if ($service.HasExited) { return $null }
+    throw 'Cannot verify the registered process identity.'
+  }
+}
+
+function Write-Registration([string]$Path, $Record) {
+  $temporary = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+  try {
+    [IO.File]::WriteAllText($temporary, ($Record | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
+    if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) }
+    else { [IO.File]::Move($temporary, $Path) }
+  } finally {
+    if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+  }
+}
+
 function Write-DshEntry {
-  # Use DSH's own authenticated launch URL; do not bypass the host login.
+  # Manual callers still receive DSH's authenticated URL; Desktop never calls this.
   $logPath = Join-Path $jarvisHome 'server.log'
-  $origin = "http://127.0.0.1:$($launchConfig.port)/"
   if (Test-Path -LiteralPath $logPath) {
-    $launchMatch = [regex]::Match((Get-Content -Raw -LiteralPath $logPath), [regex]::Escape($origin) + '\?token=[^\s]+')
-    if ($launchMatch.Success) { Write-Output $launchMatch.Value; return }
+    $matches = [regex]::Matches((Get-Content -Raw -LiteralPath $logPath), [regex]::Escape($origin) + '\?token=[^\s]+')
+    if ($matches.Count) { Write-Output $matches[$matches.Count - 1].Value; return }
   }
   Write-Output $origin
 }
-try { $health = Invoke-RestMethod ($url + 'api/health') -TimeoutSec 2 } catch { $health = $null }
-if ($health) {
-  $record = Get-Content -Raw -LiteralPath (Join-Path $jarvisHome 'runtime.json') | ConvertFrom-Json
-  if ($health.app -eq 'jarvis' -and $health.runtime -eq 'dsh' -and $health.pid -eq $record.pid) { Write-DshEntry; exit }
-  throw 'This port is already occupied by another instance.'
+
+function Get-ServiceState {
+  $runtime = Read-Registration $runtimeFile
+  $pending = Read-Registration $pendingFile
+  $runtimeProcess = Registered-Process $runtime
+  $pendingProcess = Registered-Process $pending
+  if ($runtimeProcess -and $pendingProcess -and $runtimeProcess.Id -ne $pendingProcess.Id) {
+    return @{ Kind = 'failed'; Message = 'Two different live processes are registered for this profile.' }
+  }
+  $record = if ($runtimeProcess) { $runtime } elseif ($pendingProcess) { $pending } else { $null }
+  $listeners = @([JarvisLauncherTcp]::ListenerPids([int]$launchConfig.port))
+  if (!$listeners.Count) {
+    if ($record) { return @{ Kind = 'starting'; Record = $record } }
+    if (((Test-Path -LiteralPath $runtimeFile) -and !$runtime) -or ((Test-Path -LiteralPath $pendingFile) -and !$pending)) {
+      return @{ Kind = 'failed'; Message = 'A process registration is unreadable; verify it before starting.' }
+    }
+    return @{ Kind = 'absent' }
+  }
+  if (!$record -or @($listeners | Where-Object { $_ -ne $record.pid }).Count) {
+    return @{ Kind = 'conflict' }
+  }
+  try {
+    $health = Invoke-RestMethod ($origin + 'jarvis/api/health') -TimeoutSec 1 -MaximumRedirection 0
+  } catch {
+    # This exact process owns the listener, but its Jarvis route may still be mounting.
+    return @{ Kind = 'starting'; Record = $record }
+  }
+  if (!$health -or $health.app -ne 'jarvis' -or $health.runtime -ne 'dsh' -or $health.pid -ne $record.pid) {
+    return @{ Kind = 'conflict' }
+  }
+  if (!(Registered-Process $record)) { return @{ Kind = 'failed'; Message = 'DSH exited while its readiness was being checked.' } }
+  if ($health.ready -ne $true) { return @{ Kind = 'starting'; Record = $record } }
+  if (!$runtimeProcess -or $runtime.pid -ne $record.pid) {
+    # The boot adapter is the sole publisher; it remains alive after this caller times out.
+    return @{ Kind = 'starting'; Record = $record }
+  }
+  return @{ Kind = 'ready'; Record = $record; Pending = $pending }
 }
-$launcher = Join-Path $PSScriptRoot 'launch-local.mjs'
-$service = Start-Process -FilePath $NodePath -WindowStyle Hidden -WorkingDirectory $repoPath -ArgumentList @("`"$launcher`"", "`"$jarvisHome`"") -RedirectStandardOutput (Join-Path $jarvisHome 'server.log') -RedirectStandardError (Join-Path $jarvisHome 'server.err.log') -PassThru
-for ($attempt = 0; $attempt -lt 15; $attempt++) {
-  if ($service.HasExited) { throw "DSH exited. See $jarvisHome/server.err.log and server.log." }
-  try { $health = Invoke-RestMethod ($url + 'api/health') -TimeoutSec 1 } catch { $health = $null }
-  if ($health.ready -and $health.pid -eq $service.Id) { Write-DshEntry; exit }
-  Start-Sleep -Milliseconds 1000
+
+function Invoke-JarvisLaunch {
+  # FileShare.None covers every caller, including other desktop processes and junction aliases.
+  $lockPath = Join-Path $jarvisHome 'launcher.lock'
+  while (!$script:lock) {
+    try { $script:lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch [IO.IOException] {
+      if (($_.Exception.HResult -band 65535) -notin @(32, 33)) { throw }
+      if ($clock.Elapsed.TotalSeconds -ge $WaitSeconds) { return @{ Code = 3 } }
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  $spawned = $null
+  while ($clock.Elapsed.TotalSeconds -lt $WaitSeconds) {
+    $state = Get-ServiceState
+    switch ($state.Kind) {
+      'conflict' { return @{ Code = 2 } }
+      'failed' { return @{ Code = 1; Message = $state.Message } }
+      'ready' {
+        $record = $state.Record
+        if ($state.Pending -and $state.Pending.pid -eq $record.pid -and $state.Pending.phase -ne 'ready') {
+          $state.Pending.phase = 'ready'
+          Write-Registration $pendingFile $state.Pending
+        }
+        return @{ Code = 0 }
+      }
+      'absent' {
+        if ($spawned) {
+          $spawned.phase = 'failed'
+          Write-Registration $pendingFile $spawned
+          return @{ Code = 1; Message = 'DSH exited. See server.err.log and server.log in the profile.' }
+        }
+        $nonce = if ($BootProcessId) { $BootNonce } else { [Guid]::NewGuid().ToString('N') }
+        if ($BootProcessId) {
+          $service = Get-Process -Id $BootProcessId -ErrorAction Stop
+        } else {
+          $launcher = Join-Path $PSScriptRoot 'launch-local.mjs'
+          $arguments = @(('"{0}"' -f $launcher), ('"{0}"' -f $jarvisHome), '--launcher-nonce', $nonce)
+          $service = Start-Process -FilePath $NodePath -WindowStyle Hidden -WorkingDirectory $repoPath -ArgumentList $arguments -RedirectStandardOutput (Join-Path $jarvisHome 'server.log') -RedirectStandardError (Join-Path $jarvisHome 'server.err.log') -PassThru
+        }
+        $spawned = [pscustomobject]@{
+          pid = $service.Id; startedAt = [DateTime]::UtcNow.ToString('o')
+          processStartedAt = $service.StartTime.ToUniversalTime().ToString('o')
+          url = $origin; jarvisUrl = $origin + 'jarvis/'; phase = 'starting'; bootNonce = $nonce
+        }
+        Write-Registration $pendingFile $spawned
+      }
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  return @{ Code = 3 }
 }
-Write-Output "DSH is starting. Open the DSH URL from $jarvisHome/server.log when ready."
+
+try {
+  if ($env:OS -ne 'Windows_NT') { throw 'This launcher requires Windows.' }
+  if (($BootProcessId -ne 0 -or $BootNonce) -and ($BootProcessId -le 0 -or $BootNonce -notmatch '^[a-f0-9]{32}$')) { throw 'Invalid internal boot handshake.' }
+  $repoPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
+  if (!$HomePath) {
+    if ($repoPath -match '^(?<home>.+)[\\/]profiles[\\/]jarvis[\\/](?:deployments[\\/][^\\/]+|node_modules[\\/]dsh-superagent)$') {
+      $HomePath = $Matches.home
+      $installedConfig = Read-Registration (Join-Path $HomePath 'launch.json')
+      if (!$installedConfig -or $installedConfig.profile -ne 'jarvis') { throw 'Cannot verify the installed jarvis profile.' }
+    } else {
+      $HomePath = Join-Path $repoPath '.artifacts/jarvis-dsh/home'
+    }
+  }
+  $jarvisHome = (Resolve-Path -LiteralPath $HomePath).Path
+  $launchFile = Join-Path $jarvisHome 'launch.json'
+  if (!(Test-Path -LiteralPath $launchFile)) { throw 'This profile must already have a launch.json; do not initialize an existing profile.' }
+  $launchConfig = Get-Content -Raw -LiteralPath $launchFile | ConvertFrom-Json
+  if ([int]$launchConfig.port -lt 1 -or [int]$launchConfig.port -gt 65535 -or !$launchConfig.profile -or !$launchConfig.dshPackage) { throw 'Invalid launch configuration.' }
+  if (!$NodePath) {
+    $bundledNode = Join-Path $env:USERPROFILE '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe'
+    $NodePath = if (Test-Path -LiteralPath $bundledNode) { $bundledNode } else { (Get-Command node -ErrorAction Stop).Source }
+  }
+  $version = & $NodePath -p 'process.versions.node' 2>$null
+  if ($LASTEXITCODE -ne 0 -or [version]$version -lt [version]'22.19.0') { throw 'Node 22.19+ is required.' }
+  $origin = "http://127.0.0.1:$($launchConfig.port)/"
+  $runtimeFile = Join-Path $jarvisHome 'runtime.json'
+  $pendingFile = Join-Path $jarvisHome 'launcher-state.json'
+  if (!('JarvisLauncherTcp' -as [type])) {
+    # GetExtendedTcpTable is read-only and does not require privileged WMI/CIM access.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class JarvisLauncherTcp {
+  [DllImport("iphlpapi.dll", SetLastError = true)]
+  private static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool sorted, int family, int tableClass, int reserved);
+  public static int[] ListenerPids(int port) {
+    var result = new List<int>();
+    foreach (int family in new int[] { 2, 23 }) {
+      int size = 0;
+      uint status = GetExtendedTcpTable(IntPtr.Zero, ref size, false, family, 3, 0);
+      if (status != 0 && status != 122) throw new InvalidOperationException("Cannot inspect local TCP listeners.");
+      while (size > 0) {
+        IntPtr table = Marshal.AllocHGlobal(size);
+        try {
+          status = GetExtendedTcpTable(table, ref size, false, family, 3, 0);
+          if (status == 122) continue;
+          if (status != 0) throw new InvalidOperationException("Cannot inspect local TCP listeners.");
+          int rows = Marshal.ReadInt32(table), stride = family == 2 ? 24 : 56;
+          int portOffset = family == 2 ? 8 : 20, pidOffset = family == 2 ? 20 : 52;
+          for (int row = 0; row < rows; row++) {
+            int offset = 4 + row * stride;
+            int localPort = (Marshal.ReadByte(table, offset + portOffset) << 8) | Marshal.ReadByte(table, offset + portOffset + 1);
+            if (localPort != port) continue;
+            int pid = Marshal.ReadInt32(table, offset + pidOffset);
+            if (!result.Contains(pid)) result.Add(pid);
+          }
+          break;
+        } finally { Marshal.FreeHGlobal(table); }
+      }
+    }
+    return result.ToArray();
+  }
+}
+'@
+  }
+  $result = Invoke-JarvisLaunch
+} catch {
+  if ($jarvisHome) {
+    try { [IO.File]::WriteAllText((Join-Path $jarvisHome 'launcher.err.log'), ($_.Exception.ToString() + [Environment]::NewLine + $_.ScriptStackTrace), (New-Object Text.UTF8Encoding $false)) } catch {}
+  }
+  $result = @{ Code = 1; Message = 'DSH could not start. Verify the configured profile, Node version and launcher logs.' }
+} finally {
+  if ($lock) { $lock.Dispose() }
+}
+
+switch ($result.Code) {
+  0 { if ($Desktop) { Write-Output 'DSH ready.' } else { Write-DshEntry } }
+  2 { [Console]::Error.WriteLine('The configured port is occupied by another or unverified service.') }
+  3 {
+    if ($Desktop) { Write-Output 'DSH is starting.' }
+    else { Write-Output "DSH is starting. Open the DSH URL from $jarvisHome/server.log when ready." }
+  }
+  default {
+    if ($Desktop) { [Console]::Error.WriteLine('DSH could not start. Check its local launcher logs.') }
+    else { [Console]::Error.WriteLine($result.Message) }
+  }
+}
+exit $result.Code
