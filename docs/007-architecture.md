@@ -401,6 +401,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/process-runtime/artifact-contract.ts` | Producer, assignment, digest and chunk bounds for versioned handoff files |
 | `src/process-runtime/delegation-ingress.ts` | Durable authenticated child ingress, isolated preparation, core admission and command receipts |
 | `src/process-runtime/delegation-executor.ts` | Fixed parent Assignment to child binding, proxy controls, result reconciliation and completion fences |
+| `src/process-runtime/explicit-retries.ts` | Persists the user's retry request until the original assignment confirms cleanup and Core can start its replacement |
 | `src/jarvis-gateway/contracts.ts` | Submit/query schemas, trusted user-turn identity, immutable commands and targets, feedback delivery contracts, reference matching and stable hashes |
 | `src/jarvis-gateway/ledger.ts` | Gateway-owned SQLite command transport, stable work associations, feedback deduplication and recoverable notification batches; does not own Ticket lifecycle |
 | `src/jarvis-gateway/source.ts` | Jarvis Source/Channel and the public constrained SourceContext backend; translates commands and ingests typed Outbox feedback |
@@ -474,6 +475,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/result-review-recovery.spec.ts` | Real SQLite/Effects resume one pending review and one immutable continuation; followed-thread close cannot bypass parent acceptance |
 | `tests/handoff-recovery.spec.ts` | Reopens the original handoff after a crash or lost reply and cancels only its bound execution |
 | `tests/handoff-session-recovery.spec.ts` | Restores the original review Session and resumes the handoff, including work waiting for a department |
+| `tests/explicit-retry-safety.spec.ts` | Verifies that a retry survives restart and late replies without running two producers or stopping the new Worker |
 | `tests/process-live-routing.spec.ts` | Live child discovery, readiness at selection and admission, and continuity of existing assignments |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
